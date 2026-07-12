@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage: compile a static, CGO-free binary ----
-FROM golang:1.26-alpine AS build
+# --platform=$BUILDPLATFORM: in multi-arch builds the compiler always runs on
+# the native build host and cross-compiles via TARGETOS/TARGETARCH (no QEMU).
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Cache module downloads separately from the source.
@@ -10,7 +12,9 @@ RUN go mod download
 
 COPY . .
 # Pure-Go (modernc sqlite) => CGO disabled => fully static binary.
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bot ./cmd/bot
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /bot ./cmd/bot
 
 # ---- runtime stage: minimal image with TLS roots + timezones ----
 FROM alpine:3.20

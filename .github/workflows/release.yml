@@ -62,3 +62,39 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # Publishes kellerman81/go_finance_bot:<version> and :latest to Docker Hub.
+  # Requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an access
+  # token from hub.docker.com -> Account Settings -> Security).
+  docker:
+    runs-on: ubuntu-latest
+    needs: release # only publish the image if tests + release succeeded
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: kellerman81/go_finance_bot
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

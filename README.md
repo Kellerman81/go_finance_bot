@@ -359,8 +359,25 @@ go run ./cmd/bot                         # runs offline (mock feed + sim broker)
 
 ### Docker
 
-A multi-stage [Dockerfile](Dockerfile) compiles a static, CGO-free binary into a
-small Alpine image; [docker-compose.yml](docker-compose.yml) builds and runs it:
+Prebuilt multi-arch images (amd64 + arm64) are published to Docker Hub at
+[kellerman81/go_finance_bot](https://hub.docker.com/r/kellerman81/go_finance_bot)
+on every release — no checkout or build needed:
+
+```bash
+docker run -d --name go_finance_bot \
+  -p 8080:8080 \
+  -v "$PWD/data:/app/data" \
+  kellerman81/go_finance_bot:latest
+curl localhost:8080/health
+```
+
+Or in [docker-compose.yml](docker-compose.yml), drop the `build:` block and set
+`image: kellerman81/go_finance_bot:latest`. Pin a version tag (e.g. `:1.2`)
+instead of `:latest` for reproducible deployments.
+
+Alternatively build it yourself: a multi-stage [Dockerfile](Dockerfile) compiles
+a static, CGO-free binary into a small Alpine image;
+[docker-compose.yml](docker-compose.yml) builds and runs it:
 
 ```bash
 docker compose up --build -d        # build + start
