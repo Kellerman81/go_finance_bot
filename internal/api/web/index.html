@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>go_finance_bot</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e8ec; --mut:#8b94a7;
+          --buy:#2ecc71; --sell:#e74c3c; --hold:#7f8c8d; --acc:#4c8bf5; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px; background:var(--panel);
+           border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; margin-right:auto; }
+  .pill { padding:2px 8px; border-radius:10px; font-size:12px; background:#222836; color:var(--mut); }
+  .pill.on { background:#143; color:var(--buy); } .pill.off { background:#411; color:var(--sell); }
+  button { background:#222836; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+           padding:5px 10px; cursor:pointer; font-size:13px; } button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+  button.danger { color:var(--sell); border-color:#5a2; } button.sell { color:#fff; background:var(--sell); border-color:var(--sell); }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .panel h2 { margin:0 0 8px; font-size:14px; } .panel.wide { grid-column:1/-1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .act-BUY { color:var(--buy); } .act-SELL { color:var(--sell); } .act-HOLD { color:var(--hold); }
+  .win { color:var(--buy); } .loss { color:var(--sell); }
+  .tiles { display:flex; flex-wrap:wrap; gap:18px; margin-bottom:10px; }
+  .tiles > div .small { display:block; }
+  .muted { color:var(--mut); } .small { font-size:12px; }
+  input,select { background:#0e1016; color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:4px 6px; width:100%; }
+  .field { margin-bottom:8px; } .field label { display:block; font-size:12px; color:var(--mut); margin-bottom:2px; }
+  .field .help { font-size:11px; color:#69707f; margin-top:1px; }
+  .row { display:flex; gap:6px; } .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .det { display:inline-block; min-width:54px; text-align:center; padding:1px 4px; border-radius:4px; margin:1px; font-size:11px; border:1px solid transparent; }
+  .det.en { border-color:var(--acc); }
+  .err-finnhub{color:#e0b34c} .err-saxo{color:#c678dd} .err-yahoo{color:#56b6c2}
+  .err-trading212{color:#98c379} .err-alpaca{color:#61afef}
+  .flash { animation: f .6s; } @keyframes f { from{background:#2a3550} to{background:transparent} }
+  a.gh { color:var(--mut); text-decoration:none; }
+  .riskbanner { background:#3a1518; border-bottom:1px solid #6e2228; color:#f0c0c4;
+                padding:8px 16px; font-size:13px; }
+  .riskbanner strong { color:#ff8a8a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>go_finance_bot</h1>
+  <span class="pill" id="brokerPill">broker —</span>
+  <span class="pill" id="cashPill">cash —</span>
+  <span class="pill" id="tradingPill">trading —</span>
+  <span class="pill" id="livePill" title="live event stream">live —</span>
+  <button id="tradeToggle">Toggle trading</button>
+  <button onclick="refreshAll()">↻ Refresh</button>
+</header>
+
+<div class="riskbanner">
+  <strong>⚠️ WARNING — trading happens entirely at your own risk.</strong>
+  This software can lose money. The authors accept no responsibility for any financial
+  losses or other damages arising from its use. Not financial advice — never trade money
+  you cannot afford to lose.
+</div>
+
+<main>
+  <!-- Live engine metrics -->
+  <section class="panel wide">
+    <h2>Live engine <span class="small muted">(runtime metrics)</span></h2>
+    <div id="metricsTiles" class="tiles"></div>
+    <div class="small muted">Equity (rolling)</div>
+    <canvas id="equitySpark" height="56" style="width:100%;height:56px" title="equity over recent samples"></canvas>
+  </section>
+
+  <!-- Live activity feed (SSE) -->
+  <section class="panel wide">
+    <h2>Activity <span class="small muted">(live signal &amp; trade stream)</span>
+      <button class="small" style="float:right;padding:2px 8px" onclick="clearActivity()">clear</button>
+    </h2>
+    <div style="max-height:240px; overflow:auto">
+      <table>
+        <thead><tr><th style="width:90px">Time</th><th style="width:70px">Type</th><th>Symbol</th><th>Detail</th></tr></thead>
+        <tbody id="activityBody"></tbody>
+      </table>
+      <div class="small muted" id="activityEmpty">Waiting for engine activity…</div>
+    </div>
+  </section>
+
+  <!-- Watchlist -->
+  <section class="panel">
+    <h2>Watchlist</h2>
+    <div class="row" style="margin-bottom:8px">
+      <input id="wlInput" placeholder="add symbol e.g. LXS.DE or AAPL"/>
+      <button class="primary" onclick="addSymbol()">Add</button>
+    </div>
+    <table><tbody id="wlBody"></tbody></table>
+  </section>
+
+  <!-- Open positions -->
+  <section class="panel">
+    <h2>Open positions</h2>
+    <table>
+      <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Peak</th><th></th></tr></thead>
+      <tbody id="posBody"></tbody>
+    </table>
+    <div class="small muted" id="posEmpty"></div>
+  </section>
+
+  <!-- Trade performance -->
+  <section class="panel wide">
+    <h2>Trade performance</h2>
+    <div class="row" style="margin-bottom:8px; align-items:center; gap:10px">
+      <label class="small muted" style="width:auto">Period</label>
+      <select id="statsPeriod" style="width:auto">
+        <option value="week">Last week</option>
+        <option value="month">Last month</option>
+        <option value="all">All time</option>
+      </select>
+    </div>
+    <div id="statsSummary" class="tiles"></div>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Symbol</th><th class="num">Trades</th><th class="num">Wins</th><th class="num">Losses</th><th class="num">Win %</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="statsBySymbolBody"></tbody>
+      </table>
+    </div>
+    <h2 style="margin-top:14px">Recent closed trades</h2>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th>Result</th></tr></thead>
+        <tbody id="closedTradesBody"></tbody>
+      </table>
+      <div class="small muted" id="closedTradesEmpty"></div>
+    </div>
+  </section>
+
+  <!-- Strategy editor -->
+  <section class="panel">
+    <h2>Strategy <span class="small muted">(edit & apply live)</span></h2>
+    <div id="stratForm"></div>
+    <button class="primary" onclick="saveStrategy()">Apply strategy</button>
+    <span class="small muted" id="stratMsg"></span>
+  </section>
+
+  <!-- Position sizing -->
+  <section class="panel">
+    <h2>Position sizing</h2>
+    <div class="field">
+      <label>Order size (notional per buy)</label>
+      <input id="szOrder" type="number" step="any"/>
+      <div class="help">Fixed €/$ per buy. Used when "min positions" is 0.</div>
+    </div>
+    <div class="field">
+      <label>Min positions</label>
+      <input id="szMin" type="number" step="1"/>
+      <div class="help">0 = use fixed order size. &gt;0 caps each buy at max_total_invested ÷ this number, so the budget always holds at least this many positions (spreads capital, no all-in-one order).</div>
+    </div>
+    <button class="primary" onclick="saveSizing()">Apply sizing</button>
+    <span class="small muted" id="szMsg"></span>
+  </section>
+
+  <!-- Holding / confirmation behaviour -->
+  <section class="panel">
+    <h2>Holding &amp; confirmation</h2>
+    <div class="field">
+      <label>Keep interval</label>
+      <input id="bhKeep" type="text" placeholder="e.g. 2h, 30m, 0s"/>
+      <div class="help">Minimum time to hold before a <em>strategy</em> sell is allowed (Go duration: 2h, 90m, 0s = off). Protective exits (stop-loss/trailing/take-profit) still fire immediately — this only stops dumping a position seconds after buying.</div>
+    </div>
+    <div class="field">
+      <label>Confirm buy (checks in a row)</label>
+      <input id="bhBuy" type="number" step="1" min="1"/>
+      <div class="help">How many consecutive evaluations must say BUY before buying. 1 = act at once; 2 = wait for a second confirming check.</div>
+    </div>
+    <div class="field">
+      <label>Confirm sell (checks in a row)</label>
+      <input id="bhSell" type="number" step="1" min="1"/>
+      <div class="help">Consecutive SELL evaluations required before selling, so a single down-tick doesn't trigger an exit.</div>
+    </div>
+    <button class="primary" onclick="saveBehavior()">Apply behaviour</button>
+    <span class="small muted" id="bhMsg"></span>
+  </section>
+
+  <!-- Exits editor -->
+  <section class="panel">
+    <h2>Protective exits</h2>
+    <div id="exitForm"></div>
+    <button class="primary" onclick="saveExits()">Apply exits</button>
+    <span class="small muted" id="exitMsg"></span>
+  </section>
+
+  <!-- Detector signals -->
+  <section class="panel wide">
+    <h2>Signals — all detectors <span class="small muted">(blue border = in active set)</span></h2>
+    <div style="overflow:auto">
+      <table id="detTable"><thead></thead><tbody id="detBody"></tbody></table>
+    </div>
+  </section>
+
+  <!-- Error log -->
+  <section class="panel wide">
+    <h2>API error log <span class="small muted">(finnhub / saxo / alpaca / yahoo / trading212)</span></h2>
+    <table>
+      <thead><tr><th>Time</th><th>Source</th><th>Message</th></tr></thead>
+      <tbody id="errBody"></tbody>
+    </table>
+    <div class="small muted" id="errEmpty"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+// Auth: token from ?token=… (once) or localStorage; sent as a bearer header on
+// every /api call. Empty when the server has no auth configured.
+let AUTH = new URLSearchParams(location.search).get('token') || localStorage.getItem('authToken') || '';
+if(AUTH) localStorage.setItem('authToken', AUTH);
+function authOpts(opt){ opt=opt||{}; const h=Object.assign({}, opt.headers);
+  if(AUTH) h['Authorization']='Bearer '+AUTH;
+  if(opt.body && !h['Content-Type']) h['Content-Type']='application/json';
+  return Object.assign({}, opt, {headers:h}); }
+const api = (p,opt) => fetch('/api'+p, authOpts(opt)).then(async r => {
+  const t=await r.text(); let j; try{j=t?JSON.parse(t):null}catch{j=t};
+  if(r.status===401){ const tok=prompt('API token required:'); if(tok){ AUTH=tok; localStorage.setItem('authToken',tok); } throw (j&&j.error)||'unauthorized'; }
+  if(!r.ok) throw (j&&j.error)||t||r.status; return j; });
+const fmt = (n,d=2) => (n==null||isNaN(n))?'—':Number(n).toLocaleString(undefined,{maximumFractionDigits:d});
+
+// ---- field metadata with end-user explanations ----
+const STRAT_FIELDS = [
+  ['Detectors','Buy detectors (comma list)','text','Indicators for BUY decisions. Available: ema_cross, rsi, macd, bollinger, vwap, atr, rvol, volume_profile, trend, adx, stochastic, supertrend, donchian.'],
+  ['DetectorsSell','Sell detectors (comma list)','text','Indicators for SELL decisions. Leave empty to reuse the buy detectors. Lets you exit on different signals than you enter.'],
+  ['Weights','Detector weights','text','Optional per-detector strength multipliers, as name:weight pairs (e.g. trend:2, rsi:0.5). Missing detectors default to 1. Scales the reported strength and, in weighted mode, the vote.'],
+  ['Combine','Combine mode (BUY)','select:majority,unanimous,weighted','How to merge detectors for BUY. majority = act on the side with more votes; unanimous = all must agree; weighted = act on the net strength-weighted score.'],
+  ['CombineSell','Combine mode (SELL)','select:,majority,unanimous,weighted','Merge mode for SELL only. Empty = same as BUY. Set this to exit faster than you enter (e.g. unanimous buy, majority sell).'],
+  ['MinStrength','Min strength — BUY (0–1)','num','Minimum combined confidence to BUY. Higher = fewer, higher-conviction entries (fewer losses).'],
+  ['MinStrengthSell','Min strength — SELL','num','Minimum confidence to SELL. -1 = same as BUY. Set lower (e.g. 0.1) to exit more readily than you enter.'],
+  ['FastMA','Fast EMA','int','Short EMA period for the trend crossover (must be < slow).'],
+  ['SlowMA','Slow EMA','int','Long EMA period. ema_cross is bullish when fast > slow.'],
+  ['RSIPeriod','RSI period','int','Lookback for RSI (momentum oscillator).'],
+  ['RSIMode','RSI mode','select:midline,extremes','midline = graded vote around 50 (always participates); extremes = only votes at oversold/overbought.'],
+  ['RSIOverbought','RSI overbought','num','RSI level treated as overbought → sell pressure (e.g. 70).'],
+  ['RSIOversold','RSI oversold','num','RSI level treated as oversold → buy pressure (e.g. 30).'],
+  ['MACDFast','MACD fast','int','MACD fast EMA period (e.g. 12).'],
+  ['MACDSlow','MACD slow','int','MACD slow EMA period (e.g. 26).'],
+  ['MACDSignal','MACD signal','int','MACD signal-line EMA period (e.g. 9). Buy when histogram > 0.'],
+  ['BBPeriod','Bollinger period','int','Window for the Bollinger mid (SMA).'],
+  ['BBStdDev','Bollinger σ','num','Std-dev multiplier for the bands. Buy below lower, sell above upper.'],
+  ['VWAPPeriod','VWAP window','int','Rolling window for volume-weighted average price (trend bias).'],
+  ['ATRPeriod','ATR period','int','Window for Average True Range (volatility).'],
+  ['ATRMult','ATR multiple','num','Breakout trigger: a move beyond mult×ATR vs the prior close.'],
+  ['RVOLPeriod','RVOL period','int','Window for average volume in Relative Volume.'],
+  ['RVOLThreshold','RVOL threshold','num','Volume surge (e.g. 1.5 = 150% of average) needed to confirm a move.'],
+  ['VPWindow','Vol-profile window','int','Bars used to build the volume profile.'],
+  ['VPBuckets','Vol-profile buckets','int','Number of price bins in the profile.'],
+  ['VPValueAreaPct','Value-area %','num','Fraction of volume around the point of control (e.g. 0.7 = 70%).'],
+  ['TrendPeriod','Trend lookback (bars)','int','Bars (1-min) for the regression trend — up to a week (~1950). Uses all bars available up to this; reads the prevailing direction instead of the last bar or two.'],
+  ['TrendThreshold','Trend threshold','num','Minimum end-to-end move of the fitted line to count as a trend (0.01 = 1%). Smaller moves are treated as flat.'],
+  ['TrendGate','Trend gate','bool','When on, the weekly trend filters trades: an up-trend blocks SELLs and a down-trend blocks BUYs (protective exits still fire).'],
+  ['ADXPeriod','ADX period','int','Lookback for the Average Directional Index (trend strength). Needs ~2× this many bars.'],
+  ['ADXThreshold','ADX threshold','num','Minimum ADX to treat the move as a trend (e.g. 25); +DI vs −DI sets the direction.'],
+  ['StochKPeriod','Stochastic %K period','int','Lookback for the Stochastic %K (position within the high/low range).'],
+  ['StochDPeriod','Stochastic %D period','int','Smoothing period for %D (SMA of %K).'],
+  ['StochOverbought','Stochastic overbought','num','%K at/above this is overbought → sell (e.g. 80).'],
+  ['StochOversold','Stochastic oversold','num','%K at/below this is oversold → buy (e.g. 20).'],
+  ['SupertrendPeriod','Supertrend ATR period','int','ATR lookback for the Supertrend trend-follow band (e.g. 10).'],
+  ['SupertrendMult','Supertrend multiplier','num','ATR multiple for the Supertrend band (e.g. 3). Larger = fewer flips.'],
+  ['DonchianPeriod','Donchian period','int','Lookback for the Donchian breakout channel (highest high / lowest low, e.g. 20).'],
+];
+const EXIT_FIELDS = [
+  ['Enabled','Exits enabled','bool','Turn protective exits on/off. They run before strategy signals.'],
+  ['StopLossPct','Stop-loss','num','Sell if price falls this fraction below entry (0.05 = 5%). 0 disables.'],
+  ['TrailingStopPct','Trailing stop','num','Sell if price falls this fraction below the peak since entry. 0 disables.'],
+  ['TakeProfitPct','Take-profit','num','Sell if price rises this fraction above entry (0.20 = 20%). 0 disables.'],
+];
+
+function buildForm(el, fields, vals){
+  el.innerHTML='';
+  for(const [key,label,type,help] of fields){
+    const d=document.createElement('div'); d.className='field';
+    let input;
+    if(type.startsWith('select:')){
+      input=document.createElement('select');
+      for(const o of type.slice(7).split(',')){ const op=document.createElement('option'); op.value=o; op.textContent=o; input.appendChild(op);}
+      input.value=vals[key]??'';
+    } else if(type==='bool'){
+      input=document.createElement('select');
+      for(const o of ['true','false']){ const op=document.createElement('option'); op.value=o; op.textContent=o; input.appendChild(op);}
+      input.value=String(!!vals[key]);
+    } else {
+      input=document.createElement('input');
+      const v=vals[key];
+      input.value = Array.isArray(v) ? v.join(',')
+        : (v && typeof v==='object') ? Object.entries(v).map(([k,x])=>k+':'+x).join(',')
+        : (v??'');
+    }
+    input.dataset.key=key; input.dataset.type=type;
+    const l=document.createElement('label'); l.textContent=label;
+    const h=document.createElement('div'); h.className='help'; h.textContent=help;
+    d.appendChild(l); d.appendChild(input); d.appendChild(h); el.appendChild(d);
+  }
+}
+function readForm(el){
+  const o={};
+  el.querySelectorAll('[data-key]').forEach(i=>{
+    const k=i.dataset.key, t=i.dataset.type, v=i.value.trim();
+    if(k==='Detectors'||k==='DetectorsSell'){ o[k]=v.split(',').map(x=>x.trim()).filter(Boolean); }
+    else if(k==='Weights'){ const m={}; v.split(',').map(x=>x.trim()).filter(Boolean).forEach(pair=>{ const c=pair.indexOf(':'); if(c>0){ const kk=pair.slice(0,c).trim(), f=parseFloat(pair.slice(c+1)); if(kk&&!isNaN(f)) m[kk]=f; } }); o[k]=m; }
+    else if(t==='int'){ o[k]=parseInt(v||'0',10); }
+    else if(t==='num'){ o[k]=parseFloat(v||'0'); }
+    else if(t==='bool'){ o[k]= v==='true'; }
+    else { o[k]=v; }
+  });
+  return o;
+}
+
+// ---- loaders ----
+function applyStatus(s,pos){
+  $('#brokerPill').textContent='broker: '+s.broker;
+  $('#cashPill').textContent='cash '+fmt(pos.cash)+' / eq '+fmt(pos.equity);
+  const t=$('#tradingPill'); t.textContent='trading '+(s.trading_enabled?'ON':'OFF');
+  t.className='pill '+(s.trading_enabled?'on':'off');
+  $('#tradeToggle').dataset.on=s.trading_enabled;
+  $('#tradeToggle').textContent=s.trading_enabled?'Stop trading':'Start trading';
+  pushEquity(pos.equity);
+}
+async function loadStatus(){ applyStatus(await api('/status'), await api('/positions')); }
+// One round-trip for the frequently-polled slices (status, positions, open, metrics).
+async function loadDashboard(){
+  const d=await api('/dashboard');
+  applyStatus(d.status, d.positions);
+  applyPositions(d.open);
+  applyMetrics(d.metrics);
+}
+async function loadWatchlist(){
+  const w=await api('/watchlist'); const b=$('#wlBody'); b.innerHTML='';
+  (w.symbols||[]).forEach(sym=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${sym}</td><td class="num"><button class="danger" onclick="removeSymbol('${sym}')">remove</button></td>`;
+    b.appendChild(tr);
+  });
+}
+function applyPositions(p){
+  const b=$('#posBody'); b.innerHTML='';
+  if(!p||!p.length){ $('#posEmpty').textContent='No open positions.'; return; } $('#posEmpty').textContent='';
+  p.forEach(o=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${o.symbol}</td><td class="num">${fmt(o.qty,4)}</td><td class="num">${fmt(o.entry_price)}</td><td class="num">${fmt(o.peak)}</td>`+
+      `<td class="num"><button class="sell" onclick="sell('${o.symbol}',${o.qty})">Sell</button></td>`;
+    b.appendChild(tr);
+  });
+}
+async function loadPositions(){ applyPositions(await api('/open')); }
+async function loadStrategy(){ const r=await api('/strategy'); buildForm($('#stratForm'),STRAT_FIELDS,r.strategy); }
+async function loadSizing(){ const z=await api('/sizing'); $('#szOrder').value=z.order_size_usd; $('#szMin').value=z.min_positions; }
+async function saveSizing(){ try{ await api('/sizing',{method:'PUT',body:JSON.stringify({order_size_usd:parseFloat($('#szOrder').value||'0'),min_positions:parseInt($('#szMin').value||'0',10)})}); msg('#szMsg','applied ✓'); }catch(e){ msg('#szMsg','error: '+e); } }
+async function loadBehavior(){ const b=await api('/behavior'); $('#bhKeep').value=b.keep_interval; $('#bhBuy').value=b.confirm_buy; $('#bhSell').value=b.confirm_sell; }
+async function saveBehavior(){ try{ await api('/behavior',{method:'PUT',body:JSON.stringify({keep_interval:$('#bhKeep').value.trim(),confirm_buy:parseInt($('#bhBuy').value||'1',10),confirm_sell:parseInt($('#bhSell').value||'1',10)})}); msg('#bhMsg','applied ✓'); }catch(e){ msg('#bhMsg','error: '+e); } }
+async function loadExits(){ const x=await api('/exits'); buildForm($('#exitForm'),EXIT_FIELDS,x); }
+async function loadDetectors(){
+  const d=await api('/detectors'); const syms=Object.keys(d).sort();
+  // detector columns from the first symbol
+  const cols = syms.length ? d[syms[0]].map(x=>x.name) : [];
+  $('#detTable thead').innerHTML='<tr><th>Symbol</th>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
+  const b=$('#detBody'); b.innerHTML='';
+  syms.forEach(sym=>{
+    const cells=d[sym].map(x=>`<span class="det ${x.enabled?'en':''} act-${x.action}" title="${(x.reason||'').replace(/"/g,'')}">${x.action[0]} ${fmt(x.strength,2)}</span>`);
+    b.innerHTML+=`<tr><td>${sym}</td>${cells.map(c=>'<td>'+c+'</td>').join('')}</tr>`;
+  });
+}
+async function loadStats(){
+  const period = $('#statsPeriod').value || 'week';
+  const s = await api('/stats?period='+encodeURIComponent(period));
+  const tiles = [
+    ['Trades', s.trades],
+    ['Wins', s.wins],
+    ['Losses', s.losses],
+    ['Win rate', fmt(s.win_rate_pct,1)+'%'],
+    ['Total P&L', fmt(s.total_pnl,2)],
+    ['Avg win', fmt(s.avg_win,2)],
+    ['Avg loss', fmt(s.avg_loss,2)],
+  ];
+  $('#statsSummary').innerHTML = tiles.map(([l,v])=>`<div><span class="small muted">${l}</span><span style="font-size:18px">${v}</span></div>`).join('');
+  const b=$('#statsBySymbolBody'); b.innerHTML='';
+  (s.by_symbol||[]).forEach(x=>{
+    b.innerHTML+=`<tr><td>${x.symbol}</td><td class="num">${x.trades}</td><td class="num">${x.wins}</td><td class="num">${x.losses}</td><td class="num">${fmt(x.win_rate_pct,1)}</td><td class="num">${fmt(x.total_pnl,2)}</td></tr>`;
+  });
+}
+async function loadClosedTrades(){
+  const t = await api('/trades');
+  const closed = (t||[]).filter(x=>x.win!==undefined && x.win!==null);
+  const b=$('#closedTradesBody'); b.innerHTML='';
+  if(!closed.length){ $('#closedTradesEmpty').textContent='No closed trades yet.'; return; } $('#closedTradesEmpty').textContent='';
+  closed.slice(0,50).forEach(x=>{
+    const when=new Date(x.time).toLocaleString();
+    const cls = x.win ? 'win' : 'loss';
+    b.innerHTML+=`<tr><td class="small muted">${when}</td><td>${x.symbol}</td><td class="act-${x.side==='buy'?'BUY':'SELL'}">${x.side}</td>`+
+      `<td class="num">${fmt(x.qty,4)}</td><td class="num">${fmt(x.price)}</td>`+
+      `<td class="num ${cls}">${fmt(x.pnl,2)}</td><td class="num ${cls}">${fmt(x.pnl_pct,1)}%</td>`+
+      `<td class="${cls}" title="${(x.entry_indicators||'').replace(/"/g,'')}">${x.win?'WIN':'LOSS'}</td></tr>`;
+  });
+}
+async function loadErrors(){
+  const e=await api('/errors'); const b=$('#errBody'); b.innerHTML='';
+  if(!e||!e.length){ $('#errEmpty').textContent='No API errors recorded.'; return; } $('#errEmpty').textContent='';
+  e.slice(0,80).forEach(x=>{
+    const t=new Date(x.time).toLocaleTimeString();
+    b.innerHTML+=`<tr><td class="muted small">${t}</td><td class="err-${x.source}">${x.source}</td><td class="small">${(x.message||'').slice(0,200)}</td></tr>`;
+  });
+}
+
+// ---- live engine metrics ----
+function relTime(ts){
+  if(!ts) return '—';
+  const d=new Date(ts); if(isNaN(d)||d.getFullYear()<2000) return '—';
+  const s=(Date.now()-d.getTime())/1000; if(s<0) return '—';
+  if(s<60) return Math.round(s)+'s ago';
+  if(s<3600) return Math.round(s/60)+'m ago';
+  return Math.round(s/3600)+'h ago';
+}
+function applyMetrics(m){
+  const tiles=[
+    ['Ticks', fmt(m.ticks_ingested,0)],
+    ['Bars', fmt(m.bars_completed,0)],
+    ['Eval cycles', fmt(m.eval_cycles,0)],
+    ['Orders', fmt(m.orders_submitted,0)],
+    ['Open orders', fmt(m.open_orders,0)],
+    ['Last eval', m.last_eval_ms?fmt(m.last_eval_ms,1)+' ms':'—'],
+    ['Last eval @', relTime(m.last_eval_time)],
+  ];
+  $('#metricsTiles').innerHTML=tiles.map(([l,v])=>`<div><span class="small muted">${l}</span><span style="font-size:18px">${v}</span></div>`).join('');
+}
+async function loadMetrics(){ applyMetrics(await api('/metrics')); }
+
+// ---- equity sparkline (client-side rolling buffer, no deps) ----
+const equityHistory=[];
+function pushEquity(v){ if(v==null||isNaN(v)||v<=0) return; equityHistory.push(v); while(equityHistory.length>120) equityHistory.shift(); drawSpark(); }
+function drawSpark(){
+  const c=$('#equitySpark'); if(!c) return;
+  const W=c.width=(c.clientWidth||600), H=c.height;
+  const ctx=c.getContext('2d'); ctx.clearRect(0,0,W,H);
+  if(equityHistory.length<2) return;
+  const min=Math.min(...equityHistory), max=Math.max(...equityHistory), rng=(max-min)||1;
+  ctx.beginPath();
+  equityHistory.forEach((v,i)=>{ const x=i/(equityHistory.length-1)*W, y=H-3-((v-min)/rng)*(H-6); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  const cs=getComputedStyle(document.documentElement);
+  ctx.strokeStyle=(equityHistory[equityHistory.length-1]>=equityHistory[0]?cs.getPropertyValue('--buy'):cs.getPropertyValue('--sell')).trim();
+  ctx.lineWidth=1.5; ctx.stroke();
+}
+
+// ---- live activity feed (Server-Sent Events) ----
+let activityRows=0;
+function setLive(on){ const p=$('#livePill'); p.textContent='live '+(on?'ON':'off'); p.className='pill '+(on?'on':'off'); }
+function addActivity(type, symbol, detail, cls){
+  $('#activityEmpty').style.display='none';
+  const b=$('#activityBody');
+  const tr=document.createElement('tr'); tr.className='flash';
+  tr.innerHTML=`<td class="muted small">${new Date().toLocaleTimeString()}</td><td class="small">${type}</td>`+
+    `<td>${symbol||''}</td><td class="small ${cls||''}">${detail||''}</td>`;
+  b.insertBefore(tr, b.firstChild);
+  activityRows++;
+  while(activityRows>100 && b.lastChild){ b.removeChild(b.lastChild); activityRows--; }
+}
+function clearActivity(){ $('#activityBody').innerHTML=''; activityRows=0; $('#activityEmpty').style.display=''; }
+function startEventStream(){
+  let es;
+  const url='/api/events'+(AUTH?('?token='+encodeURIComponent(AUTH)):'');
+  try{ es=new EventSource(url); }catch{ setLive(false); return; }
+  es.onopen=()=>setLive(true);
+  es.onerror=()=>setLive(false); // browser auto-reconnects
+  es.addEventListener('signal', ev=>{ try{
+    const d=JSON.parse(ev.data), s=d.signal||{};
+    addActivity('signal', d.symbol, `${s.action} ${fmt(s.strength,2)} — ${s.reason||''}`, 'act-'+s.action);
+  }catch{} });
+  es.addEventListener('trade', ev=>{ try{
+    const d=JSON.parse(ev.data), t=d.trade||{}, side=(t.side||'').toUpperCase();
+    addActivity('trade', d.symbol, `${side} ${fmt(t.qty,4)} @ ${fmt(t.price)} — ${t.status} (${t.reason||''})`,
+      'act-'+(side==='BUY'?'BUY':'SELL'));
+  }catch{} });
+}
+
+// ---- actions ----
+async function addSymbol(){ const v=$('#wlInput').value.trim(); if(!v)return;
+  try{ await api('/watchlist',{method:'POST',body:JSON.stringify({symbols:v.split(',').map(s=>s.trim())})}); $('#wlInput').value=''; loadWatchlist(); }catch(e){ alert(e); } }
+async function removeSymbol(s){ try{ await api('/watchlist/'+encodeURIComponent(s),{method:'DELETE'}); loadWatchlist(); }catch(e){ alert(e); } }
+async function sell(sym,qty){ if(!confirm('Market SELL '+fmt(qty,4)+' '+sym+'?'))return;
+  try{ const r=await api('/orders',{method:'POST',body:JSON.stringify({symbol:sym,side:'sell',qty:qty})}); alert('Sell '+(r.status||'submitted')); loadPositions(); }catch(e){ alert('Sell failed: '+e); } }
+async function saveStrategy(){ try{ await api('/strategy',{method:'PUT',body:JSON.stringify(readForm($('#stratForm')))}); msg('#stratMsg','applied ✓'); loadDetectors(); }catch(e){ msg('#stratMsg','error: '+e); } }
+async function saveExits(){ try{ await api('/exits',{method:'PUT',body:JSON.stringify(readForm($('#exitForm')))}); msg('#exitMsg','applied ✓'); }catch(e){ msg('#exitMsg','error: '+e); } }
+function msg(sel,t){ const e=$(sel); e.textContent=' '+t; e.classList.add('flash'); setTimeout(()=>e.classList.remove('flash'),600); }
+
+$('#tradeToggle').onclick=async()=>{ const on=$('#tradeToggle').dataset.on==='true';
+  try{ await api('/trading',{method:'POST',body:JSON.stringify({enabled:!on})}); loadStatus(); }catch(e){ alert(e); } };
+$('#statsPeriod').onchange=loadStats;
+
+function refreshAll(){ loadDashboard(); loadWatchlist(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); }
+// initial load: forms once, data on a poll, activity via a live stream
+loadStrategy(); loadExits(); loadSizing(); loadBehavior(); refreshAll(); startEventStream();
+setInterval(()=>{ loadDashboard(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); }, 5000);
+window.addEventListener('resize', drawSpark);
+</script>
+</body>
+</html>

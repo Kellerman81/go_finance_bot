@@ -1,0 +1,220 @@
+# Example configuration — copy to data/config.yaml and fill in your own values.
+# Everything here runs OFFLINE out of the box: mock price feed, simulated
+# broker, trading disabled (dry-run). No secrets are required to start.
+#
+# ⚠️ WARNING: trading happens entirely at your own risk. This software can lose
+# money; the authors accept no responsibility for any losses. Prove a strategy
+# in paper/sim first and never trade money you cannot afford to lose.
+#
+# Secrets can also come from environment variables (which override this file):
+# FINNHUB_API_KEY, ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
+# ALPACA_USE_SIM, BOT_BROKER, SAXO_TOKEN, SAXO_BASE_URL, SAXO_APP_SECRET,
+# SAXO_CERT_PASSWORD, T212_API_KEY, T212_SECRET, T212_BASE_URL,
+# BOT_SERVER_ADDR, BOT_AUTH_TOKEN.
+
+server:
+  addr: ":8080"
+  # When set, every /api request must present this token — as
+  # "Authorization: Bearer <token>" or a ?token= query parameter (SSE stream).
+  # Empty disables auth. Set it (or BOT_AUTH_TOKEN) before exposing the port
+  # beyond localhost: the API can place orders and toggle live trading.
+  auth_token: ""
+
+finnhub:
+  api_key: ""                       # free key from https://finnhub.io — leave empty to run on the offline mock feed
+  rest_base: "https://finnhub.io/api/v1"
+  ws_base: "wss://ws.finnhub.io"
+
+# Execution venue: "sim" (offline simulator), "alpaca" (US), "saxo" (EU) or
+# "trading212" (EU).
+broker: "sim"
+
+alpaca:
+  key_id: ""
+  secret_key: ""
+  base_url: "https://paper-api.alpaca.markets"  # paper trading endpoint
+  paper: true
+  use_sim: true                     # true => internal simulator, no Alpaca calls
+  sim_cash: 100000                  # starting cash for the simulator
+
+# Saxo Bank OpenAPI (EU broker).
+# IMPORTANT: the token environment and base_url MUST match.
+#   SIM  token  -> base_url https://gateway.saxobank.com/sim/openapi
+#   LIVE token  -> base_url https://gateway.saxobank.com/openapi
+# auth_mode:
+#   "token"       static bearer token (e.g. the 24h SIM token from
+#                 developer.saxo) — must be replaced by hand when it expires.
+#   "certificate" unattended live auth: signs a JWT with your certificate and
+#                 auto-refreshes — no daily re-paste. Requires an approved live
+#                 application + certificate from Saxo (developer.saxo / MyAccount).
+saxo:
+  auth_mode: "token"
+  token: ""                         # OAuth bearer token (or set SAXO_TOKEN)
+  base_url: "https://gateway.saxobank.com/sim/openapi"   # SIM gateway
+  account_key: ""                   # optional; empty => first account
+  asset_types: "Stock,Etf"          # instrument-search scope for ticker -> Uic
+
+  # --- certificate-based auth (set auth_mode: "certificate") ---
+  app_key: ""                       # live application client_id
+  app_secret: ""                    # live application client_secret (or SAXO_APP_SECRET)
+  app_url: ""                       # registered application URL (JWT "spurl" claim)
+  user_id: ""                       # user the certificate is issued for (JWT "sub")
+  auth_url: ""                      # empty => derived from base_url (sim/live)
+  cert_path: ""                     # path to .p12/.pfx or PEM cert+key
+  cert_password: ""                 # certificate password (or SAXO_CERT_PASSWORD)
+
+# Trading 212 (EU). Self-service API key + secret — generate them in the
+# Trading 212 app (Settings -> API (Beta)), NO app approval needed. Start on
+# the demo endpoint.
+#   demo: https://demo.trading212.com/api/v0   live: https://live.trading212.com/api/v0
+# The key is tied to its environment, so base_url must match the key.
+# Note: the API has strict per-endpoint rate limits and no market-data stream,
+# so keep Finnhub for tracking and use Trading 212 only for execution.
+trading212:
+  api_key: ""                       # API key    (or set T212_API_KEY)
+  secret: ""                        # API secret (or set T212_SECRET) — sent as Basic auth
+  base_url: "https://demo.trading212.com/api/v0"
+  preferred_currency: "EUR"         # pick the EUR listing when an instrument has several
+  # Map watchlist symbols that aren't resolvable by ticker to their ISIN, e.g.:
+  # isins:
+  #   LEM.PA: "FR0010429068"
+
+# A few hundred symbols are supported; this is a small starter set.
+watchlist:
+  - AAPL
+  - MSFT
+  - NVDA
+  - QQQ
+  - SAP.DE
+  - SIE.DE
+
+# Hard money limits — enforced on EVERY order (automated and manual).
+# Set a value to 0 to disable that specific limit (max_order_value and
+# max_total_invested must be > 0 when trading is enabled).
+limits:
+  max_total_invested: 10000   # cap on total market value of all positions
+  max_per_position: 1000      # cap per single symbol (>= order_size_usd)
+  max_order_value: 500        # cap on a single order's notional value
+  max_daily_spend: 2000       # cap on cumulative buy notional per day
+  cash_reserve: 100           # cash that must always remain uninvested
+  max_open_positions: 50      # max distinct symbols held at once
+
+strategy:
+  # Detectors to run. With more than one, their results are compared/merged.
+  # Available: ema_cross, rsi, macd, bollinger, vwap, atr, rvol, volume_profile,
+  #            trend, adx, stochastic, supertrend, donchian
+  detectors: ["ema_cross", "rsi", "macd", "trend"]
+  # Detector set for SELL decisions; empty => reuse the buy detectors above.
+  # Lets you exit on different indicators than you enter on.
+  detectors_sell: []
+  # How to merge multiple detectors:
+  #   majority  - act on the side with strictly more votes
+  #   unanimous - act only if all opinionated detectors agree (none opposes)
+  #   weighted  - act on the sign of the net (strength-weighted) score
+  combine: "majority"
+  # Separate merge mode for SELL decisions (empty => same as combine above).
+  # Lets you be strict to enter and quick to exit.
+  combine_sell: ""
+  # Minimum combined confidence (0..1) required to BUY; weaker => HOLD.
+  # Higher = fewer, higher-conviction trades (fewer losses). 0.30 ~ very selective.
+  min_strength: 0.25
+  # Minimum confidence to SELL. -1 => same as min_strength. A lower value lets
+  # the bot exit on a weaker signal than it needs to enter.
+  min_strength_sell: -1
+  # Per-detector strength multipliers used when combining (missing => 1.0).
+  # Lets a "weighted" combine trust some signals more; 0 or negative mutes a
+  # detector's strength contribution without removing its vote. E.g.:
+  # weights:
+  #   trend: 2.0    # count the regression trend double
+  #   rsi: 0.5
+
+  fast_ma: 12
+  slow_ma: 26
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  rsi_mode: "midline"       # "midline" (graded, always votes) or "extremes" (only 30/70)
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20             # Bollinger Bands
+  bb_stddev: 2
+  vwap_period: 20           # VWAP window
+  atr_period: 14            # ATR breakout
+  atr_mult: 1.5
+  rvol_period: 20           # Relative Volume
+  rvol_threshold: 1.5
+  vp_window: 120            # Volume Profile window
+  vp_buckets: 24
+  vp_value_area_pct: 0.7
+  adx_period: 14            # ADX trend strength (+DI/-DI direction)
+  adx_threshold: 25         # min ADX to vote a trend
+  stoch_k_period: 14        # Stochastic oscillator
+  stoch_d_period: 3
+  stoch_overbought: 80
+  stoch_oversold: 20
+  supertrend_period: 10     # Supertrend ATR lookback
+  supertrend_mult: 3        # ATR multiple for the flip band (larger = fewer flips)
+  donchian_period: 20       # Donchian breakout channel lookback
+
+  # Trend: a least-squares regression slope over up to a week of 1-minute bars,
+  # so buy/sell decisions follow the prevailing direction instead of reacting to
+  # the last bar or two. Uses all available bars up to trend_period.
+  trend_period: 1950        # lookback in bars (~1 US trading week of 1-min bars)
+  trend_threshold: 0.01     # min end-to-end move of the fitted line to count as a trend
+  trend_gate: true          # uptrend blocks SELLs, downtrend blocks BUYs (exits still fire)
+
+# Trading commission model — folded into order sizing, money limits and P&L.
+# commission = max(commission_min, commission_flat + commission_pct * notional)
+costs:
+  commission_pct: 0.001     # e.g. 0.001 = 0.1% of notional
+  commission_flat: 0.0      # flat fee per order
+  commission_min: 0.0       # minimum commission per order
+
+engine:
+  eval_interval: 30s          # how often signals are re-evaluated
+  bar_interval: 1m            # candle size built from live ticks (default 1m);
+                              # larger bars trade on coarser, less noisy candles
+  trading_enabled: false      # false => dry-run (signals only, no orders)
+  order_size_usd: 250         # target notional per buy (used when min_positions = 0)
+  min_positions: 0            # 0 = fixed order_size_usd; >0 caps each buy at
+                              # max_total_invested / min_positions, so capital is
+                              # split across at least this many positions
+  allow_pyramiding: false     # false => one entry per symbol until exited (avoids churn)
+  # Minimum time to hold before a STRATEGY sell is allowed — stops the bot
+  # dumping a position seconds after buying on a blip. Protective exits
+  # (stop-loss/trailing/take-profit) still fire immediately. 0 = disabled.
+  keep_interval: 2h
+  # Require this many consecutive evaluations (eval_interval apart) to agree
+  # before acting, so a one-off reading doesn't trigger a trade. 1 = act at once.
+  confirm_buy: 2              # wait for a 2nd confirming check before buying
+  confirm_sell: 2             # wait for a 2nd confirming check before selling
+
+  # Only place automated orders when (or just before) the symbol's exchange is
+  # open, so the bot doesn't act on a price left stale by a closed venue.
+  # Protective exits are NOT gated. Holidays are not modelled.
+  market_hours_check: true
+  pre_open_window: 5m         # also allow orders this long before the open
+  # Re-confirm the execution price from market data right before an automated
+  # order. The live feed may lag or be a different listing/currency than the
+  # broker trades; the confirmed venue price is used for sizing and risk.
+  venue_price_check: true
+  max_price_deviation: 0.02   # block a BUY if the venue price moved >2% from the signal (0 = don't block)
+
+# Protective exits applied to open positions BEFORE strategy signals.
+# Percentages are fractions (0.05 = 5%); set to 0 to disable a rule.
+exits:
+  enabled: true
+  stop_loss_pct: 0.05         # sell if price falls 5% below entry
+  trailing_stop_pct: 0.08     # sell if price falls 8% below peak-since-entry
+  take_profit_pct: 0.20       # sell if price rises 20% above entry
+
+# Persistence of trades, watchlist and daily spend.
+storage:
+  driver: "sqlite"            # "sqlite" or "none"
+  path: "data/finance_bot.db" # kept alongside this config in the data/ dir
+
+# Automated-trading safety controls.
+safety:
+  max_orders_per_min: 20      # trip a breaker (halt auto-trading) above this rate; 0 disables
+  min_order_interval: 1100ms  # minimum gap between order submissions (Saxo ~1/sec)

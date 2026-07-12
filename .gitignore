@@ -1,0 +1,21 @@
+# local config with secrets
+config.yaml
+
+# binaries
+/bot
+/bot.exe
+*.exe
+
+# sqlite database files
+*.db
+*.db-journal
+*.db-wal
+
+# env
+.env
+
+# saxo certificates / keys
+*.p12
+*.pfx
+*.pem
+*.key

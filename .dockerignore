@@ -1,0 +1,28 @@
+# VCS & local
+.git
+.gitignore
+*.md
+
+# build artifacts / binaries
+bot
+bot.exe
+*.exe
+
+# local data & secrets (mounted at runtime, never baked into the image)
+data/
+*.db
+*.db-journal
+*.db-wal
+.env
+config.yaml
+
+# certs/keys
+*.p12
+*.pfx
+*.pem
+*.key
+
+# docker
+Dockerfile
+.dockerignore
+docker-compose.yml

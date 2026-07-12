@@ -1,0 +1,20 @@
+services:
+  go_finance_bot:
+    build:
+      context: /mnt/cache/docker_data/go_finance_bot   # repo root (has go.mod + Dockerfile)
+      dockerfile: Dockerfile                           # relative to the context above
+    image: go_finance_bot
+    container_name: go_finance_bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"               # gin HTTP API (matches server.addr in config.yaml)
+    # Single mounted directory holds BOTH config.yaml and finance_bot.db.
+    # Edit ./data/config.yaml on the host; the DB persists in the same dir.
+    volumes:
+      - /mnt/cache/docker_data/go_finance_bot/data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
