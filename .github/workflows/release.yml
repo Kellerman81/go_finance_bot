@@ -44,7 +44,8 @@ jobs:
                 -o "$out/finance_${cmd}${ext}" "./cmd/${cmd}"
             done
             cp README.md "$out/"
-            cp data/config.example.yaml "$out/data/"
+            cp data/config.yaml "$out/data/"
+            cp data/finance_bot.db "$out/data/"
             name="go_finance_bot_${VERSION}_${GOOS}_${GOARCH}"
             if [ "$GOOS" = "windows" ]; then
               (cd "$out" && zip -qr "../${name}.zip" .)
