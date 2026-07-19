@@ -2,7 +2,7 @@ package market
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 )
@@ -39,64 +39,88 @@ func NewReplay(data map[string][]Candle, interval time.Duration) *Replay {
 		done:       make(chan struct{}),
 	}
 	if r.data == nil {
-		r.data = map[string][]Candle{}
+		r.data = make(map[string][]Candle)
 	}
+
 	if interval > 0 {
 		go r.run()
 	}
+
 	return r
 }
 
+// Quotes returns the replayed tick channel.
 func (r *Replay) Quotes() <-chan Quote { return r.out }
 
+// LastQuote returns the most recent replayed tick for symbol.
 func (r *Replay) LastQuote(symbol string) (Quote, bool) {
 	r.mu.Lock()
+
 	q, ok := r.last[symbol]
 	r.mu.Unlock()
+
 	return q, ok
 }
 
+// Subscribe registers symbols for replay.
 func (r *Replay) Subscribe(symbols ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	if r.closed {
-		return fmt.Errorf("provider closed")
+		return errors.New("provider closed")
 	}
+
 	for _, s := range symbols {
 		if s != "" {
 			r.subscribed[s] = struct{}{}
 		}
 	}
+
 	return nil
 }
 
+// Unsubscribe stops replaying the given symbols.
 func (r *Replay) Unsubscribe(symbols ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	for _, s := range symbols {
 		delete(r.subscribed, s)
 	}
+
 	return nil
 }
 
 // Candles returns the preloaded history for symbol within [from, to]. The
 // resolution is ignored — the data is served at whatever resolution it was
 // loaded — so callers should load at the resolution they intend to replay.
-func (r *Replay) Candles(_ context.Context, symbol string, _ Resolution, from, to time.Time) ([]Candle, error) {
+func (r *Replay) Candles(
+	_ context.Context,
+	symbol string,
+	_ Resolution,
+	from, to time.Time,
+) ([]Candle, error) {
 	r.mu.Lock()
+
 	all := r.data[symbol]
 	r.mu.Unlock()
+
 	return sliceByTime(all, from, to), nil
 }
 
+// Close stops the replay and closes the tick channel.
 func (r *Replay) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	if r.closed {
 		return nil
 	}
+
 	r.closed = true
 	close(r.done)
+
 	return nil
 }
 
@@ -105,33 +129,46 @@ func (r *Replay) Close() error {
 func (r *Replay) run() {
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-r.done:
 			close(r.out)
+
 			return
+
 		case <-t.C:
 			r.mu.Lock()
+
 			batch := make([]Quote, 0, len(r.subscribed))
 			for s := range r.subscribed {
 				candles := r.data[s]
 				i := r.cursor[s]
+
 				if i >= len(candles) {
 					continue
 				}
+
 				c := candles[i]
+
 				r.cursor[s] = i + 1
+
 				q := Quote{Symbol: s, Price: c.Close, Volume: c.Volume, Time: c.Time}
+
 				r.last[s] = q
 				batch = append(batch, q)
 			}
+
 			r.mu.Unlock()
+
 			for _, q := range batch {
 				select {
 				case r.out <- q:
 				case <-r.done:
 					close(r.out)
+
 					return
+
 				default:
 				}
 			}

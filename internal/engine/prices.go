@@ -18,6 +18,7 @@ func NewPriceCache() *PriceCache {
 // Set records the latest price for a symbol.
 func (c *PriceCache) Set(symbol string, price float64) {
 	c.mu.Lock()
+
 	c.m[symbol] = price
 	c.mu.Unlock()
 }
@@ -26,7 +27,9 @@ func (c *PriceCache) Set(symbol string, price float64) {
 func (c *PriceCache) Get(symbol string) (float64, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	p, ok := c.m[symbol]
+
 	return p, ok
 }
 
@@ -34,9 +37,11 @@ func (c *PriceCache) Get(symbol string) (float64, bool) {
 func (c *PriceCache) Snapshot() map[string]float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	out := make(map[string]float64, len(c.m))
 	for k, v := range c.m {
 		out[k] = v
 	}
+
 	return out
 }

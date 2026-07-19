@@ -16,7 +16,12 @@ type countingFetcher struct {
 	err     error
 }
 
-func (c *countingFetcher) Candles(_ context.Context, _ string, _ Resolution, from, to time.Time) ([]Candle, error) {
+func (c *countingFetcher) Candles(
+	_ context.Context,
+	_ string,
+	_ Resolution,
+	from, to time.Time,
+) ([]Candle, error) {
 	atomic.AddInt64(&c.calls, 1)
 	if c.err != nil {
 		return nil, c.err
@@ -69,7 +74,13 @@ func TestCachingHistorySlicesToWindow(t *testing.T) {
 	src := &countingFetcher{candles: minuteCandles(60, start)}
 	c := NewCachingHistory(src, time.Minute)
 	// Prime the cache with the full hour.
-	if _, err := c.Candles(context.Background(), "AAPL", Res1Min, start, start.Add(time.Hour)); err != nil {
+	if _, err := c.Candles(
+		context.Background(),
+		"AAPL",
+		Res1Min,
+		start,
+		start.Add(time.Hour),
+	); err != nil {
 		t.Fatal(err)
 	}
 	// A narrower sub-window is served from cache, sliced to [from,to].
@@ -106,19 +117,35 @@ func TestFallbackHistoryOrder(t *testing.T) {
 		t.Errorf("fallback returned %d candles, want 5 from secondary", len(got))
 	}
 	if primary.calls != 1 || secondary.calls != 1 {
-		t.Errorf("expected both sources tried once, got primary=%d secondary=%d", primary.calls, secondary.calls)
+		t.Errorf(
+			"expected both sources tried once, got primary=%d secondary=%d",
+			primary.calls,
+			secondary.calls,
+		)
 	}
 
 	// Empty (not error) also falls through to the next source.
 	empty := &countingFetcher{candles: nil}
 	fb2 := NewFallbackHistory(empty, secondary)
-	if _, err := fb2.Candles(context.Background(), "AAPL", Res1Min, start, start.Add(time.Hour)); err != nil {
+	if _, err := fb2.Candles(
+		context.Background(),
+		"AAPL",
+		Res1Min,
+		start,
+		start.Add(time.Hour),
+	); err != nil {
 		t.Fatal(err)
 	}
 
 	// All sources empty => error.
 	fb3 := NewFallbackHistory(&countingFetcher{}, &countingFetcher{})
-	if _, err := fb3.Candles(context.Background(), "AAPL", Res1Min, start, start.Add(time.Hour)); err == nil {
+	if _, err := fb3.Candles(
+		context.Background(),
+		"AAPL",
+		Res1Min,
+		start,
+		start.Add(time.Hour),
+	); err == nil {
 		t.Error("expected error when every source is empty")
 	}
 }
@@ -129,7 +156,14 @@ func TestResampleAggregatesBuckets(t *testing.T) {
 	in := make([]Candle, 10)
 	for i := 0; i < 10; i++ {
 		p := float64(100 + i)
-		in[i] = Candle{Open: p, High: p + 0.5, Low: p - 0.5, Close: p, Volume: 1, Time: start.Add(time.Duration(i) * time.Minute)}
+		in[i] = Candle{
+			Open:   p,
+			High:   p + 0.5,
+			Low:    p - 0.5,
+			Close:  p,
+			Volume: 1,
+			Time:   start.Add(time.Duration(i) * time.Minute),
+		}
 	}
 	out := Resample(in, Res5Min)
 	if len(out) != 2 {

@@ -7,11 +7,11 @@ import "sync"
 
 // Holding is a single tracked position.
 type Holding struct {
-	Symbol      string  `json:"symbol"`
-	Qty         float64 `json:"qty"`
-	AvgPrice    float64 `json:"avg_price"`
-	LastPrice   float64 `json:"last_price"`
-	MarketValue float64 `json:"market_value"`
+	Symbol       string  `json:"symbol"`
+	Qty          float64 `json:"qty"`
+	AvgPrice     float64 `json:"avg_price"`
+	LastPrice    float64 `json:"last_price"`
+	MarketValue  float64 `json:"market_value"`
 	UnrealizedPL float64 `json:"unrealized_pl"`
 }
 
@@ -39,6 +39,7 @@ func New() *Portfolio {
 // SetCash updates the cash balance.
 func (p *Portfolio) SetCash(cash float64) {
 	p.mu.Lock()
+
 	p.cash = cash
 	p.mu.Unlock()
 }
@@ -47,9 +48,11 @@ func (p *Portfolio) SetCash(cash float64) {
 func (p *Portfolio) SyncPositions(hs []Holding) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.holdings = make(map[string]*Holding, len(hs))
 	for i := range hs {
 		h := hs[i]
+
 		p.holdings[h.Symbol] = &h
 	}
 }
@@ -58,11 +61,15 @@ func (p *Portfolio) SyncPositions(hs []Holding) {
 func (p *Portfolio) MarkPrice(symbol string, price float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if h, ok := p.holdings[symbol]; ok {
-		h.LastPrice = price
-		h.MarketValue = price * h.Qty
-		h.UnrealizedPL = (price - h.AvgPrice) * h.Qty
+
+	h, ok := p.holdings[symbol]
+	if !ok {
+		return
 	}
+
+	h.LastPrice = price
+	h.MarketValue = price * h.Qty
+	h.UnrealizedPL = (price - h.AvgPrice) * h.Qty
 }
 
 // PositionQty returns the quantity held in a symbol without allocating a full
@@ -70,9 +77,11 @@ func (p *Portfolio) MarkPrice(symbol string, price float64) {
 func (p *Portfolio) PositionQty(symbol string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if h, ok := p.holdings[symbol]; ok {
 		return h.Qty
 	}
+
 	return 0
 }
 
@@ -80,9 +89,11 @@ func (p *Portfolio) PositionQty(symbol string) float64 {
 func (p *Portfolio) PositionValue(symbol string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if h, ok := p.holdings[symbol]; ok {
 		return h.MarketValue
 	}
+
 	return 0
 }
 
@@ -90,15 +101,19 @@ func (p *Portfolio) PositionValue(symbol string) float64 {
 func (p *Portfolio) Snapshot() Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	out := Snapshot{
 		Cash:     p.cash,
 		Holdings: make(map[string]Holding, len(p.holdings)),
 	}
 	for sym, h := range p.holdings {
 		out.Holdings[sym] = *h
+
 		out.Invested += h.MarketValue
 	}
+
 	out.OpenPositions = len(p.holdings)
 	out.Equity = out.Cash + out.Invested
+
 	return out
 }

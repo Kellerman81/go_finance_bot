@@ -56,7 +56,10 @@ func TestBarStoreSeedKeepsRecent(t *testing.T) {
 	base := time.Now()
 	candles := make([]market.Candle, 10)
 	for i := range candles {
-		candles[i] = market.Candle{Close: float64(i), Time: base.Add(time.Duration(i) * time.Minute)}
+		candles[i] = market.Candle{
+			Close: float64(i),
+			Time:  base.Add(time.Duration(i) * time.Minute),
+		}
 	}
 	bs.seed("X", candles)
 	series := bs.series("X")

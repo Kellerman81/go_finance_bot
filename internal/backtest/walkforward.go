@@ -34,30 +34,37 @@ type WalkForward struct {
 // lookback for the estimate to be meaningful. It returns each fold and the mean
 // out-of-sample score/return.
 func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, grid ParamGrid,
-	cash float64, minTrades, folds int, score Scorer, respectLimits bool) WalkForward {
-
+	cash float64, minTrades, folds int, score Scorer, respectLimits bool,
+) WalkForward {
 	if folds < 1 {
 		folds = 1
 	}
+
 	maxLen := 0
 	for _, c := range data {
 		if len(c) > maxLen {
 			maxLen = len(c)
 		}
 	}
+
 	seg := maxLen / (folds + 1)
+
 	var wf WalkForward
+
 	if seg < 2 {
 		return wf // not enough data to split
 	}
 
 	var sumScore, sumRet float64
+
 	for k := 1; k <= folds; k++ {
 		trainEnd := k * seg
 		testEnd := (k + 1) * seg
+
 		if k == folds {
 			testEnd = maxLen // last fold soaks up any remainder
 		}
+
 		train := sliceData(data, 0, trainEnd)
 		test := sliceData(data, trainEnd, testEnd)
 
@@ -65,21 +72,35 @@ func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, gr
 		if len(trials) == 0 {
 			continue
 		}
+
 		best := trials[0]
-		res := runConfig(base, test, best.Params,
-			best.CapitalFrac, best.StopLoss, best.TrailingStop, best.TakeProfit, cash, respectLimits)
+		res := runConfig(
+			base,
+			test,
+			best.Params,
+			best.CapitalFrac,
+			best.StopLoss,
+			best.TrailingStop,
+			best.TakeProfit,
+			cash,
+			respectLimits,
+		)
 		s := score(res)
+
 		sumScore += s
 		sumRet += res.TotalReturnPct
+
 		wf.Folds = append(wf.Folds, WFFold{
 			TrainBars: trainEnd, TestBars: testEnd - trainEnd,
 			Best: best, Test: res, TestScore: s,
 		})
 	}
+
 	if n := len(wf.Folds); n > 0 {
 		wf.MeanOOSScore = sumScore / float64(n)
 		wf.MeanOOSReturn = sumRet / float64(n)
 	}
+
 	return wf
 }
 
@@ -92,13 +113,17 @@ func sliceData(data map[string][]market.Candle, lo, hi int) map[string][]market.
 		if a < 0 {
 			a = 0
 		}
+
 		if b > len(c) {
 			b = len(c)
 		}
+
 		if a >= b {
 			continue
 		}
+
 		out[s] = c[a:b]
 	}
+
 	return out
 }

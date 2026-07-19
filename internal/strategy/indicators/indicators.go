@@ -11,18 +11,22 @@ func SMA(values []float64, period int) []float64 {
 	if period <= 0 {
 		return fillNaN(out)
 	}
+
 	var sum float64
+
 	for i := range values {
 		sum += values[i]
 		if i >= period {
 			sum -= values[i-period]
 		}
+
 		if i >= period-1 {
 			out[i] = sum / float64(period)
 		} else {
 			out[i] = math.NaN()
 		}
 	}
+
 	return out
 }
 
@@ -41,18 +45,26 @@ func EMA(values []float64, period int) []float64 {
 	if period <= 0 || len(values) < period {
 		return fillNaN(out)
 	}
+
 	k := 2.0 / float64(period+1)
+
 	var seed float64
-	for i := 0; i < period; i++ {
+
+	for i := range period {
 		seed += values[i]
+
 		out[i] = math.NaN()
 	}
+
 	prev := seed / float64(period)
+
 	out[period-1] = prev
+
 	for i := period; i < len(values); i++ {
 		prev = (values[i]-prev)*k + prev
 		out[i] = prev
 	}
+
 	return out
 }
 
@@ -63,15 +75,20 @@ func EMALast(values []float64, period int) (float64, bool) {
 	if period <= 0 || len(values) < period {
 		return 0, false
 	}
+
 	k := 2.0 / float64(period+1)
+
 	var seed float64
-	for i := 0; i < period; i++ {
+
+	for i := range period {
 		seed += values[i]
 	}
+
 	prev := seed / float64(period)
 	for i := period; i < len(values); i++ {
 		prev = (values[i]-prev)*k + prev
 	}
+
 	return prev, true
 }
 
@@ -81,7 +98,9 @@ func RSI(values []float64, period int) []float64 {
 	if period <= 0 || len(values) <= period {
 		return out
 	}
+
 	var gain, loss float64
+
 	for i := 1; i <= period; i++ {
 		ch := values[i] - values[i-1]
 		if ch >= 0 {
@@ -90,21 +109,27 @@ func RSI(values []float64, period int) []float64 {
 			loss -= ch
 		}
 	}
+
 	avgGain := gain / float64(period)
 	avgLoss := loss / float64(period)
+
 	out[period] = rsiFrom(avgGain, avgLoss)
+
 	for i := period + 1; i < len(values); i++ {
 		ch := values[i] - values[i-1]
 		g, l := 0.0, 0.0
+
 		if ch >= 0 {
 			g = ch
 		} else {
 			l = -ch
 		}
+
 		avgGain = (avgGain*float64(period-1) + g) / float64(period)
 		avgLoss = (avgLoss*float64(period-1) + l) / float64(period)
 		out[i] = rsiFrom(avgGain, avgLoss)
 	}
+
 	return out
 }
 
@@ -114,7 +139,9 @@ func RSILast(values []float64, period int) (float64, bool) {
 	if period <= 0 || len(values) <= period {
 		return 0, false
 	}
+
 	var gain, loss float64
+
 	for i := 1; i <= period; i++ {
 		ch := values[i] - values[i-1]
 		if ch >= 0 {
@@ -123,27 +150,35 @@ func RSILast(values []float64, period int) (float64, bool) {
 			loss -= ch
 		}
 	}
+
 	avgGain := gain / float64(period)
 	avgLoss := loss / float64(period)
+
 	for i := period + 1; i < len(values); i++ {
 		ch := values[i] - values[i-1]
 		g, l := 0.0, 0.0
+
 		if ch >= 0 {
 			g = ch
 		} else {
 			l = -ch
 		}
+
 		avgGain = (avgGain*float64(period-1) + g) / float64(period)
 		avgLoss = (avgLoss*float64(period-1) + l) / float64(period)
 	}
+
 	return rsiFrom(avgGain, avgLoss), true
 }
 
+// rsiFrom converts average gain/loss into the 0–100 RSI value.
 func rsiFrom(avgGain, avgLoss float64) float64 {
 	if avgLoss == 0 {
 		return 100
 	}
+
 	rs := avgGain / avgLoss
+
 	return 100 - (100 / (1 + rs))
 }
 
@@ -159,6 +194,7 @@ func MACD(values []float64, fast, slow, signal int) MACDResult {
 	emaFast := EMA(values, fast)
 	emaSlow := EMA(values, slow)
 	macd := make([]float64, len(values))
+
 	for i := range values {
 		if math.IsNaN(emaFast[i]) || math.IsNaN(emaSlow[i]) {
 			macd[i] = math.NaN()
@@ -170,6 +206,7 @@ func MACD(values []float64, fast, slow, signal int) MACDResult {
 	// Signal line is the EMA of the defined portion of the MACD series.
 	start := firstDefined(macd)
 	sig := fillNaN(make([]float64, len(values)))
+
 	if start >= 0 && len(macd)-start >= signal {
 		defined := macd[start:]
 		sigDefined := EMA(defined, signal)
@@ -184,6 +221,7 @@ func MACD(values []float64, fast, slow, signal int) MACDResult {
 			hist[i] = macd[i] - sig[i]
 		}
 	}
+
 	return MACDResult{MACD: macd, Signal: sig, Histogram: hist}
 }
 
@@ -192,27 +230,38 @@ func MACD(values []float64, fast, slow, signal int) MACDResult {
 // allocations, which matters in the backtest/optimizer hot loop where the MACD
 // detector runs once per bar per symbol. ok is false while the histogram is
 // undefined (fewer than max(fast,slow)+signal-1 values).
+//
+//nolint:revive,cyclop // four results are clearer than a struct; the EMA seeding is one pass
 func MACDLast(values []float64, fast, slow, signal int) (macd, sig, hist float64, ok bool) {
 	n := len(values)
+
 	if fast <= 0 || slow <= 0 || signal <= 0 {
 		return 0, 0, 0, false
 	}
+
 	start := slow // first index where both EMAs (and thus MACD) are defined
 	if fast > slow {
 		start = fast
 	}
+
 	start--
 	if n < start+signal {
 		return 0, 0, 0, false
 	}
+
 	kf := 2.0 / float64(fast+1)
 	ks := 2.0 / float64(slow+1)
 	kg := 2.0 / float64(signal+1)
-	var fSum, sSum, fPrev, sPrev float64
-	var seedSum, sigPrev float64
+
+	var (
+		fSum, sSum, fPrev, sPrev float64
+		seedSum, sigPrev         float64
+	)
+
 	seedCount := 0
 	sigDefined := false
-	for i := 0; i < n; i++ {
+
+	for i := range n {
 		v := values[i]
 		if i < fast {
 			fSum += v
@@ -222,6 +271,7 @@ func MACDLast(values []float64, fast, slow, signal int) (macd, sig, hist float64
 		} else {
 			fPrev = (v-fPrev)*kf + fPrev
 		}
+
 		if i < slow {
 			sSum += v
 			if i == slow-1 {
@@ -230,42 +280,53 @@ func MACDLast(values []float64, fast, slow, signal int) (macd, sig, hist float64
 		} else {
 			sPrev = (v-sPrev)*ks + sPrev
 		}
+
 		if i < start {
 			continue
 		}
+
 		macd = fPrev - sPrev
 		if !sigDefined {
 			// Seed the signal EMA with the SMA of the first `signal` MACD values,
 			// exactly as MACD() seeds EMA(macd[start:], signal).
 			seedSum += macd
 			seedCount++
+
 			if seedCount == signal {
 				sigPrev = seedSum / float64(signal)
 				sigDefined = true
 			}
+
 			continue
 		}
+
 		sigPrev = (macd-sigPrev)*kg + sigPrev
 	}
+
 	if !sigDefined {
 		return 0, 0, 0, false
 	}
+
 	return macd, sigPrev, macd - sigPrev, true
 }
 
+// firstDefined returns the index of the first non-NaN value, or -1.
 func firstDefined(v []float64) int {
 	for i := range v {
 		if !math.IsNaN(v[i]) {
 			return i
 		}
 	}
+
 	return -1
 }
 
+// fillNaN sets every element to NaN and returns the slice.
 func fillNaN(v []float64) []float64 {
 	for i := range v {
 		v[i] = math.NaN()
 	}
+
 	return v
 }
 
@@ -276,5 +337,6 @@ func Last(v []float64) (float64, bool) {
 			return v[i], true
 		}
 	}
+
 	return 0, false
 }

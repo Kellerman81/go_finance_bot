@@ -5,12 +5,13 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec,revive // SHA-1 is mandated by the JWT x5t thumbprint spec
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 // TokenSource supplies a currently-valid Saxo bearer token, refreshing as
 // needed. The Saxo broker calls it on every request.
 type TokenSource interface {
+	// Token returns a currently-valid bearer token.
 	Token(ctx context.Context) (string, error)
 }
 
@@ -34,12 +36,18 @@ type TokenSource interface {
 type StaticTokenSource struct{ token string }
 
 // NewStaticTokenSource wraps a fixed bearer token.
-func NewStaticTokenSource(token string) *StaticTokenSource { return &StaticTokenSource{token: token} }
+func NewStaticTokenSource(
+	token string,
+) *StaticTokenSource {
+	return &StaticTokenSource{token: token}
+}
 
+// Token returns the fixed token, or an error when none is configured.
 func (s *StaticTokenSource) Token(context.Context) (string, error) {
 	if s.token == "" {
-		return "", fmt.Errorf("saxo: no token configured")
+		return "", errors.New("saxo: no token configured")
 	}
+
 	return s.token, nil
 }
 
@@ -61,11 +69,11 @@ type CertConfig struct {
 // personal-jwt grant, then keeps the token fresh using the returned refresh
 // token (falling back to a new assertion when the refresh token expires).
 type certTokenSource struct {
-	cfg        CertConfig
-	tokenURL   string
-	key        *rsa.PrivateKey
-	x5t        string // base64url SHA-1 thumbprint of the certificate
-	http       *http.Client
+	cfg      CertConfig
+	tokenURL string
+	key      *rsa.PrivateKey
+	x5t      string // base64url SHA-1 thumbprint of the certificate
+	http     *http.Client
 
 	mu         sync.Mutex
 	access     string
@@ -77,16 +85,20 @@ type certTokenSource struct {
 // NewCertTokenSource loads the certificate and prepares a CBA token source.
 func NewCertTokenSource(cfg CertConfig) (*certTokenSource, error) {
 	if cfg.AppKey == "" || cfg.UserID == "" || cfg.CertPath == "" {
-		return nil, fmt.Errorf("saxo cert auth requires app_key, user_id and cert_path")
+		return nil, errors.New("saxo cert auth requires app_key, user_id and cert_path")
 	}
+
 	if cfg.AuthURL == "" {
-		return nil, fmt.Errorf("saxo cert auth requires auth_url")
+		return nil, errors.New("saxo cert auth requires auth_url")
 	}
+
 	key, cert, err := loadCertificate(cfg.CertPath, cfg.CertPassword)
 	if err != nil {
 		return nil, err
 	}
-	sum := sha1.Sum(cert.Raw)
+
+	sum := sha1.Sum(cert.Raw) //nolint:gosec // x5t is SHA-1 by spec
+
 	return &certTokenSource{
 		cfg:      cfg,
 		tokenURL: strings.TrimRight(cfg.AuthURL, "/") + "/token",
@@ -96,6 +108,8 @@ func NewCertTokenSource(cfg CertConfig) (*certTokenSource, error) {
 	}, nil
 }
 
+// Token returns a cached access token, exchanging a freshly signed JWT
+// assertion for a new one shortly before expiry.
 func (c *certTokenSource) Token(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -104,6 +118,7 @@ func (c *certTokenSource) Token(ctx context.Context) (string, error) {
 	if c.access != "" && now.Before(c.accessExp.Add(-30*time.Second)) {
 		return c.access, nil
 	}
+
 	// Prefer a cheap refresh while the refresh token is still valid.
 	if c.refresh != "" && now.Before(c.refreshExp.Add(-30*time.Second)) {
 		if err := c.exchange(ctx, url.Values{
@@ -113,17 +128,20 @@ func (c *certTokenSource) Token(ctx context.Context) (string, error) {
 			return c.access, nil
 		}
 	}
+
 	// Otherwise (or on refresh failure) mint a fresh token from a JWT assertion.
 	assertion, err := c.signAssertion()
 	if err != nil {
 		return "", err
 	}
+
 	if err := c.exchange(ctx, url.Values{
 		"grant_type": {"urn:saxobank:oauth:grant-type:personal-jwt"},
 		"assertion":  {assertion},
 	}); err != nil {
 		return "", err
 	}
+
 	return c.access, nil
 }
 
@@ -138,26 +156,48 @@ func (c *certTokenSource) signAssertion() (string, error) {
 		"spurl": c.cfg.AppURL,
 		"exp":   now.Add(2 * time.Minute).Unix(),
 	}
-	hb, _ := json.Marshal(header)
-	pb, _ := json.Marshal(payload)
-	signingInput := base64.RawURLEncoding.EncodeToString(hb) + "." + base64.RawURLEncoding.EncodeToString(pb)
+
+	hb, err := json.Marshal(header)
+	if err != nil {
+		return "", fmt.Errorf("marshal jwt header: %w", err)
+	}
+
+	pb, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal jwt payload: %w", err)
+	}
+
+	signingInput := base64.RawURLEncoding.EncodeToString(
+		hb,
+	) + "." + base64.RawURLEncoding.EncodeToString(
+		pb,
+	)
 
 	digest := sha256.Sum256([]byte(signingInput))
+
 	sig, err := rsa.SignPKCS1v15(rand.Reader, c.key, crypto.SHA256, digest[:])
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
 	}
+
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
 // exchange POSTs to the token endpoint and stores the resulting tokens. Caller
 // holds c.mu.
 func (c *certTokenSource) exchange(ctx context.Context, form url.Values) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.tokenURL,
+		strings.NewReader(form.Encode()),
+	)
 	if err != nil {
 		return err
 	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
 	if c.cfg.AppSecret != "" {
 		req.SetBasicAuth(c.cfg.AppKey, c.cfg.AppSecret)
 	}
@@ -167,6 +207,7 @@ func (c *certTokenSource) exchange(ctx context.Context, form url.Values) error {
 		return err
 	}
 	defer resp.Body.Close()
+
 	var body struct {
 		AccessToken           string `json:"access_token"`
 		ExpiresIn             int    `json:"expires_in"`
@@ -175,20 +216,30 @@ func (c *certTokenSource) exchange(ctx context.Context, form url.Values) error {
 		Error                 string `json:"error"`
 		ErrorDescription      string `json:"error_description"`
 	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return fmt.Errorf("saxo token decode: %w", err)
 	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || body.AccessToken == "" {
-		return fmt.Errorf("saxo token endpoint: status %d: %s %s", resp.StatusCode, body.Error, body.ErrorDescription)
+		return fmt.Errorf(
+			"saxo token endpoint: status %d: %s %s",
+			resp.StatusCode,
+			body.Error,
+			body.ErrorDescription,
+		)
 	}
 
 	now := time.Now()
+
 	c.access = body.AccessToken
 	c.accessExp = now.Add(time.Duration(body.ExpiresIn) * time.Second)
+
 	if body.RefreshToken != "" {
 		c.refresh = body.RefreshToken
 		c.refreshExp = now.Add(time.Duration(body.RefreshTokenExpiresIn) * time.Second)
 	}
+
 	return nil
 }
 
@@ -199,64 +250,85 @@ func loadCertificate(path, password string) (*rsa.PrivateKey, *x509.Certificate,
 	if err != nil {
 		return nil, nil, fmt.Errorf("read cert %s: %w", path, err)
 	}
+
 	lower := strings.ToLower(path)
 	if strings.HasSuffix(lower, ".p12") || strings.HasSuffix(lower, ".pfx") {
 		priv, cert, err := pkcs12.Decode(data, password)
 		if err != nil {
 			return nil, nil, fmt.Errorf("decode pkcs12: %w", err)
 		}
+
 		key, ok := priv.(*rsa.PrivateKey)
 		if !ok {
-			return nil, nil, fmt.Errorf("pkcs12: private key is not RSA")
+			return nil, nil, errors.New("pkcs12: private key is not RSA")
 		}
+
 		return key, cert, nil
 	}
+
 	return parsePEM(data)
 }
 
+// parsePEM extracts the first certificate and an RSA private key from
+// concatenated PEM blocks.
 func parsePEM(data []byte) (*rsa.PrivateKey, *x509.Certificate, error) {
-	var key *rsa.PrivateKey
-	var cert *x509.Certificate
+	var (
+		key  *rsa.PrivateKey
+		cert *x509.Certificate
+	)
+
 	for {
 		var block *pem.Block
+
 		block, data = pem.Decode(data)
+
 		if block == nil {
 			break
 		}
+
 		switch {
 		case block.Type == "CERTIFICATE":
 			c, err := x509.ParseCertificate(block.Bytes)
 			if err != nil {
 				return nil, nil, fmt.Errorf("parse certificate: %w", err)
 			}
+
 			if cert == nil {
 				cert = c
 			}
+
 		case strings.Contains(block.Type, "PRIVATE KEY"):
 			k, err := parsePrivateKey(block.Bytes)
 			if err != nil {
 				return nil, nil, err
 			}
+
 			key = k
 		}
 	}
+
 	if key == nil || cert == nil {
-		return nil, nil, fmt.Errorf("PEM must contain both a CERTIFICATE and an RSA PRIVATE KEY")
+		return nil, nil, errors.New("PEM must contain both a CERTIFICATE and an RSA PRIVATE KEY")
 	}
+
 	return key, cert, nil
 }
 
+// parsePrivateKey parses a PKCS#1 or PKCS#8 DER private key and requires RSA.
 func parsePrivateKey(der []byte) (*rsa.PrivateKey, error) {
 	if k, err := x509.ParsePKCS1PrivateKey(der); err == nil {
 		return k, nil
 	}
+
 	k, err := x509.ParsePKCS8PrivateKey(der)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}
+
 	rk, ok := k.(*rsa.PrivateKey)
 	if !ok {
-		return nil, fmt.Errorf("private key is not RSA")
+		return nil, errors.New("private key is not RSA")
 	}
+
 	return rk, nil
 }

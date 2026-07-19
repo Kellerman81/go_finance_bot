@@ -18,20 +18,26 @@ type metrics struct {
 	openOrders   atomic.Int64 // working orders seen at the last reconcile
 }
 
+// onTick counts an ingested tick and, when it completed a bar, the bar.
 func (m *metrics) onTick(barCompleted bool) {
 	m.ticks.Add(1)
+
 	if barCompleted {
 		m.barsDone.Add(1)
 	}
 }
 
+// onEval records a completed evaluate() cycle and its duration.
 func (m *metrics) onEval(d time.Duration) {
 	m.evalCycles.Add(1)
 	m.lastEvalNs.Store(int64(d))
 	m.lastEvalUnix.Store(time.Now().UnixNano())
 }
 
-func (m *metrics) onOrder()            { m.ordersSent.Add(1) }
+// onOrder counts an order submission.
+func (m *metrics) onOrder() { m.ordersSent.Add(1) }
+
+// setOpenOrders records the working-order count from the last reconcile.
 func (m *metrics) setOpenOrders(n int) { m.openOrders.Store(int64(n)) }
 
 // Metrics is a point-in-time snapshot of engine counters, for the API/UI.
@@ -48,9 +54,11 @@ type Metrics struct {
 // Metrics returns a snapshot of the engine's runtime counters.
 func (e *Engine) Metrics() Metrics {
 	var lastEval time.Time
+
 	if ns := e.met.lastEvalUnix.Load(); ns > 0 {
 		lastEval = time.Unix(0, ns)
 	}
+
 	return Metrics{
 		TicksIngested:   e.met.ticks.Load(),
 		BarsCompleted:   e.met.barsDone.Load(),

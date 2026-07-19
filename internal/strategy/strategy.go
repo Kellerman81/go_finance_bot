@@ -31,16 +31,20 @@ type Signal struct {
 
 // Strategy evaluates candle history and returns a Signal.
 type Strategy interface {
+	// Name describes the strategy configuration.
 	Name() string
 	// WarmupBars is the minimum number of candles required before Evaluate
 	// can return a non-Hold signal.
 	WarmupBars() int
+	// Evaluate runs the strategy over candles and returns the signal for symbol.
 	Evaluate(symbol string, candles []market.Candle) Signal
 }
 
 // Detector is a single-indicator signal generator. Combined runs one or more.
 type Detector interface {
+	// Name returns the canonical detector name (e.g. "rsi").
 	Name() string
+	// WarmupBars is the minimum bars needed for a stable read.
 	WarmupBars() int
 	// Detect returns an Action with a 0..1 strength and a human reason. The
 	// closes/highs/lows/volumes are aligned series of equal length.
@@ -53,6 +57,7 @@ type series struct {
 	open, high, low, close, volume []float64
 }
 
+// toSeries extracts the OHLCV columns from candles in one allocation.
 func toSeries(candles []market.Candle) series {
 	n := len(candles)
 	// One backing allocation carved into five columns: fewer allocations and
@@ -66,9 +71,11 @@ func toSeries(candles []market.Candle) series {
 		close:  buf[3*n : 4*n : 4*n],
 		volume: buf[4*n : 5*n : 5*n],
 	}
+
 	for i, c := range candles {
 		s.open[i], s.high[i], s.low[i], s.close[i], s.volume[i] = c.Open, c.High, c.Low, c.Close, c.Volume
 	}
+
 	return s
 }
 
@@ -108,26 +115,36 @@ type Combined struct {
 	trendFilter *trendDetector
 }
 
+// Name describes the combined strategy: detector sets and merge modes.
 func (c *Combined) Name() string {
 	modes := string(c.mode)
 	if c.sellMode != c.mode {
 		modes = fmt.Sprintf("buy:%s/sell:%s", c.mode, c.sellMode)
 	}
+
 	sets := detectorNames(c.detectors)
 	if !c.sellSame {
-		sets = fmt.Sprintf("buy:%s/sell:%s", detectorNames(c.detectors), detectorNames(c.sellDetectors))
+		sets = fmt.Sprintf(
+			"buy:%s/sell:%s",
+			detectorNames(c.detectors),
+			detectorNames(c.sellDetectors),
+		)
 	}
+
 	return fmt.Sprintf("combined[%s|%s]", sets, modes)
 }
 
+// detectorNames joins detector names with commas.
 func detectorNames(ds []Detector) string {
 	names := make([]string, len(ds))
 	for i, d := range ds {
 		names[i] = d.Name()
 	}
+
 	return strings.Join(names, ",")
 }
 
+// WarmupBars reports the bars needed before the strategy gives stable signals.
 func (c *Combined) WarmupBars() int { return c.warmup }
 
 // MaxLookback reports the most bars any of the strategy's detectors (or the
@@ -136,7 +153,7 @@ func (c *Combined) WarmupBars() int { return c.warmup }
 // per-bar window so those detectors see as much history as they would live,
 // instead of being silently capped to the (much smaller) warmup window.
 func (c *Combined) MaxLookback() int {
-	max := c.warmup
+	most := c.warmup
 	consider := func(d Detector) {
 		n := d.WarmupBars()
 		if lb, ok := d.(interface{ MaxLookback() int }); ok {
@@ -144,27 +161,37 @@ func (c *Combined) MaxLookback() int {
 				n = m
 			}
 		}
-		if n > max {
-			max = n
+
+		if n > most {
+			most = n
 		}
 	}
+
 	for _, d := range c.detectors {
 		consider(d)
 	}
+
 	for _, d := range c.sellDetectors {
 		consider(d)
 	}
+
 	if c.trendFilter != nil {
 		consider(c.trendFilter)
 	}
-	return max
+
+	return most
 }
 
+// Evaluate runs the detector sets on the candles and merges their votes into
+// a single BUY/SELL/HOLD signal for symbol.
+//
+//nolint:cyclop // the merge pipeline (warmup, tally, gate, format) is one flow
 func (c *Combined) Evaluate(symbol string, candles []market.Candle) Signal {
 	price := 0.0
 	if len(candles) > 0 {
 		price = candles[len(candles)-1].Close
 	}
+
 	sig := Signal{Symbol: symbol, Action: Hold, Price: price}
 
 	if len(candles) < c.warmup {
@@ -181,10 +208,19 @@ func (c *Combined) Evaluate(symbol string, candles []market.Candle) Signal {
 	// SELL side: may use a different detector set (reuse the buy tally if same).
 	sellVotes := buyVotes
 	sBuyN, sSellN, sBuyStr, sSellStr := bBuyN, bSellN, bBuyStr, bSellStr
+
 	if !c.sellSame && len(c.sellDetectors) > 0 {
 		sellVotes, sBuyN, sSellN, sBuyStr, sSellStr = tallyDetectors(c.sellDetectors, s, c.weights)
 	}
-	sellOK, sellStrength := sideQualifies(c.sellMode, sSellN, sBuyN, sSellStr, sBuyStr, len(sellVotes))
+
+	sellOK, sellStrength := sideQualifies(
+		c.sellMode,
+		sSellN,
+		sBuyN,
+		sSellStr,
+		sBuyStr,
+		len(sellVotes),
+	)
 
 	action := Hold
 	strength := 0.0
@@ -203,7 +239,11 @@ func (c *Combined) Evaluate(symbol string, candles []market.Candle) Signal {
 	// the engine before the strategy, so a vetoed SELL never traps a losing
 	// position.
 	if c.trendGate && c.trendFilter != nil && action != Hold {
-		if tdir, treason := c.trendVote(s, usedVotes); (tdir == Buy && action == Sell) || (tdir == Sell && action == Buy) {
+		if tdir, treason := c.trendVote(
+			s,
+			usedVotes,
+		); (tdir == Buy && action == Sell) ||
+			(tdir == Sell && action == Buy) {
 			sig.Action = Hold
 			sig.Strength = 0
 			sig.Reason = fmt.Sprintf("%s blocked by %s", action, treason)
@@ -217,15 +257,19 @@ func (c *Combined) Evaluate(symbol string, candles []market.Candle) Signal {
 	if action == Sell {
 		gate = c.minStrengthSell
 	}
+
 	if action != Hold && sig.Strength < gate {
 		sig.Action = Hold
 		sig.Reason = fmt.Sprintf("%s => %s %.2f<min %.2f, hold",
 			formatVotes(usedVotes, action, usedMode), action, sig.Strength, gate)
 		sig.Strength = 0
+
 		return sig
 	}
+
 	sig.Action = action
 	sig.Reason = formatVotes(usedVotes, action, usedMode)
+
 	return sig
 }
 
@@ -240,38 +284,62 @@ func (c *Combined) trendVote(s series, votes []detectorVote) (Action, string) {
 			return v.action, v.reason
 		}
 	}
+
 	a, _, reason := c.trendFilter.Detect(s)
+
 	return a, reason
 }
 
 // tallyDetectors runs a detector set over the series and tallies its votes. Each
 // detector's strength is scaled by its configured weight (default 1.0) before
 // being summed; vote counts are unaffected by weight.
-func tallyDetectors(dets []Detector, s series, weights map[string]float64) (votes []detectorVote, buyN, sellN int, buyStr, sellStr float64) {
+//
+//nolint:revive // five results (votes + per-side counts/strengths) beat an ad-hoc struct
+func tallyDetectors(
+	dets []Detector,
+	s series,
+	weights map[string]float64,
+) (votes []detectorVote, buyN, sellN int, buyStr, sellStr float64) {
 	votes = make([]detectorVote, 0, len(dets))
 	for _, d := range dets {
 		a, str, reason := d.Detect(s)
+
 		votes = append(votes, detectorVote{d.Name(), a, str, reason})
+
 		w := 1.0
+
 		if wv, ok := weights[d.Name()]; ok {
 			w = wv
 		}
+
 		switch a {
 		case Buy:
 			buyN++
+
 			buyStr += str * w
+
 		case Sell:
 			sellN++
+
 			sellStr += str * w
+
+		case Hold:
+			// holds don't vote
 		}
 	}
+
 	return votes, buyN, sellN, buyStr, sellStr
 }
 
 // sideQualifies reports whether a side (with sideN votes / sideStr summed
 // strength) wins under the given mode against the opposing side, and the
 // resulting 0..1 strength.
-func sideQualifies(mode CombineMode, sideN, otherN int, sideStr, otherStr float64, total int) (bool, float64) {
+func sideQualifies(
+	mode CombineMode,
+	sideN, otherN int,
+	sideStr, otherStr float64,
+	total int,
+) (bool, float64) {
 	switch mode {
 	case Unanimous:
 		return sideN > 0 && otherN == 0, sideStr / float64(maxi(sideN, 1))
@@ -279,11 +347,15 @@ func sideQualifies(mode CombineMode, sideN, otherN int, sideStr, otherStr float6
 		if total == 0 {
 			return false, 0
 		}
+
 		net := sideStr - otherStr
+
 		return net > 0, net / float64(total)
-	default: // Majority
-		return sideN > otherN, sideStr / float64(maxi(sideN, 1))
+
+	case Majority: // falls out to the shared majority return; unknown modes too
 	}
+
+	return sideN > otherN, sideStr / float64(maxi(sideN, 1))
 }
 
 // detectorVote captures one detector's result for tallying and reporting.
@@ -294,14 +366,18 @@ type detectorVote struct {
 	reason   string
 }
 
+// formatVotes renders every detector's vote plus the merged outcome (a single
+// detector keeps its own reason).
 func formatVotes(votes []detectorVote, result Action, mode CombineMode) string {
 	parts := make([]string, len(votes))
 	for i, v := range votes {
 		parts[i] = fmt.Sprintf("%s:%s(%.2f)", v.name, v.action, v.strength)
 	}
+
 	if len(votes) == 1 {
 		return votes[0].reason
 	}
+
 	return fmt.Sprintf("%s => %s by %s", strings.Join(parts, ", "), result, mode)
 }
 
@@ -312,8 +388,10 @@ func New(cfg config.StrategyConfig) Strategy {
 	if len(names) == 0 {
 		names = []string{"ema_cross", "rsi", "macd"}
 	}
+
 	mode := normalizeCombine(cfg.Combine, Majority)
 	sellMode := mode
+
 	if strings.TrimSpace(cfg.CombineSell) != "" {
 		sellMode = normalizeCombine(cfg.CombineSell, mode)
 	}
@@ -329,6 +407,7 @@ func New(cfg config.StrategyConfig) Strategy {
 	if len(cfg.DetectorsSell) > 0 {
 		if sd, sw := buildDetectorList(cfg.DetectorsSell, cfg); len(sd) > 0 {
 			sellDetectors, sellSame = sd, false
+
 			if sw > warmup {
 				warmup = sw
 			}
@@ -342,9 +421,11 @@ func New(cfg config.StrategyConfig) Strategy {
 
 	// Weekly-trend gate: a directional filter, independent of the detector sets.
 	var trendFilter *trendDetector
+
 	if cfg.TrendGate {
 		trendFilter = newTrendDetector(cfg)
 	}
+
 	return &Combined{
 		detectors: detectors, sellDetectors: sellDetectors, sellSame: sellSame,
 		mode: mode, sellMode: sellMode, warmup: warmup + 2,
@@ -361,6 +442,7 @@ func normalizeWeights(in map[string]float64, cfg config.StrategyConfig) map[stri
 	if len(in) == 0 {
 		return nil
 	}
+
 	out := make(map[string]float64, len(in))
 	for k, v := range in {
 		if d := buildDetector(k, cfg); d != nil {
@@ -369,6 +451,7 @@ func normalizeWeights(in map[string]float64, cfg config.StrategyConfig) map[stri
 			out[strings.ToLower(strings.TrimSpace(k))] = v
 		}
 	}
+
 	return out
 }
 
@@ -380,11 +463,13 @@ func buildDetectorList(names []string, cfg config.StrategyConfig) (dets []Detect
 		if d == nil {
 			continue
 		}
+
 		dets = append(dets, d)
 		if w := d.WarmupBars(); w > warmup {
 			warmup = w
 		}
 	}
+
 	return dets, warmup
 }
 
@@ -398,19 +483,24 @@ func normalizeCombine(s string, def CombineMode) CombineMode {
 	}
 }
 
+// clamp01 clamps v into [0, 1].
 func clamp01(v float64) float64 {
 	if v < 0 {
 		return 0
 	}
+
 	if v > 1 {
 		return 1
 	}
+
 	return v
 }
 
+// maxi returns the larger of two ints.
 func maxi(a, b int) int {
 	if a > b {
 		return a
 	}
+
 	return b
 }

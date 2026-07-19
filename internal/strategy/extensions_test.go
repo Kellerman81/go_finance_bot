@@ -50,8 +50,10 @@ func TestWeightsFlipWeightedDecision(t *testing.T) {
 		t.Fatalf("equal opposed weighted => %s, want HOLD", got)
 	}
 	// Weight the SELL detector heavier => net negative => SELL.
-	weighted := &Combined{detectors: dets, mode: Weighted, sellMode: Weighted, warmup: 1,
-		weights: map[string]float64{"b": 3}}
+	weighted := &Combined{
+		detectors: dets, mode: Weighted, sellMode: Weighted, warmup: 1,
+		weights: map[string]float64{"b": 3},
+	}
 	if got := weighted.Evaluate("X", twoBars).Action; got != Sell {
 		t.Errorf("weighting b => %s, want SELL", got)
 	}
@@ -77,6 +79,10 @@ func TestNewDetectorsProduceSignals(t *testing.T) {
 	}
 	sig := s.Evaluate("X", candles)
 	if sig.Action != Buy {
-		t.Errorf("steady uptrend with trend-following detectors => %s (%s), want BUY", sig.Action, sig.Reason)
+		t.Errorf(
+			"steady uptrend with trend-following detectors => %s (%s), want BUY",
+			sig.Action,
+			sig.Reason,
+		)
 	}
 }

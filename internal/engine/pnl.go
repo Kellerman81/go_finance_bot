@@ -22,11 +22,14 @@ func (e *Engine) indicatorSnapshot(symbol string) string {
 // avoiding a second full-history copy on the trade-decision path.
 func (e *Engine) indicatorSnapshotFrom(series []market.Candle) string {
 	results := strategy.EvaluateAll(e.StrategyConfig(), series)
+
 	b, err := json.Marshal(results)
 	if err != nil {
 		e.log.Warn("marshal indicator snapshot failed", "err", err)
+
 		return ""
 	}
+
 	return string(b)
 }
 
@@ -40,15 +43,24 @@ func (e *Engine) indicatorSnapshotFrom(series []market.Candle) string {
 // record for symbol (e.g. a position that predates this feature, or was
 // opened outside the bot's own tracking), in which case pnl/pnlPct/win must
 // be left nil on the TradeRecord.
-func (e *Engine) closePnL(symbol string, exitPrice, qty float64) (pnl, pnlPct float64, entryIndicators string, ok bool) {
+//
+//nolint:revive // four results (pnl/pct/indicators/ok) beat an ad-hoc struct
+func (e *Engine) closePnL(
+	symbol string,
+	exitPrice, qty float64,
+) (pnl, pnlPct float64, entryIndicators string, ok bool) {
 	e.mu.RLock()
+
 	p, has := e.openPos[symbol]
 	e.mu.RUnlock()
+
 	if !has || p.EntryPrice <= 0 || qty <= 0 {
 		return 0, 0, "", false
 	}
+
 	pnl = (exitPrice - p.EntryPrice) * qty
 	pnlPct = (exitPrice/p.EntryPrice - 1) * 100
+
 	return pnl, pnlPct, p.EntryIndicators, true
 }
 

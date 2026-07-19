@@ -17,10 +17,10 @@ func TestBuyNotionalMinPositions(t *testing.T) {
 		min  int
 		want float64
 	}{
-		{250, 0, 250},  // fixed order size when min_positions = 0
-		{250, 4, 100},  // capped at 400/4 = 100 so the budget holds >= 4 positions
-		{50, 4, 50},    // order size smaller than the slice -> even more positions
-		{250, 8, 50},   // 400/8
+		{250, 0, 250}, // fixed order size when min_positions = 0
+		{250, 4, 100}, // capped at 400/4 = 100 so the budget holds >= 4 positions
+		{50, 4, 50},   // order size smaller than the slice -> even more positions
+		{250, 8, 50},  // 400/8
 	}
 	for _, c := range cases {
 		e := &Engine{cfg: config.EngineConfig{OrderSizeUSD: c.size, MinPositions: c.min}, rm: rm}

@@ -16,7 +16,12 @@ type fakeHistory struct {
 	called int
 }
 
-func (f *fakeHistory) Candles(_ context.Context, symbol string, res market.Resolution, from, to time.Time) ([]market.Candle, error) {
+func (f *fakeHistory) Candles(
+	_ context.Context,
+	symbol string,
+	res market.Resolution,
+	from, to time.Time,
+) ([]market.Candle, error) {
 	f.called++
 	if f.err != nil {
 		return nil, f.err
@@ -59,7 +64,10 @@ func TestConfirmVenuePrice(t *testing.T) {
 	}
 
 	// Deviation veto disabled (0): resizes to the venue price even on a big move.
-	e = &Engine{cfg: config.EngineConfig{VenuePriceCheck: true, MaxPriceDeviation: 0}, history: &fakeHistory{price: 130}}
+	e = &Engine{
+		cfg:     config.EngineConfig{VenuePriceCheck: true, MaxPriceDeviation: 0},
+		history: &fakeHistory{price: 130},
+	}
 	if px, _, ok := e.confirmVenuePrice("AAPL", 100); !ok || px != 130 {
 		t.Errorf("no-veto => px %.2f ok %v, want 130/true", px, ok)
 	}

@@ -40,9 +40,13 @@
   .err-trading212{color:#98c379} .err-alpaca{color:#61afef}
   .flash { animation: f .6s; } @keyframes f { from{background:#2a3550} to{background:transparent} }
   a.gh { color:var(--mut); text-decoration:none; }
-  .riskbanner { background:#3a1518; border-bottom:1px solid #6e2228; color:#f0c0c4;
-                padding:8px 16px; font-size:13px; }
+  .riskbanner { position:relative; background:#3a1518; border-bottom:1px solid #6e2228;
+                color:#f0c0c4; padding:10px 40px 10px 16px; font-size:13px; line-height:1.5; }
   .riskbanner strong { color:#ff8a8a; }
+  .riskbanner.hidden { display:none; }
+  .riskbanner .close { position:absolute; top:6px; right:10px; background:transparent;
+                border:none; color:#f0c0c4; font-size:18px; line-height:1; cursor:pointer; padding:2px 6px; }
+  .riskbanner .close:hover { color:#fff; }
 </style>
 </head>
 <body>
@@ -56,12 +60,33 @@
   <button onclick="refreshAll()">↻ Refresh</button>
 </header>
 
-<div class="riskbanner">
-  <strong>⚠️ WARNING — trading happens entirely at your own risk.</strong>
-  This software can lose money. The authors accept no responsibility for any financial
-  losses or other damages arising from its use. Not financial advice — never trade money
-  you cannot afford to lose.
+<div class="riskbanner" id="riskBanner">
+  <button class="close" id="riskBannerClose" title="Dismiss (stays hidden on this device)" aria-label="Dismiss warning">×</button>
+  <strong>⚠️ WARNING — USE AT YOUR OWN RISK.</strong>
+  This software trades real money when connected to a live broker. All trading happens
+  entirely at your own risk. The authors accept <strong>no responsibility or liability
+  whatsoever for any financial losses</strong>, missed profits, broker fees, tax
+  consequences, or any other damages arising from its use — whether caused by bugs, bad
+  signals, market conditions, API failures, misconfiguration, or anything else. Provided
+  <strong>as is, without warranty of any kind</strong>, for educational purposes.
+  <strong>Not financial advice.</strong> Automated strategies can and do lose money; past
+  (backtested) performance does not predict future results. Prove any strategy on the
+  simulator and a paper/demo account first, set conservative money limits, and never trade
+  money you cannot afford to lose.
 </div>
+<script>
+// Risk banner: dismissible, and the dismissal persists across refreshes via
+// localStorage. Runs inline (during parse) so a previously-dismissed banner is
+// hidden before first paint — no flash.
+(function(){
+  var b = document.getElementById('riskBanner');
+  if(localStorage.getItem('riskAck') === '1'){ b.classList.add('hidden'); return; }
+  document.getElementById('riskBannerClose').addEventListener('click', function(){
+    b.classList.add('hidden');
+    localStorage.setItem('riskAck','1');
+  });
+})();
+</script>
 
 <main>
   <!-- Live engine metrics -->

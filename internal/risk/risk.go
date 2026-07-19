@@ -16,13 +16,13 @@ import (
 
 // Decision is the result of authorising an order.
 type Decision struct {
-	Approved bool    `json:"approved"`
-	Symbol   string  `json:"symbol"`
+	Approved bool        `json:"approved"`
+	Symbol   string      `json:"symbol"`
 	Side     broker.Side `json:"side"`
-	OrigQty  float64 `json:"orig_qty"`
-	FinalQty float64 `json:"final_qty"`
-	EstValue float64 `json:"est_value"`
-	Reason   string  `json:"reason"`
+	OrigQty  float64     `json:"orig_qty"`
+	FinalQty float64     `json:"final_qty"`
+	EstValue float64     `json:"est_value"`
+	Reason   string      `json:"reason"`
 }
 
 // Manager enforces money limits and tracks rolling daily spend.
@@ -43,12 +43,14 @@ func New(limits config.Limits, costs config.CostsConfig) *Manager {
 func (m *Manager) Limits() config.Limits {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	return m.limits
 }
 
 // SetLimits replaces the active limits (used by the API).
 func (m *Manager) SetLimits(l config.Limits) {
 	m.mu.Lock()
+
 	m.limits = l
 	m.mu.Unlock()
 }
@@ -59,6 +61,7 @@ func (m *Manager) SetLimits(l config.Limits) {
 func (m *Manager) Restore(day string, amount float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if day == today() {
 		m.day = day
 		m.spentToday = amount
@@ -72,7 +75,9 @@ func (m *Manager) Restore(day string, amount float64) {
 func (m *Manager) SpentToday() float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.rollDay()
+
 	return m.spentToday
 }
 
@@ -81,9 +86,16 @@ func (m *Manager) SpentToday() float64 {
 // Decision whose FinalQty may be smaller than the requested Qty (clamped to
 // fit). Sells are always allowed up to the held quantity. The returned order
 // (when Approved) carries FinalQty.
-func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Snapshot) (broker.Order, Decision) {
+//
+//nolint:cyclop,funlen // sequential limit gates; splitting would obscure the check order
+func (m *Manager) Authorize(
+	o broker.Order,
+	estPrice float64,
+	snap portfolio.Snapshot,
+) (broker.Order, Decision) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.rollDay()
 
 	d := Decision{Symbol: o.Symbol, Side: o.Side, OrigQty: o.Qty}
@@ -92,6 +104,7 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 		d.Reason = "no valid price"
 		return o, d
 	}
+
 	if o.Qty <= 0 {
 		d.Reason = "non-positive quantity"
 		return o, d
@@ -103,12 +116,15 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 			d.Reason = "no position to sell"
 			return o, d
 		}
+
 		qty := min(o.Qty, held)
+
 		o.Qty = qty
 		d.Approved = true
 		d.FinalQty = qty
 		d.EstValue = qty * estPrice
 		d.Reason = "sell authorised"
+
 		return o, d
 	}
 
@@ -125,17 +141,33 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 	effPrice := estPrice * (1 + m.costs.CommissionPct)
 	fixedFee := max(m.costs.CommissionFlat, m.costs.CommissionMin)
 
-	type cap struct {
+	type capRule struct {
 		name     string
 		maxValue float64 // remaining dollar headroom for this dimension
 		price    float64 // per-share divisor (notional or commission-adjusted)
 		enabled  bool
 	}
-	caps := []cap{
+
+	caps := []capRule{
 		{"max_order_value", l.MaxOrderValue, estPrice, l.MaxOrderValue > 0},
-		{"max_per_position", l.MaxPerPosition - snap.Holdings[o.Symbol].MarketValue, estPrice, l.MaxPerPosition > 0},
-		{"max_total_invested", l.MaxTotalInvested - snap.Invested, estPrice, l.MaxTotalInvested > 0},
-		{"max_daily_spend", l.MaxDailySpend - m.spentToday - fixedFee, effPrice, l.MaxDailySpend > 0},
+		{
+			"max_per_position",
+			l.MaxPerPosition - snap.Holdings[o.Symbol].MarketValue,
+			estPrice,
+			l.MaxPerPosition > 0,
+		},
+		{
+			"max_total_invested",
+			l.MaxTotalInvested - snap.Invested,
+			estPrice,
+			l.MaxTotalInvested > 0,
+		},
+		{
+			"max_daily_spend",
+			l.MaxDailySpend - m.spentToday - fixedFee,
+			effPrice,
+			l.MaxDailySpend > 0,
+		},
 		{"cash_reserve", snap.Cash - l.CashReserve - fixedFee, effPrice, true},
 	}
 
@@ -144,10 +176,12 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 		if !c.enabled {
 			continue
 		}
+
 		if c.maxValue <= 0 {
 			d.Reason = fmt.Sprintf("blocked by %s (no headroom)", c.name)
 			return o, d
 		}
+
 		maxQty := c.maxValue / c.price
 		if maxQty < qty {
 			qty = maxQty
@@ -172,7 +206,9 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 	}
 
 	o.Qty = qty
+
 	notional := qty * estPrice
+
 	d.Approved = true
 	d.FinalQty = qty
 	// EstValue is the full cash cost of the buy, including commission.
@@ -182,6 +218,7 @@ func (m *Manager) Authorize(o broker.Order, estPrice float64, snap portfolio.Sna
 	} else {
 		d.Reason = "buy authorised"
 	}
+
 	return o, d
 }
 
@@ -193,7 +230,9 @@ func (m *Manager) Commission(notional float64) float64 { return m.costs.Commissi
 func (m *Manager) RecordBuy(notional float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.rollDay()
+
 	m.spentToday += notional + m.costs.Commission(notional)
 }
 
@@ -205,4 +244,5 @@ func (m *Manager) rollDay() {
 	}
 }
 
+// today returns the current UTC day (YYYY-MM-DD) for the rolling daily spend.
 func today() string { return time.Now().UTC().Format("2006-01-02") }

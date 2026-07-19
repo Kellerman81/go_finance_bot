@@ -4,6 +4,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -74,10 +75,12 @@ func (c CostsConfig) Commission(notional float64) float64 {
 	if notional < 0 {
 		notional = -notional
 	}
+
 	fee := c.CommissionFlat + c.CommissionPct*notional
 	if fee < c.CommissionMin {
 		fee = c.CommissionMin
 	}
+
 	return fee
 }
 
@@ -97,10 +100,10 @@ type SafetyConfig struct {
 // run before strategy signals and force a sell when triggered. Percentages are
 // fractions (0.05 = 5%). A zero percentage disables that rule.
 type ExitsConfig struct {
-	Enabled        bool    `yaml:"enabled"`
-	StopLossPct    float64 `yaml:"stop_loss_pct"`     // sell if price falls this far below entry
+	Enabled         bool    `yaml:"enabled"`
+	StopLossPct     float64 `yaml:"stop_loss_pct"`     // sell if price falls this far below entry
 	TrailingStopPct float64 `yaml:"trailing_stop_pct"` // sell if price falls this far below peak-since-entry
-	TakeProfitPct  float64 `yaml:"take_profit_pct"`   // sell if price rises this far above entry
+	TakeProfitPct   float64 `yaml:"take_profit_pct"`   // sell if price rises this far above entry
 }
 
 // StorageConfig configures persistence.
@@ -184,9 +187,11 @@ func (s SaxoConfig) SaxoAuthURL() string {
 	if s.AuthURL != "" {
 		return s.AuthURL
 	}
+
 	if strings.Contains(s.BaseURL, "/sim/") {
 		return "https://sim.logonvalidation.net"
 	}
+
 	return "https://live.logonvalidation.net"
 }
 
@@ -261,10 +266,10 @@ type StrategyConfig struct {
 	RSIOversold   float64 `yaml:"rsi_oversold"`
 	// RSIMode: "midline" (graded mean-reversion vote around 50, always
 	// participates) or "extremes" (only votes at oversold/overbought).
-	RSIMode string `yaml:"rsi_mode"`
-	MACDFast      int     `yaml:"macd_fast"`
-	MACDSlow      int     `yaml:"macd_slow"`
-	MACDSignal    int     `yaml:"macd_signal"`
+	RSIMode    string `yaml:"rsi_mode"`
+	MACDFast   int    `yaml:"macd_fast"`
+	MACDSlow   int    `yaml:"macd_slow"`
+	MACDSignal int    `yaml:"macd_signal"`
 
 	// Bollinger Bands.
 	BBPeriod int     `yaml:"bb_period"`
@@ -371,10 +376,19 @@ type EngineConfig struct {
 	// price moved too much since the signal. 0 disables the deviation veto (the
 	// order is still resized to the confirmed price). Default 0.02.
 	MaxPriceDeviation float64 `yaml:"max_price_deviation"`
+	// SyncInterval is the minimum time between broker polls for account/positions
+	// and working orders (portfolio reconcile). Raise it for brokers with slow or
+	// rate-limited APIs (e.g. Trading 212, which returns 500s under frequent
+	// polling). 0 defaults to eval_interval/2 for the portfolio sync and 15s for
+	// the order reconcile. Order paths always force an immediate post-fill sync,
+	// so this only bounds the *background* refresh cadence, never trade freshness.
+	SyncInterval time.Duration `yaml:"sync_interval"`
 }
 
 // Default returns a config populated with safe defaults (paper/simulated,
 // trading disabled, conservative limits).
+//
+
 func Default() Config {
 	return Config{
 		Server: ServerConfig{Addr: ":8080"},
@@ -405,11 +419,11 @@ func Default() Config {
 			MaxOpenPositions: 50,
 		},
 		Strategy: StrategyConfig{
-			Detectors:   []string{"ema_cross", "rsi", "macd", "trend"},
+			Detectors:       []string{"ema_cross", "rsi", "macd", "trend"},
 			Combine:         "majority",
 			MinStrength:     0.25,
 			MinStrengthSell: -1, // inherit MinStrength unless set
-			FastMA:    12, SlowMA: 26,
+			FastMA:          12, SlowMA: 26,
 			RSIPeriod: 14, RSIOverbought: 70, RSIOversold: 30, RSIMode: "midline",
 			MACDFast: 12, MACDSlow: 26, MACDSignal: 9,
 			BBPeriod: 20, BBStdDev: 2,
@@ -421,15 +435,15 @@ func Default() Config {
 			StochKPeriod: 14, StochDPeriod: 3, StochOverbought: 80, StochOversold: 20,
 			SupertrendPeriod: 10, SupertrendMult: 3,
 			DonchianPeriod: 20,
-			TrendPeriod: 1950, TrendThreshold: 0.01, TrendGate: true,
+			TrendPeriod:    1950, TrendThreshold: 0.01, TrendGate: true,
 		},
 		Engine: EngineConfig{
-			EvalInterval:   30 * time.Second,
-			BarInterval:    time.Minute,
-			TradingEnabled: false,
-			OrderSizeUSD:   250,
-			ConfirmBuy:     1,
-			ConfirmSell:    1,
+			EvalInterval:      30 * time.Second,
+			BarInterval:       time.Minute,
+			TradingEnabled:    false,
+			OrderSizeUSD:      250,
+			ConfirmBuy:        1,
+			ConfirmSell:       1,
 			MarketHoursCheck:  true,
 			PreOpenWindow:     5 * time.Minute,
 			VenuePriceCheck:   true,
@@ -465,6 +479,7 @@ func Load(path string) (Config, error) {
 			if err := yaml.Unmarshal(data, &cfg); err != nil {
 				return cfg, fmt.Errorf("parse config %s: %w", path, err)
 			}
+
 		case os.IsNotExist(err):
 			// fall through to env-only config
 		default:
@@ -477,75 +492,101 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+
 	return cfg, nil
 }
 
+// applyEnv layers environment-variable overrides onto the config.
+//
+//nolint:cyclop // one guarded assignment per env var; inherently branchy
 func applyEnv(cfg *Config) {
 	if v := os.Getenv("FINNHUB_API_KEY"); v != "" {
 		cfg.Finnhub.APIKey = v
 	}
+
 	if v := os.Getenv("ALPACA_KEY_ID"); v != "" {
 		cfg.Alpaca.KeyID = v
 	}
+
 	if v := os.Getenv("ALPACA_SECRET_KEY"); v != "" {
 		cfg.Alpaca.SecretKey = v
 	}
+
 	if v := os.Getenv("ALPACA_BASE_URL"); v != "" {
 		cfg.Alpaca.BaseURL = v
 	}
+
 	if v := os.Getenv("ALPACA_USE_SIM"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.Alpaca.UseSim = b
 		}
 	}
+
 	if v := os.Getenv("BOT_BROKER"); v != "" {
 		cfg.Broker = v
 	}
+
 	if v := os.Getenv("SAXO_TOKEN"); v != "" {
 		cfg.Saxo.Token = v
 	}
+
 	if v := os.Getenv("SAXO_BASE_URL"); v != "" {
 		cfg.Saxo.BaseURL = v
 	}
+
 	if v := os.Getenv("T212_API_KEY"); v != "" {
 		cfg.Trading212.APIKey = v
 	}
+
 	if v := os.Getenv("T212_SECRET"); v != "" {
 		cfg.Trading212.Secret = v
 	}
+
 	if v := os.Getenv("T212_BASE_URL"); v != "" {
 		cfg.Trading212.BaseURL = v
 	}
+
 	if v := os.Getenv("SAXO_APP_SECRET"); v != "" {
 		cfg.Saxo.AppSecret = v
 	}
+
 	if v := os.Getenv("SAXO_CERT_PASSWORD"); v != "" {
 		cfg.Saxo.CertPassword = v
 	}
+
 	if v := os.Getenv("BOT_SERVER_ADDR"); v != "" {
 		cfg.Server.Addr = v
 	}
+
 	if v := os.Getenv("BOT_AUTH_TOKEN"); v != "" {
 		cfg.Server.AuthToken = v
 	}
+
 	if v := os.Getenv("BOT_STORAGE_PATH"); v != "" {
 		cfg.Storage.Path = v
 	}
+
 	if v := os.Getenv("BOT_TRADING_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.Engine.TradingEnabled = b
 		}
 	}
-	if v := os.Getenv("BOT_WATCHLIST"); v != "" {
-		var syms []string
-		for _, s := range strings.Split(v, ",") {
-			if s = strings.TrimSpace(strings.ToUpper(s)); s != "" {
-				syms = append(syms, s)
-			}
+
+	v := os.Getenv("BOT_WATCHLIST")
+	if v == "" {
+		return
+	}
+
+	var syms []string
+
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(strings.ToUpper(s)); s != "" {
+			syms = append(syms, s)
 		}
-		if len(syms) > 0 {
-			cfg.Watchlist = syms
-		}
+	}
+
+	if len(syms) > 0 {
+		cfg.Watchlist = syms
 	}
 }
 
@@ -563,52 +604,75 @@ func (c Config) BrokerProvider() string {
 	case "sim":
 		return "sim"
 	}
+
 	if !c.Alpaca.UseSim && c.Alpaca.KeyID != "" {
 		return "alpaca"
 	}
+
 	return "sim"
 }
 
 // Validate checks invariants that must hold for safe operation.
+//
+//nolint:cyclop // a flat list of independent sanity checks
 func (c Config) Validate() error {
 	// Fail closed: refuse to run with trading enabled but no money ceilings.
 	if c.Engine.TradingEnabled {
 		if c.Limits.MaxOrderValue <= 0 {
-			return fmt.Errorf("limits.max_order_value must be > 0 when trading is enabled")
+			return errors.New("limits.max_order_value must be > 0 when trading is enabled")
 		}
+
 		if c.Limits.MaxTotalInvested <= 0 {
-			return fmt.Errorf("limits.max_total_invested must be > 0 when trading is enabled")
+			return errors.New("limits.max_total_invested must be > 0 when trading is enabled")
 		}
+
 		switch c.BrokerProvider() {
 		case "alpaca":
 			if c.Alpaca.KeyID == "" || c.Alpaca.SecretKey == "" {
-				return fmt.Errorf("alpaca credentials required when broker=alpaca and trading is enabled")
+				return errors.New(
+					"alpaca credentials required when broker=alpaca and trading is enabled",
+				)
 			}
+
 		case "trading212":
 			if c.Trading212.APIKey == "" || c.Trading212.Secret == "" {
-				return fmt.Errorf("trading212.api_key and trading212.secret required when broker=trading212 and trading is enabled")
+				return errors.New(
+					"trading212.api_key and trading212.secret required when broker=trading212 and trading is enabled",
+				)
 			}
+
 			if c.Trading212.BaseURL == "" {
-				return fmt.Errorf("trading212.base_url required when broker=trading212")
+				return errors.New("trading212.base_url required when broker=trading212")
 			}
+
 		case "saxo":
 			if c.Saxo.BaseURL == "" {
-				return fmt.Errorf("saxo.base_url required when broker=saxo")
+				return errors.New("saxo.base_url required when broker=saxo")
 			}
+
 			if c.Saxo.AuthMode == "certificate" {
 				if c.Saxo.AppKey == "" || c.Saxo.UserID == "" || c.Saxo.CertPath == "" {
-					return fmt.Errorf("saxo certificate auth requires app_key, user_id and cert_path")
+					return errors.New(
+						"saxo certificate auth requires app_key, user_id and cert_path",
+					)
 				}
 			} else if c.Saxo.Token == "" {
-				return fmt.Errorf("saxo.token required when broker=saxo and auth_mode=token")
+				return errors.New("saxo.token required when broker=saxo and auth_mode=token")
 			}
 		}
 	}
+
 	if c.Strategy.FastMA >= c.Strategy.SlowMA {
-		return fmt.Errorf("strategy.fast_ma (%d) must be < slow_ma (%d)", c.Strategy.FastMA, c.Strategy.SlowMA)
+		return fmt.Errorf(
+			"strategy.fast_ma (%d) must be < slow_ma (%d)",
+			c.Strategy.FastMA,
+			c.Strategy.SlowMA,
+		)
 	}
+
 	if c.Engine.EvalInterval <= 0 {
-		return fmt.Errorf("engine.eval_interval must be > 0")
+		return errors.New("engine.eval_interval must be > 0")
 	}
+
 	return nil
 }

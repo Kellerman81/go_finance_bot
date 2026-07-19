@@ -32,7 +32,11 @@ func TestOptimizeRanksAndFilters(t *testing.T) {
 	// Min-trades filter respected.
 	for _, tr := range trials {
 		if tr.Result.NumTrades < minTrades {
-			t.Errorf("trial with %d trades slipped past min-trades %d", tr.Result.NumTrades, minTrades)
+			t.Errorf(
+				"trial with %d trades slipped past min-trades %d",
+				tr.Result.NumTrades,
+				minTrades,
+			)
 		}
 	}
 }

@@ -34,12 +34,15 @@ type SymbolStats struct {
 // "all"; anything else — including "" — defaults to "week").
 func (e *Engine) Stats(period string) (TradeStats, error) {
 	label, since := periodSince(period)
+
 	stats, err := e.store.TradeStats(since)
 	if err != nil {
 		return TradeStats{}, err
 	}
+
 	stats.Period = label
 	stats.Since = since
+
 	return stats, nil
 }
 

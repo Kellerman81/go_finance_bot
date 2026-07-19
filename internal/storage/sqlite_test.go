@@ -18,7 +18,14 @@ func TestOpenPositionRoundTrip(t *testing.T) {
 	defer db.Close()
 
 	entry := time.Now().UTC().Truncate(time.Second)
-	p := engine.OpenPosition{Symbol: "AAPL", Qty: 2, EntryPrice: 150, EntryTime: entry, Peak: 155, EntryIndicators: `[{"name":"rsi"}]`}
+	p := engine.OpenPosition{
+		Symbol:          "AAPL",
+		Qty:             2,
+		EntryPrice:      150,
+		EntryTime:       entry,
+		Peak:            155,
+		EntryIndicators: `[{"name":"rsi"}]`,
+	}
 	if err := db.SaveOpenPosition(p); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -27,7 +34,8 @@ func TestOpenPositionRoundTrip(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("load: %v len=%d", err, len(got))
 	}
-	if got[0].Symbol != "AAPL" || got[0].Qty != 2 || got[0].Peak != 155 || !got[0].EntryTime.Equal(entry) ||
+	if got[0].Symbol != "AAPL" || got[0].Qty != 2 || got[0].Peak != 155 ||
+		!got[0].EntryTime.Equal(entry) ||
 		got[0].EntryIndicators != p.EntryIndicators {
 		t.Errorf("round-trip mismatch: %+v", got[0])
 	}
@@ -71,14 +79,36 @@ func TestTradeRoundTripWithPnL(t *testing.T) {
 		Status: "filled", Indicators: buyInd,
 	}
 	win := engine.TradeRecord{
-		Time: base.Add(time.Minute), Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 110, Value: 110,
-		Status: "filled", Indicators: sellInd, EntryIndicators: buyInd,
-		PnL: ptrF(10), PnLPct: ptrF(10), Win: ptrB(true),
+		Time: base.Add(
+			time.Minute,
+		),
+		Symbol:          "AAPL",
+		Side:            broker.Sell,
+		Qty:             1,
+		Price:           110,
+		Value:           110,
+		Status:          "filled",
+		Indicators:      sellInd,
+		EntryIndicators: buyInd,
+		PnL:             ptrF(10),
+		PnLPct:          ptrF(10),
+		Win:             ptrB(true),
 	}
 	loss := engine.TradeRecord{
-		Time: base.Add(2 * time.Minute), Symbol: "MSFT", Side: broker.Sell, Qty: 1, Price: 90, Value: 90,
-		Status: "filled", Indicators: sellInd, EntryIndicators: buyInd,
-		PnL: ptrF(-5), PnLPct: ptrF(-5), Win: ptrB(false),
+		Time: base.Add(
+			2 * time.Minute,
+		),
+		Symbol:          "MSFT",
+		Side:            broker.Sell,
+		Qty:             1,
+		Price:           90,
+		Value:           90,
+		Status:          "filled",
+		Indicators:      sellInd,
+		EntryIndicators: buyInd,
+		PnL:             ptrF(-5),
+		PnLPct:          ptrF(-5),
+		Win:             ptrB(false),
 	}
 	for _, tr := range []engine.TradeRecord{buy, win, loss} {
 		if err := db.SaveTrade(tr); err != nil {
@@ -120,14 +150,57 @@ func TestTradeStats(t *testing.T) {
 	now := time.Now().UTC()
 	trades := []engine.TradeRecord{
 		// AAPL: 1 win (+10), 1 loss (-4) -> total +6
-		{Time: now.Add(-time.Hour), Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 110, Status: "filled", PnL: ptrF(10), Win: ptrB(true)},
-		{Time: now.Add(-2 * time.Hour), Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 96, Status: "filled", PnL: ptrF(-4), Win: ptrB(false)},
+		{
+			Time:   now.Add(-time.Hour),
+			Symbol: "AAPL",
+			Side:   broker.Sell,
+			Qty:    1,
+			Price:  110,
+			Status: "filled",
+			PnL:    ptrF(10),
+			Win:    ptrB(true),
+		},
+		{
+			Time:   now.Add(-2 * time.Hour),
+			Symbol: "AAPL",
+			Side:   broker.Sell,
+			Qty:    1,
+			Price:  96,
+			Status: "filled",
+			PnL:    ptrF(-4),
+			Win:    ptrB(false),
+		},
 		// MSFT: 1 win (+20)
-		{Time: now.Add(-3 * time.Hour), Symbol: "MSFT", Side: broker.Sell, Qty: 1, Price: 120, Status: "filled", PnL: ptrF(20), Win: ptrB(true)},
+		{
+			Time:   now.Add(-3 * time.Hour),
+			Symbol: "MSFT",
+			Side:   broker.Sell,
+			Qty:    1,
+			Price:  120,
+			Status: "filled",
+			PnL:    ptrF(20),
+			Win:    ptrB(true),
+		},
 		// Outside the 30-day window entirely — must be excluded.
-		{Time: now.AddDate(0, 0, -40), Symbol: "MSFT", Side: broker.Sell, Qty: 1, Price: 130, Status: "filled", PnL: ptrF(30), Win: ptrB(true)},
+		{
+			Time:   now.AddDate(0, 0, -40),
+			Symbol: "MSFT",
+			Side:   broker.Sell,
+			Qty:    1,
+			Price:  130,
+			Status: "filled",
+			PnL:    ptrF(30),
+			Win:    ptrB(true),
+		},
 		// An open buy (no realized outcome) — must be excluded regardless of window.
-		{Time: now.Add(-time.Hour), Symbol: "GOOG", Side: broker.Buy, Qty: 1, Price: 50, Status: "filled"},
+		{
+			Time:   now.Add(-time.Hour),
+			Symbol: "GOOG",
+			Side:   broker.Buy,
+			Qty:    1,
+			Price:  50,
+			Status: "filled",
+		},
 	}
 	for _, tr := range trades {
 		if err := db.SaveTrade(tr); err != nil {
@@ -161,7 +234,8 @@ func TestTradeStats(t *testing.T) {
 	for _, s := range stats.BySymbol {
 		bySym[s.Symbol] = s
 	}
-	if s := bySym["AAPL"]; s.Trades != 2 || s.Wins != 1 || s.Losses != 1 || abs(s.TotalPnL-6) > 1e-9 {
+	if s := bySym["AAPL"]; s.Trades != 2 || s.Wins != 1 || s.Losses != 1 ||
+		abs(s.TotalPnL-6) > 1e-9 {
 		t.Errorf("AAPL stats mismatch: %+v", s)
 	}
 	if s := bySym["MSFT"]; s.Trades != 1 || s.Wins != 1 || abs(s.TotalPnL-20) > 1e-9 {
@@ -238,7 +312,8 @@ func TestSQLiteMigratesLegacyColumns(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("load after migration: %v len=%d", err, len(got))
 	}
-	if got[0].PnL == nil || *got[0].PnL != 5 || got[0].Win == nil || !*got[0].Win || got[0].Indicators != tr.Indicators {
+	if got[0].PnL == nil || *got[0].PnL != 5 || got[0].Win == nil || !*got[0].Win ||
+		got[0].Indicators != tr.Indicators {
 		t.Errorf("post-migration round-trip mismatch: %+v", got[0])
 	}
 }

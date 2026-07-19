@@ -20,14 +20,23 @@ func LoadConfig(path string, warn io.Writer) config.Config {
 	if warn == nil {
 		warn = os.Stderr
 	}
+
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(warn, "WARNING: config %q not found — running on built-in defaults; "+
 			"your edits are NOT applied. Pass -config <path> (e.g. -config data/config.yaml).\n", path)
+
 		return config.Default()
 	}
+
 	cfg, err := config.Load(path)
 	if err != nil {
-		fmt.Fprintf(warn, "WARNING: config %q: %v — continuing with best-effort values.\n", path, err)
+		fmt.Fprintf(
+			warn,
+			"WARNING: config %q: %v — continuing with best-effort values.\n",
+			path,
+			err,
+		)
 	}
+
 	return cfg
 }

@@ -32,13 +32,36 @@ func newT212Mock(t *testing.T) *t212Mock {
 			{"ticker": "VUSA_EQ", "shortName": "VUSA", "isin": "IE00B3XXRP09", "type": "ETF"},
 			{"ticker": "LXSd_EQ", "shortName": "LXS", "isin": "DE0005470405", "type": "STOCK"},
 			{"ticker": "SAPd_EQ", "shortName": "SAP", "isin": "DE0007164600", "type": "STOCK"},
-			{"ticker": "SAP_CA_EQ", "shortName": "SAP", "isin": "CA8029121057", "type": "STOCK"}, // Saputo (ambiguous)
+			{
+				"ticker":    "SAP_CA_EQ",
+				"shortName": "SAP",
+				"isin":      "CA8029121057",
+				"type":      "STOCK",
+			}, // Saputo (ambiguous)
 			{"ticker": "SAP_US_EQ", "shortName": "SAP", "isin": "US8030542042", "type": "STOCK"},
 			{"ticker": "SLABOND_EQ", "shortName": "SLA", "isin": "DE000SLA7M77", "type": "STOCK"},
 			// Same ISIN, three currencies — EUR should win.
-			{"ticker": "PRJUl_EQ", "shortName": "PRJU", "isin": "LU1931974775", "currencyCode": "USD", "type": "ETF"},
-			{"ticker": "PRIJl_EQ", "shortName": "PRIJ", "isin": "LU1931974775", "currencyCode": "GBX", "type": "ETF"},
-			{"ticker": "PR1Jd_EQ", "shortName": "PR1J", "isin": "LU1931974775", "currencyCode": "EUR", "type": "ETF"},
+			{
+				"ticker":       "PRJUl_EQ",
+				"shortName":    "PRJU",
+				"isin":         "LU1931974775",
+				"currencyCode": "USD",
+				"type":         "ETF",
+			},
+			{
+				"ticker":       "PRIJl_EQ",
+				"shortName":    "PRIJ",
+				"isin":         "LU1931974775",
+				"currencyCode": "GBX",
+				"type":         "ETF",
+			},
+			{
+				"ticker":       "PR1Jd_EQ",
+				"shortName":    "PR1J",
+				"isin":         "LU1931974775",
+				"currencyCode": "EUR",
+				"type":         "ETF",
+			},
 		})
 	})
 	mux.HandleFunc("POST /equity/orders/market", func(w http.ResponseWriter, r *http.Request) {
@@ -50,19 +73,46 @@ func newT212Mock(t *testing.T) *t212Mock {
 		})
 	})
 	mux.HandleFunc("/equity/account/cash", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"free": 900.0, "total": 1000.0, "invested": 100.0})
+		_ = json.NewEncoder(w).
+			Encode(map[string]any{"free": 900.0, "total": 1000.0, "invested": 100.0})
 	})
 	mux.HandleFunc("/equity/account/info", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"currencyCode": "EUR"})
 	})
 	mux.HandleFunc("/equity/portfolio", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"ticker": "AAPL_US_EQ", "quantity": 2.0, "averagePrice": 150.0, "currentPrice": 160.0, "ppl": 20.0},
+			{
+				"ticker":       "AAPL_US_EQ",
+				"quantity":     2.0,
+				"averagePrice": 150.0,
+				"currentPrice": 160.0,
+				"ppl":          20.0,
+			},
 		})
 	})
 	mux.HandleFunc("GET /equity/orders", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"id": 777, "ticker": "AAPL_US_EQ", "quantity": -5.0, "type": "LIMIT", "status": "WORKING", "limitPrice": 200.0},
+			{
+				"id":         777,
+				"ticker":     "AAPL_US_EQ",
+				"quantity":   -5.0,
+				"type":       "LIMIT",
+				"status":     "WORKING",
+				"limitPrice": 200.0,
+			},
+		})
+	})
+	// Fill polling: report the last submitted order as fully filled at 100/share.
+	mux.HandleFunc("GET /equity/orders/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := strconv.Atoi(r.PathValue("id"))
+		q, _ := m.lastBody["quantity"].(float64)
+		abs := q
+		if abs < 0 {
+			abs = -abs
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": id, "ticker": m.lastBody["ticker"], "quantity": q,
+			"filledQuantity": q, "filledValue": abs * 100.0, "status": "FILLED",
 		})
 	})
 	mux.HandleFunc("DELETE /equity/orders/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +126,13 @@ func newT212Mock(t *testing.T) *t212Mock {
 
 // fresh returns a client with pacing reset so back-to-back calls don't sleep.
 func (m *t212Mock) fresh() *Trading212 {
-	c := NewTrading212(m.srv.URL, "key", "secret", map[string]string{"PRAJL.XC": "LU1931974775"}, "EUR")
+	c := NewTrading212(
+		m.srv.URL,
+		"key",
+		"secret",
+		map[string]string{"PRAJL.XC": "LU1931974775"},
+		"EUR",
+	)
 	c.lastCall = map[string]time.Time{}
 	return c
 }
@@ -103,7 +159,8 @@ func TestT212OrderSignedQuantity(t *testing.T) {
 		t.Errorf("auth header = %q, want Basic base64(key:secret)", m.lastAuth)
 	}
 
-	if _, err := m.fresh().SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: 3, Type: Market}); err != nil {
+	if _, err := m.fresh().
+		SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: 3, Type: Market}); err != nil {
 		t.Fatalf("sell: %v", err)
 	}
 	if q, _ := m.lastBody["quantity"].(float64); q != -3 {
@@ -119,7 +176,8 @@ func TestT212SellQuantityRoundedDown(t *testing.T) {
 	// never above the owned amount, so Trading 212 doesn't reject it as "selling
 	// more than owned".
 	owned := 100.0 / 27.0 // 3.7037037037037037
-	if _, err := m.fresh().SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: owned, Type: Market}); err != nil {
+	if _, err := m.fresh().
+		SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: owned, Type: Market}); err != nil {
 		t.Fatalf("sell: %v", err)
 	}
 	q, _ := m.lastBody["quantity"].(float64)
@@ -135,7 +193,8 @@ func TestT212SellQuantityRoundedDown(t *testing.T) {
 	}
 
 	// A quantity that rounds to zero is rejected rather than sent as a 0-order.
-	if _, err := m.fresh().SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: 1e-12, Type: Market}); err == nil {
+	if _, err := m.fresh().
+		SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: 1e-12, Type: Market}); err == nil {
 		t.Error("a sub-dust quantity should be rejected, not sent")
 	}
 }
@@ -176,7 +235,12 @@ func TestT212QuantityPrecisionRetry(t *testing.T) {
 		}
 		accepted = q
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id": 1, "ticker": body["ticker"], "quantity": q, "filledQuantity": 0, "status": "SUBMITTED"})
+			"id":             1,
+			"ticker":         body["ticker"],
+			"quantity":       q,
+			"filledQuantity": 0,
+			"status":         "SUBMITTED",
+		})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -205,11 +269,124 @@ func TestT212QuantityPrecisionRetry(t *testing.T) {
 
 	// The learned precision is cached: a second order resolves in one attempt.
 	attempts = 0
-	if _, err := c.SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: owned, Type: Market}); err != nil {
+	if _, err := c.SubmitOrder(
+		ctx,
+		Order{Symbol: "AAPL", Side: Sell, Qty: owned, Type: Market},
+	); err != nil {
 		t.Fatalf("second sell: %v", err)
 	}
 	if attempts != 1 {
 		t.Errorf("cached precision should need exactly 1 attempt, got %d", attempts)
+	}
+}
+
+// fillTestServer serves the minimum for one AAPL market order, with a custom
+// handler for the fill-polling endpoint (nil = let the mux 404 it).
+func fillTestServer(t *testing.T, orderStatus http.HandlerFunc) *Trading212 {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/equity/metadata/instruments", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"ticker": "AAPL_US_EQ", "shortName": "AAPL", "isin": "US0378331005", "type": "STOCK"},
+		})
+	})
+	mux.HandleFunc("POST /equity/orders/market", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 9, "ticker": body["ticker"], "quantity": body["quantity"],
+			"filledQuantity": 0, "status": "NEW",
+		})
+	})
+	if orderStatus != nil {
+		mux.HandleFunc("GET /equity/orders/{id}", orderStatus)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := NewTrading212(srv.URL, "k", "s", nil, "EUR")
+	c.lastCall = map[string]time.Time{}
+	return c
+}
+
+func TestT212ConfirmFillPolling(t *testing.T) {
+	// The POST answers NEW/0 (async fill). The order endpoint reports NEW on the
+	// first poll and FILLED with real quantity + filledValue on the second — the
+	// result must carry the true fill, not the submission snapshot.
+	var polls int
+	c := fillTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		if polls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 9, "ticker": "AAPL_US_EQ", "quantity": 2.0,
+				"filledQuantity": 0, "status": "NEW",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 9, "ticker": "AAPL_US_EQ", "quantity": 2.0,
+			"filledQuantity": 2.0, "filledValue": 391.0, "status": "FILLED",
+		})
+	})
+
+	res, err := c.SubmitOrder(
+		context.Background(),
+		Order{Symbol: "AAPL", Side: Buy, Qty: 2, Type: Market},
+	)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if polls < 2 {
+		t.Errorf("expected at least 2 polls (NEW then FILLED), got %d", polls)
+	}
+	if res.FilledQty != 2 {
+		t.Errorf("FilledQty = %v, want 2 (the confirmed fill)", res.FilledQty)
+	}
+	if res.FilledPx != 195.5 {
+		t.Errorf("FilledPx = %v, want 195.5 (filledValue/filledQuantity)", res.FilledPx)
+	}
+	if res.Status != "filled" {
+		t.Errorf("Status = %q, want filled", res.Status)
+	}
+}
+
+func TestT212ConfirmFill404AssumesFilled(t *testing.T) {
+	// No order-status handler: the poll 404s, meaning the order filled and left
+	// the working set — the submitted quantity is assumed filled.
+	c := fillTestServer(t, nil)
+	res, err := c.SubmitOrder(
+		context.Background(),
+		Order{Symbol: "AAPL", Side: Sell, Qty: 3, Type: Market},
+	)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if res.FilledQty != 3 {
+		t.Errorf("FilledQty = %v, want 3 (assumed filled on 404)", res.FilledQty)
+	}
+	if res.Status != "filled" {
+		t.Errorf("Status = %q, want filled", res.Status)
+	}
+}
+
+func TestT212ConfirmFillRejectedStaysUnfilled(t *testing.T) {
+	// A rejected order must keep its honest zero fill — no realized P&L.
+	c := fillTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 9, "ticker": "AAPL_US_EQ", "quantity": 2.0,
+			"filledQuantity": 0, "status": "REJECTED",
+		})
+	})
+	res, err := c.SubmitOrder(
+		context.Background(),
+		Order{Symbol: "AAPL", Side: Buy, Qty: 2, Type: Market},
+	)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if res.FilledQty != 0 {
+		t.Errorf("FilledQty = %v, want 0 for a rejected order", res.FilledQty)
+	}
+	if res.Status == "filled" {
+		t.Errorf("Status = %q — a rejection must not be reported as filled", res.Status)
 	}
 }
 
@@ -229,7 +406,8 @@ func TestT212AccountAndPositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("positions: %v", err)
 	}
-	if len(pos) != 1 || pos[0].Symbol != "AAPL" || pos[0].MarketValue != 320 || pos[0].UnrealizedPL != 20 {
+	if len(pos) != 1 || pos[0].Symbol != "AAPL" || pos[0].MarketValue != 320 ||
+		pos[0].UnrealizedPL != 20 {
 		t.Errorf("position mapping wrong: %+v", pos)
 	}
 }
@@ -246,7 +424,8 @@ func TestT212OpenOrdersAndCancel(t *testing.T) {
 		t.Fatalf("want 1 order, got %d", len(orders))
 	}
 	o := orders[0]
-	if o.OrderID != "777" || o.Symbol != "AAPL" || o.Side != Sell || o.Qty != 5 || o.Price != 200 || o.Type != "LIMIT" {
+	if o.OrderID != "777" || o.Symbol != "AAPL" || o.Side != Sell || o.Qty != 5 || o.Price != 200 ||
+		o.Type != "LIMIT" {
 		t.Errorf("order mapping wrong: %+v", o)
 	}
 
@@ -276,12 +455,12 @@ func TestT212ResolveExchanges(t *testing.T) {
 	c := m.fresh()
 
 	cases := map[string]string{
-		"LXS.DE":           "LXSd_EQ",     // German listing via .DE suffix
-		"SAP.DE":           "SAPd_EQ",     // disambiguate German SAP, not Saputo (CA)
-		"SAP":              "SAP_US_EQ",   // no suffix => prefer US listing
-		"AAPL":             "AAPL_US_EQ",  // US preferred
-		"DE000SLA7M77.SG":  "SLABOND_EQ",  // ISIN match
-		"LXSd_EQ":          "LXSd_EQ",     // already a ticker, passes through
+		"LXS.DE":          "LXSd_EQ",    // German listing via .DE suffix
+		"SAP.DE":          "SAPd_EQ",    // disambiguate German SAP, not Saputo (CA)
+		"SAP":             "SAP_US_EQ",  // no suffix => prefer US listing
+		"AAPL":            "AAPL_US_EQ", // US preferred
+		"DE000SLA7M77.SG": "SLABOND_EQ", // ISIN match
+		"LXSd_EQ":         "LXSd_EQ",    // already a ticker, passes through
 	}
 	for in, want := range cases {
 		got, err := c.ResolveSymbol(ctx, in)

@@ -31,22 +31,29 @@ func (e *Engine) Subscribe(buffer int) (<-chan Event, func()) {
 	if buffer < 1 {
 		buffer = 16
 	}
+
 	ch := make(chan Event, buffer)
+
 	e.subsMu.Lock()
+
 	if e.subs == nil {
 		e.subs = make(map[int]chan Event)
 	}
+
 	id := e.nextSubID
 	e.nextSubID++
+
 	e.subs[id] = ch
 	e.subsMu.Unlock()
 
 	return ch, func() {
 		e.subsMu.Lock()
+
 		if c, ok := e.subs[id]; ok {
 			delete(e.subs, id)
 			close(c)
 		}
+
 		e.subsMu.Unlock()
 	}
 }
@@ -55,11 +62,13 @@ func (e *Engine) Subscribe(buffer int) (<-chan Event, func()) {
 // (non-blocking) so publishing never stalls the engine.
 func (e *Engine) emit(ev Event) {
 	e.subsMu.Lock()
+
 	for _, ch := range e.subs {
 		select {
 		case ch <- ev:
 		default: // slow consumer — drop rather than block
 		}
 	}
+
 	e.subsMu.Unlock()
 }

@@ -23,17 +23,24 @@ type staticAsset struct {
 // indexAsset is the compiled UI page, built once at package init.
 var indexAsset = buildIndexAsset()
 
+// buildIndexAsset reads the embedded UI page and precomputes its gzip copy
+// and content-hash ETag.
 func buildIndexAsset() staticAsset {
 	raw, err := webFS.ReadFile("web/index.html")
 	if err != nil {
 		// Embedded at build time — a read failure is a programming error.
 		panic("api: read embedded index.html: " + err.Error())
 	}
+
 	var buf bytes.Buffer
+
 	gw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+
 	_, _ = gw.Write(raw)
 	_ = gw.Close()
+
 	sum := sha256.Sum256(raw)
+
 	return staticAsset{raw: raw, gz: buf.Bytes(), etag: fmt.Sprintf("\"%x\"", sum[:16])}
 }
 
@@ -42,17 +49,23 @@ func buildIndexAsset() staticAsset {
 func (a staticAsset) serve(c *gin.Context) {
 	c.Header("ETag", a.etag)
 	c.Header("Cache-Control", "no-cache") // always revalidate; ETag makes that a 304
+
 	if match := c.GetHeader("If-None-Match"); match != "" && strings.Contains(match, a.etag) {
 		c.Status(http.StatusNotModified)
+
 		return
 	}
+
 	c.Header("Content-Type", "text/html; charset=utf-8")
+
 	if strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
 		c.Header("Content-Encoding", "gzip")
 		c.Header("Vary", "Accept-Encoding")
 		c.Data(http.StatusOK, "text/html; charset=utf-8", a.gz)
+
 		return
 	}
+
 	c.Data(http.StatusOK, "text/html; charset=utf-8", a.raw)
 }
 
@@ -61,14 +74,20 @@ func (a staticAsset) serve(c *gin.Context) {
 // gzip.
 func gzipJSON() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.FullPath() == "/api/events" || !strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		if c.FullPath() == "/api/events" ||
+			!strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
 			c.Next()
+
 			return
 		}
+
 		gz, _ := gzip.NewWriterLevel(c.Writer, gzip.DefaultCompression)
+
 		defer gz.Close()
+
 		c.Header("Content-Encoding", "gzip")
 		c.Header("Vary", "Accept-Encoding")
+
 		c.Writer = &gzipWriter{ResponseWriter: c.Writer, gz: gz}
 		c.Next()
 	}
@@ -79,8 +98,10 @@ type gzipWriter struct {
 	gz *gzip.Writer
 }
 
+// Write compresses p through the gzip writer.
 func (g *gzipWriter) Write(b []byte) (int, error) { return g.gz.Write(b) }
 
+// WriteString compresses s through the gzip writer.
 func (g *gzipWriter) WriteString(s string) (int, error) { return g.gz.Write([]byte(s)) }
 
 // WriteHeader strips Content-Length, which no longer matches once the body is
@@ -99,11 +120,17 @@ func requireToken(token string) gin.HandlerFunc {
 		if h := c.GetHeader("Authorization"); presented == "" && strings.HasPrefix(h, "Bearer ") {
 			presented = strings.TrimPrefix(h, "Bearer ")
 		}
+
 		if subtleEqual(presented, token) {
 			c.Next()
+
 			return
 		}
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: missing or invalid API token"})
+
+		c.AbortWithStatusJSON(
+			http.StatusUnauthorized,
+			gin.H{"error": "unauthorized: missing or invalid API token"},
+		)
 	}
 }
 
@@ -113,9 +140,12 @@ func subtleEqual(a, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	var v byte
-	for i := 0; i < len(a); i++ {
+
+	for i := range len(a) {
 		v |= a[i] ^ b[i]
 	}
+
 	return v == 0
 }

@@ -17,6 +17,7 @@ func markSet(names []string, cfg config.StrategyConfig) map[string]bool {
 			set[d.Name()] = true
 		}
 	}
+
 	return set
 }
 
@@ -36,29 +37,40 @@ type DetectorResult struct {
 func EvaluateAll(cfg config.StrategyConfig, candles []market.Candle) []DetectorResult {
 	enabled := markSet(cfg.Detectors, cfg)
 	enabledSell := enabled
+
 	if len(cfg.DetectorsSell) > 0 {
 		enabledSell = markSet(cfg.DetectorsSell, cfg)
 	}
 
 	var s series
+
 	if len(candles) > 0 {
 		s = toSeries(candles)
 	}
 
 	names := AvailableDetectors()
 	out := make([]DetectorResult, 0, len(names))
+
 	for _, name := range names {
 		d := buildDetector(name, cfg)
 		if d == nil {
 			continue
 		}
-		r := DetectorResult{Name: name, Action: Hold, Enabled: enabled[name], EnabledSell: enabledSell[name]}
+
+		r := DetectorResult{
+			Name:        name,
+			Action:      Hold,
+			Enabled:     enabled[name],
+			EnabledSell: enabledSell[name],
+		}
 		if len(candles) < d.WarmupBars() {
 			r.Reason = fmt.Sprintf("warming up (%d/%d bars)", len(candles), d.WarmupBars())
 		} else {
 			r.Action, r.Strength, r.Reason = d.Detect(s)
 		}
+
 		out = append(out, r)
 	}
+
 	return out
 }

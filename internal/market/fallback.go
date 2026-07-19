@@ -22,23 +22,33 @@ func NewFallbackHistory(sources ...HistoryFetcher) *FallbackHistory {
 // Candles returns the first source's non-empty candles. It keeps trying on error
 // or empty results, returning the last error only if every source failed to
 // produce data.
-func (f *FallbackHistory) Candles(ctx context.Context, symbol string, res Resolution, from, to time.Time) ([]Candle, error) {
+func (f *FallbackHistory) Candles(
+	ctx context.Context,
+	symbol string,
+	res Resolution,
+	from, to time.Time,
+) ([]Candle, error) {
 	var lastErr error
+
 	for _, s := range f.sources {
 		if s == nil {
 			continue
 		}
+
 		candles, err := s.Candles(ctx, symbol, res, from, to)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+
 		if len(candles) > 0 {
 			return candles, nil
 		}
 	}
+
 	if lastErr != nil {
 		return nil, lastErr
 	}
+
 	return nil, fmt.Errorf("no history for %s at %s from any source", symbol, res)
 }

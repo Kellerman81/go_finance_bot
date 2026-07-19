@@ -14,33 +14,48 @@ func Resample(candles []Candle, target Resolution) []Candle {
 	if step <= 0 || len(candles) == 0 {
 		return candles
 	}
+
 	out := make([]Candle, 0, len(candles))
-	var cur *Candle
-	var curBucket time.Time
+
+	var (
+		cur       *Candle
+		curBucket time.Time
+	)
+
 	for _, c := range candles {
 		bucket := c.Time.Truncate(step)
 		if cur == nil || bucket.After(curBucket) {
 			if cur != nil {
 				out = append(out, *cur)
 			}
+
 			curBucket = bucket
+
 			b := c
+
 			b.Time = bucket
 			cur = &b
+
 			continue
 		}
+
 		// Same bucket: fold this candle into the aggregate.
 		if c.High > cur.High {
 			cur.High = c.High
 		}
+
 		if c.Low < cur.Low {
 			cur.Low = c.Low
 		}
+
 		cur.Close = c.Close
+
 		cur.Volume += c.Volume
 	}
+
 	if cur != nil {
 		out = append(out, *cur)
 	}
+
 	return out
 }

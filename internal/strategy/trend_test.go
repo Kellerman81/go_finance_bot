@@ -111,7 +111,10 @@ func TestCombinedMaxLookback(t *testing.T) {
 		t.Fatal("Combined should expose MaxLookback")
 	}
 	if got := lb.MaxLookback(); got < 1200 {
-		t.Errorf("MaxLookback = %d, want >= trend period 1200 so backtests size the window correctly", got)
+		t.Errorf(
+			"MaxLookback = %d, want >= trend period 1200 so backtests size the window correctly",
+			got,
+		)
 	}
 }
 

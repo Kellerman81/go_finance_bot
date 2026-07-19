@@ -2,7 +2,7 @@ package market
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"math"
 	"math/rand"
 	"sync"
@@ -28,6 +28,7 @@ func NewMock(interval time.Duration) *Mock {
 	if interval <= 0 {
 		interval = time.Second
 	}
+
 	m := &Mock{
 		out:      make(chan Quote, 256),
 		interval: interval,
@@ -35,82 +36,111 @@ func NewMock(interval time.Duration) *Mock {
 		last:     make(map[string]Quote),
 		done:     make(chan struct{}),
 	}
+
 	go m.run()
+
 	return m
 }
 
+// Quotes returns the synthetic tick channel.
 func (m *Mock) Quotes() <-chan Quote { return m.out }
 
 // LastQuote returns the most recent tick emitted for symbol.
 func (m *Mock) LastQuote(symbol string) (Quote, bool) {
 	m.mu.Lock()
+
 	q, ok := m.last[symbol]
 	m.mu.Unlock()
+
 	return q, ok
 }
 
+// Subscribe registers symbols for synthetic streaming.
 func (m *Mock) Subscribe(symbols ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if m.closed {
-		return fmt.Errorf("provider closed")
+		return errors.New("provider closed")
 	}
+
 	for _, s := range symbols {
 		if _, ok := m.prices[s]; !ok {
 			// Seed a deterministic-ish starting price per symbol.
-			m.prices[s] = 50 + rand.Float64()*200
+			m.prices[s] = 50 + rand.Float64()*200 //nolint:gosec // synthetic mock prices, not security-sensitive
 		}
 	}
+
 	return nil
 }
 
+// Unsubscribe stops generating ticks for the given symbols.
 func (m *Mock) Unsubscribe(symbols ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	for _, s := range symbols {
 		delete(m.prices, s)
 	}
+
 	return nil
 }
 
+// Close stops the generator and closes the tick channel.
 func (m *Mock) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if m.closed {
 		return nil
 	}
+
 	m.closed = true
 	close(m.done)
+
 	return nil
 }
 
+// run emits a random-walk tick per subscribed symbol on every interval.
 func (m *Mock) run() {
 	t := time.NewTicker(m.interval)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-m.done:
 			close(m.out)
+
 			return
+
 		case <-t.C:
 			m.mu.Lock()
+
 			snapshot := make(map[string]Quote, len(m.prices))
 			now := time.Now()
+
 			for s, p := range m.prices {
 				// Gaussian-ish random walk, ~0.3% step.
-				np := p * (1 + (rand.Float64()-0.5)*0.006)
+				np := p * (1 + (rand.Float64()-0.5)*0.006) //nolint:gosec // synthetic mock ticks, not security-sensitive
+
 				m.prices[s] = np
+
 				q := Quote{Symbol: s, Price: round2(np), Volume: 1, Time: now}
+
 				snapshot[s] = q
 				m.last[s] = q
 			}
+
 			m.mu.Unlock()
+
 			for _, q := range snapshot {
 				select {
 				case m.out <- q:
 				case <-m.done:
 					close(m.out)
+
 					return
+
 				default:
 				}
 			}
@@ -120,27 +150,43 @@ func (m *Mock) run() {
 
 // Candles synthesises a deterministic random-walk history ending near the
 // symbol's current price, useful for indicator warmup in offline mode.
-func (m *Mock) Candles(_ context.Context, symbol string, res Resolution, from, to time.Time) ([]Candle, error) {
+//
+//nolint:gosec // deterministic synthetic data, not security-sensitive
+func (*Mock) Candles(
+	_ context.Context,
+	symbol string,
+	res Resolution,
+	from, to time.Time,
+) ([]Candle, error) {
 	// Deterministic per symbol (independent of the live, globally-seeded price)
 	// so backtests/optimisation are reproducible across runs.
 	step := resolutionDuration(res)
 	span := to.Sub(from)
 	n := int(span / step) // honour the requested range instead of a fixed count
+
 	if n < 2 {
 		n = 2
 	}
+
 	if n > 500000 {
 		n = 500000 // guard against pathological ranges
 	}
-	rng := rand.New(rand.NewSource(int64(hash(symbol))))
+
+	rng := rand.New(
+		rand.NewSource(int64(hash(symbol))),
+	)
 	price := 50 + rng.Float64()*200 // deterministic base price from the symbol
 	p := price * 0.9
 	out := make([]Candle, n)
-	for i := 0; i < n; i++ {
+
+	for i := range n {
 		open := p
-		p = p * (1 + (rng.Float64()-0.48)*0.01)
+
+		p *= (1 + (rng.Float64()-0.48)*0.01)
+
 		high := math.Max(open, p) * (1 + rng.Float64()*0.003)
 		low := math.Min(open, p) * (1 - rng.Float64()*0.003)
+
 		out[i] = Candle{
 			Symbol: symbol,
 			Open:   round2(open),
@@ -151,10 +197,12 @@ func (m *Mock) Candles(_ context.Context, symbol string, res Resolution, from, t
 			Time:   from.Add(time.Duration(i) * step),
 		}
 	}
+
 	return out, nil
 }
 
-// resolutionDuration maps a candle resolution to its bar interval.
+// resolutionDuration maps a candle resolution to its bar interval; unknown
+// resolutions fall back to one minute.
 func resolutionDuration(res Resolution) time.Duration {
 	switch res {
 	case Res5Min:
@@ -165,18 +213,24 @@ func resolutionDuration(res Resolution) time.Duration {
 		return time.Hour
 	case Res1Day:
 		return 24 * time.Hour
-	default:
-		return time.Minute
+	case Res1Min: // the shared fallback below
 	}
+
+	return time.Minute
 }
 
+// round2 rounds to two decimals.
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
+// hash is the FNV-1a 32-bit hash of s (a stable per-symbol seed).
 func hash(s string) uint32 {
 	var h uint32 = 2166136261
-	for i := 0; i < len(s); i++ {
+
+	for i := range len(s) {
 		h ^= uint32(s[i])
+
 		h *= 16777619
 	}
+
 	return h
 }

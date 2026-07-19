@@ -42,10 +42,18 @@ func TestOrderingAllowedUSHours(t *testing.T) {
 func TestOrderingAllowedXetra(t *testing.T) {
 	berlin := mustLoad(t, "Europe/Berlin")
 	// Xetra 09:00–17:30 local. 2026-06-22 Monday.
-	if ok, _ := OrderingAllowed("SAP.DE", time.Date(2026, 6, 22, 10, 0, 0, 0, berlin), 5*time.Minute); !ok {
+	if ok, _ := OrderingAllowed(
+		"SAP.DE",
+		time.Date(2026, 6, 22, 10, 0, 0, 0, berlin),
+		5*time.Minute,
+	); !ok {
 		t.Error("SAP.DE at 10:00 Berlin should be allowed")
 	}
-	if ok, _ := OrderingAllowed("SAP.DE", time.Date(2026, 6, 22, 18, 0, 0, 0, berlin), 5*time.Minute); ok {
+	if ok, _ := OrderingAllowed(
+		"SAP.DE",
+		time.Date(2026, 6, 22, 18, 0, 0, 0, berlin),
+		5*time.Minute,
+	); ok {
 		t.Error("SAP.DE at 18:00 Berlin (after close) should be blocked")
 	}
 	// A US symbol during US-morning is still before Xetra... but evaluated on its

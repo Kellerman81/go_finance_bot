@@ -14,9 +14,14 @@ type fakeDetector struct {
 	strength float64
 }
 
-func (f fakeDetector) Name() string                            { return f.name }
-func (f fakeDetector) WarmupBars() int                         { return 1 }
-func (f fakeDetector) Detect(series) (Action, float64, string) { return f.action, f.strength, f.name }
+func (f fakeDetector) Name() string    { return f.name }
+func (f fakeDetector) WarmupBars() int { return 1 }
+
+func (f fakeDetector) Detect(
+	series,
+) (Action, float64, string) {
+	return f.action, f.strength, f.name
+}
 
 func combinedWith(mode CombineMode, ds ...Detector) *Combined {
 	return &Combined{detectors: ds, mode: mode, sellMode: mode, warmup: 1}
@@ -80,13 +85,17 @@ func TestSeparateSellDetectors(t *testing.T) {
 
 func TestSellGateLowerThanBuy(t *testing.T) {
 	// A weak (0.2) signal: passes the low sell bar (0.1) but fails the buy bar (0.5).
-	sellSide := &Combined{detectors: []Detector{fakeDetector{"a", Sell, 0.2}},
-		mode: Majority, sellMode: Majority, warmup: 1, minStrength: 0.5, minStrengthSell: 0.1}
+	sellSide := &Combined{
+		detectors: []Detector{fakeDetector{"a", Sell, 0.2}},
+		mode:      Majority, sellMode: Majority, warmup: 1, minStrength: 0.5, minStrengthSell: 0.1,
+	}
 	if got := sellSide.Evaluate("X", twoBars).Action; got != Sell {
 		t.Fatalf("weak sell with low sell-gate => %s, want SELL", got)
 	}
-	buySide := &Combined{detectors: []Detector{fakeDetector{"a", Buy, 0.2}},
-		mode: Majority, sellMode: Majority, warmup: 1, minStrength: 0.5, minStrengthSell: 0.1}
+	buySide := &Combined{
+		detectors: []Detector{fakeDetector{"a", Buy, 0.2}},
+		mode:      Majority, sellMode: Majority, warmup: 1, minStrength: 0.5, minStrengthSell: 0.1,
+	}
 	if got := buySide.Evaluate("X", twoBars).Action; got != Hold {
 		t.Errorf("weak buy below buy-gate => %s, want HOLD", got)
 	}

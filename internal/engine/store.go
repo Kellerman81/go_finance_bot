@@ -18,31 +18,63 @@ type OpenPosition struct {
 // in the storage package; the engine defines the interface here so it does not
 // import storage (avoiding an import cycle).
 type Store interface {
+	// SaveTrade persists one trade decision.
 	SaveTrade(t TradeRecord) error
+	// RecentTrades returns up to limit of the most recent trade records.
 	RecentTrades(limit int) ([]TradeRecord, error)
+	// TradeStats aggregates realized win/loss outcomes since the cutoff.
 	TradeStats(since time.Time) (TradeStats, error)
+	// SaveWatchlist replaces the persisted watchlist.
 	SaveWatchlist(symbols []string) error
+	// LoadWatchlist returns the persisted watchlist.
 	LoadWatchlist() ([]string, error)
+	// SaveDailySpend upserts the rolling daily-spend counter for day.
 	SaveDailySpend(day string, amount float64) error
+	// LoadDailySpend returns the persisted day and spend amount.
 	LoadDailySpend() (day string, amount float64, err error)
-	// Open positions — written immediately on buy/sell so they survive restarts.
+	// SaveOpenPosition writes a durable open-position row — immediately on
+	// buy/sell so positions survive restarts.
 	SaveOpenPosition(p OpenPosition) error
+	// DeleteOpenPosition removes a symbol's open-position row.
 	DeleteOpenPosition(symbol string) error
+	// LoadOpenPositions returns all persisted open positions.
 	LoadOpenPositions() ([]OpenPosition, error)
+	// Close releases the underlying resources.
 	Close() error
 }
 
 // nopStore is the default no-persistence implementation.
 type nopStore struct{}
 
-func (nopStore) SaveTrade(TradeRecord) error                 { return nil }
-func (nopStore) RecentTrades(int) ([]TradeRecord, error)     { return nil, nil }
-func (nopStore) TradeStats(time.Time) (TradeStats, error)    { return TradeStats{}, nil }
-func (nopStore) SaveWatchlist([]string) error                { return nil }
-func (nopStore) LoadWatchlist() ([]string, error)            { return nil, nil }
-func (nopStore) SaveDailySpend(string, float64) error        { return nil }
-func (nopStore) LoadDailySpend() (string, float64, error)    { return "", 0, nil }
-func (nopStore) SaveOpenPosition(OpenPosition) error         { return nil }
-func (nopStore) DeleteOpenPosition(string) error             { return nil }
-func (nopStore) LoadOpenPositions() ([]OpenPosition, error)  { return nil, nil }
-func (nopStore) Close() error                                { return nil }
+// SaveTrade is a no-op.
+func (nopStore) SaveTrade(TradeRecord) error { return nil }
+
+// RecentTrades is a no-op.
+func (nopStore) RecentTrades(int) ([]TradeRecord, error) { return nil, nil }
+
+// TradeStats is a no-op.
+func (nopStore) TradeStats(time.Time) (TradeStats, error) { return TradeStats{}, nil }
+
+// SaveWatchlist is a no-op.
+func (nopStore) SaveWatchlist([]string) error { return nil }
+
+// LoadWatchlist is a no-op.
+func (nopStore) LoadWatchlist() ([]string, error) { return nil, nil }
+
+// SaveDailySpend is a no-op.
+func (nopStore) SaveDailySpend(string, float64) error { return nil }
+
+// LoadDailySpend is a no-op.
+func (nopStore) LoadDailySpend() (string, float64, error) { return "", 0, nil }
+
+// SaveOpenPosition is a no-op.
+func (nopStore) SaveOpenPosition(OpenPosition) error { return nil }
+
+// DeleteOpenPosition is a no-op.
+func (nopStore) DeleteOpenPosition(string) error { return nil }
+
+// LoadOpenPositions is a no-op.
+func (nopStore) LoadOpenPositions() ([]OpenPosition, error) { return nil, nil }
+
+// Close is a no-op.
+func (nopStore) Close() error { return nil }

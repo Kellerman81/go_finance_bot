@@ -20,13 +20,16 @@ type barStore struct {
 	builders map[string]*barBuilder
 }
 
+// newBarStore creates a store of per-symbol candle rings and bar builders.
 func newBarStore(capacity int, interval time.Duration) *barStore {
 	if capacity < 1 {
 		capacity = 1
 	}
+
 	if interval <= 0 {
 		interval = time.Minute
 	}
+
 	return &barStore{
 		capacity: capacity,
 		interval: interval,
@@ -39,9 +42,11 @@ func newBarStore(capacity int, interval time.Duration) *barStore {
 func (s *barStore) add(symbol string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if _, ok := s.rings[symbol]; !ok {
 		s.rings[symbol] = newRing(s.capacity)
 	}
+
 	if _, ok := s.builders[symbol]; !ok {
 		s.builders[symbol] = newBarBuilder(symbol, s.interval)
 	}
@@ -58,8 +63,10 @@ func (s *barStore) remove(symbol string) {
 // has reports whether the symbol is registered.
 func (s *barStore) has(symbol string) bool {
 	s.mu.RLock()
+
 	_, ok := s.rings[symbol]
 	s.mu.RUnlock()
+
 	return ok
 }
 
@@ -69,16 +76,20 @@ func (s *barStore) has(symbol string) bool {
 func (s *barStore) ingest(symbol string, price float64, ts time.Time) (completed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	b, ok := s.builders[symbol]
 	if !ok {
 		return false
 	}
+
 	if done, ready := b.add(price, ts); ready {
 		if r, ok := s.rings[symbol]; ok {
 			r.push(done)
 		}
+
 		return true
 	}
+
 	return false
 }
 
@@ -87,11 +98,13 @@ func (s *barStore) ingest(symbol string, price float64, ts time.Time) (completed
 func (s *barStore) seed(symbol string, candles []market.Candle) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	r, ok := s.rings[symbol]
 	if !ok {
 		r = newRing(s.capacity)
 		s.rings[symbol] = r
 	}
+
 	r.reset(candles)
 }
 
@@ -100,17 +113,22 @@ func (s *barStore) seed(symbol string, candles []market.Candle) {
 func (s *barStore) series(symbol string) []market.Candle {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	r, ok := s.rings[symbol]
 	if !ok {
 		return nil
 	}
+
 	out := make([]market.Candle, 0, r.len()+1)
+
 	out = r.appendTo(out)
+
 	if b, ok := s.builders[symbol]; ok {
 		if cur, has := b.current(); has {
 			out = append(out, cur)
 		}
 	}
+
 	return out
 }
 
@@ -122,21 +140,26 @@ type ring struct {
 	n    int // number of valid entries (<= cap)
 }
 
+// newRing allocates a ring with the given capacity (minimum 1).
 func newRing(capacity int) *ring {
 	if capacity < 1 {
 		capacity = 1
 	}
+
 	return &ring{buf: make([]market.Candle, capacity)}
 }
 
+// push appends a candle, overwriting the oldest entry when full.
 func (r *ring) push(c market.Candle) {
 	r.buf[r.head] = c
 	r.head = (r.head + 1) % len(r.buf)
+
 	if r.n < len(r.buf) {
 		r.n++
 	}
 }
 
+// len reports the number of valid entries.
 func (r *ring) len() int { return r.n }
 
 // appendTo appends the ring's entries in chronological (oldest→newest) order to
@@ -145,10 +168,12 @@ func (r *ring) appendTo(dst []market.Candle) []market.Candle {
 	if r.n == 0 {
 		return dst
 	}
+
 	start := (r.head - r.n + len(r.buf)) % len(r.buf)
-	for i := 0; i < r.n; i++ {
+	for i := range r.n {
 		dst = append(dst, r.buf[(start+i)%len(r.buf)])
 	}
+
 	return dst
 }
 
@@ -157,6 +182,7 @@ func (r *ring) reset(candles []market.Candle) {
 	if len(candles) > len(r.buf) {
 		candles = candles[len(candles)-len(r.buf):]
 	}
+
 	r.head, r.n = 0, 0
 	for _, c := range candles {
 		r.push(c)

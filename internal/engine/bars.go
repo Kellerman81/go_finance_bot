@@ -16,10 +16,12 @@ type barBuilder struct {
 	curStart time.Time
 }
 
+// newBarBuilder creates a builder for fixed-interval bars (default 1 minute).
 func newBarBuilder(symbol string, interval time.Duration) *barBuilder {
 	if interval <= 0 {
 		interval = time.Minute
 	}
+
 	return &barBuilder{symbol: symbol, interval: interval}
 }
 
@@ -27,17 +29,23 @@ func newBarBuilder(symbol string, interval time.Duration) *barBuilder {
 // rolls over into a new bar period.
 func (b *barBuilder) add(price float64, ts time.Time) (market.Candle, bool) {
 	bucket := ts.Truncate(b.interval)
+
 	var completed market.Candle
-	done := false
+
+	var done bool
 
 	if b.cur == nil {
 		b.start(bucket, price)
+
 		return completed, false
 	}
+
 	if bucket.After(b.curStart) {
 		completed = *b.cur
 		done = true
+
 		b.start(bucket, price)
+
 		return completed, done
 	}
 
@@ -45,14 +53,18 @@ func (b *barBuilder) add(price float64, ts time.Time) (market.Candle, bool) {
 	if price > b.cur.High {
 		b.cur.High = price
 	}
+
 	if price < b.cur.Low {
 		b.cur.Low = price
 	}
+
 	b.cur.Close = price
 	b.cur.Volume++
+
 	return completed, false
 }
 
+// start begins a new in-progress bar at the given bucket start and price.
 func (b *barBuilder) start(start time.Time, price float64) {
 	b.curStart = start
 	b.cur = &market.Candle{
@@ -71,5 +83,6 @@ func (b *barBuilder) current() (market.Candle, bool) {
 	if b.cur == nil {
 		return market.Candle{}, false
 	}
+
 	return *b.cur, true
 }

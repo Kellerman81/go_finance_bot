@@ -85,6 +85,11 @@ func TestVolumeProfilePOC(t *testing.T) {
 		t.Errorf("POC = %f, want ~100", vp.POC)
 	}
 	if vp.ValueAreaLow > vp.POC || vp.ValueAreaHigh < vp.POC {
-		t.Errorf("value area [%f,%f] must contain POC %f", vp.ValueAreaLow, vp.ValueAreaHigh, vp.POC)
+		t.Errorf(
+			"value area [%f,%f] must contain POC %f",
+			vp.ValueAreaLow,
+			vp.ValueAreaHigh,
+			vp.POC,
+		)
 	}
 }

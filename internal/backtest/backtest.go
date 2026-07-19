@@ -8,7 +8,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
@@ -22,9 +22,9 @@ import (
 
 // Backtester runs a strategy over historical data.
 type Backtester struct {
-	Strategy  strategy.Strategy
-	Limits    config.Limits
-	Exits     config.ExitsConfig
+	Strategy        strategy.Strategy
+	Limits          config.Limits
+	Exits           config.ExitsConfig
 	Costs           config.CostsConfig
 	Cash            float64
 	OrderSize       float64
@@ -63,18 +63,22 @@ func (bt *Backtester) sizeForStrength(strength float64) float64 {
 	if !bt.SizeByStrength {
 		return bt.OrderSize
 	}
+
 	frac := bt.MinSizeFraction
 	if frac <= 0 {
 		frac = 0.25
 	}
+
 	if frac > 1 {
 		frac = 1
 	}
+
 	if strength < 0 {
 		strength = 0
 	} else if strength > 1 {
 		strength = 1
 	}
+
 	return bt.OrderSize * (frac + (1-frac)*strength)
 }
 
@@ -86,33 +90,38 @@ type EquityPoint struct {
 
 // Result holds backtest outcomes and metrics.
 type Result struct {
-	StartingCash     float64               `json:"starting_cash"`
-	FinalEquity      float64               `json:"final_equity"`
-	TotalReturnPct   float64               `json:"total_return_pct"`
-	BuyHoldReturnPct float64               `json:"buy_hold_return_pct"`
-	MaxDrawdownPct   float64               `json:"max_drawdown_pct"`
-	NumTrades        int                   `json:"num_trades"`
-	Wins             int                   `json:"wins"`
-	Losses           int                   `json:"losses"`
-	WinRatePct       float64               `json:"win_rate_pct"`
-	Sharpe           float64               `json:"sharpe"`
-	Bars             int                   `json:"bars"`
-	Trades           []engine.TradeRecord  `json:"trades"`
-	Equity           []EquityPoint         `json:"equity"`
+	StartingCash     float64              `json:"starting_cash"`
+	FinalEquity      float64              `json:"final_equity"`
+	TotalReturnPct   float64              `json:"total_return_pct"`
+	BuyHoldReturnPct float64              `json:"buy_hold_return_pct"`
+	MaxDrawdownPct   float64              `json:"max_drawdown_pct"`
+	NumTrades        int                  `json:"num_trades"`
+	Wins             int                  `json:"wins"`
+	Losses           int                  `json:"losses"`
+	WinRatePct       float64              `json:"win_rate_pct"`
+	Sharpe           float64              `json:"sharpe"`
+	Bars             int                  `json:"bars"`
+	Trades           []engine.TradeRecord `json:"trades"`
+	Equity           []EquityPoint        `json:"equity"`
 }
 
 // Run executes the backtest over per-symbol candle series.
+//
+//nolint:cyclop,funlen // the bar-by-bar simulation loop mirrors the live engine's flow
 func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	ctx := context.Background()
 	symbols := make([]string, 0, len(data))
 	maxLen := 0
+
 	for s, c := range data {
 		symbols = append(symbols, s)
+
 		if len(c) > maxLen {
 			maxLen = len(c)
 		}
 	}
-	sort.Strings(symbols)
+
+	slices.Sort(symbols)
 
 	// Bound the per-bar lookback so each Evaluate is O(window) rather than
 	// O(i): without this the backtest is O(n^2) and large datasets hang. The
@@ -125,6 +134,7 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			lookback = m
 		}
 	}
+
 	if lookback < 100 {
 		lookback = 100
 	}
@@ -140,24 +150,31 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 
 	var (
 		trades       []engine.TradeRecord
-		equity       []EquityPoint
 		wins, losses int
 		ts           time.Time
 	)
 
+	equity := make([]EquityPoint, 0, maxLen)
+
 	syncPF := func() {
 		acct, _ := brk.GetAccount(ctx)
 		pf.SetCash(acct.Cash)
+
 		ps, _ := brk.GetPositions(ctx)
 		hs := make([]portfolio.Holding, len(ps))
+
 		for i, p := range ps {
 			px := p.Current
 			if v, ok := prices[p.Symbol]; ok {
 				px = v
 			}
-			hs[i] = portfolio.Holding{Symbol: p.Symbol, Qty: p.Qty, AvgPrice: p.AvgPrice,
-				LastPrice: px, MarketValue: px * p.Qty, UnrealizedPL: (px - p.AvgPrice) * p.Qty}
+
+			hs[i] = portfolio.Holding{
+				Symbol: p.Symbol, Qty: p.Qty, AvgPrice: p.AvgPrice,
+				LastPrice: px, MarketValue: px * p.Qty, UnrealizedPL: (px - p.AvgPrice) * p.Qty,
+			}
 		}
+
 		pf.SyncPositions(hs)
 	}
 
@@ -165,21 +182,27 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 		price := prices[order.Symbol]
 		snap := pf.Snapshot()
 		authOrder, dec := rm.Authorize(order, price, snap)
+
 		if !dec.Approved {
 			return
 		}
+
 		avgCost := snap.Holdings[order.Symbol].AvgPrice
+
 		res, err := brk.SubmitOrder(ctx, authOrder)
 		if err != nil {
 			return
 		}
+
 		fillPx := res.FilledPx
 		if fillPx <= 0 {
 			fillPx = price
 		}
+
 		val := fillPx * res.FilledQty
 		if order.Side == broker.Buy {
 			rm.RecordBuy(val)
+
 			if _, held := entryTime[order.Symbol]; !held {
 				entryTime[order.Symbol] = ts
 			}
@@ -193,13 +216,17 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			} else {
 				losses++
 			}
+
 			delete(peaks, order.Symbol)
 		}
+
 		trades = append(trades, engine.TradeRecord{
 			Time: ts, Symbol: order.Symbol, Side: order.Side, Qty: res.FilledQty,
 			Price: fillPx, Value: val, Status: "filled", Reason: reason, OrderID: res.ID,
 		})
+
 		syncPF()
+
 		if order.Side == broker.Sell && pf.PositionQty(order.Symbol) <= 0 {
 			delete(entryTime, order.Symbol)
 		}
@@ -207,13 +234,14 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 
 	syncPF() // initialise cash/positions from the broker before the run
 
-	for i := 0; i < maxLen; i++ {
+	for i := range maxLen {
 		for _, sym := range symbols {
 			c := data[sym]
 			if i < len(c) {
 				prices[sym] = c[i].Close
 				ts = c[i].Time
 			}
+
 			pf.MarkPrice(sym, prices[sym]) // cheap mark-to-market; cash unchanged between fills
 		}
 
@@ -223,12 +251,23 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 				if h.Qty <= 0 {
 					continue
 				}
+
 				price := prices[sym]
 				entry := h.AvgPrice
 				peak := math.Max(math.Max(peaks[sym], price), entry)
+
 				peaks[sym] = peak
+
 				if r := bt.exitReason(price, entry, peak); r != "" {
-					exec(broker.Order{Symbol: sym, Side: broker.Sell, Qty: h.Qty, Type: broker.Market}, "EXIT "+r)
+					exec(
+						broker.Order{
+							Symbol: sym,
+							Side:   broker.Sell,
+							Qty:    h.Qty,
+							Type:   broker.Market,
+						},
+						"EXIT "+r,
+					)
 				}
 			}
 		}
@@ -239,10 +278,12 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			if i >= len(c) {
 				continue
 			}
+
 			start := i + 1 - lookback
 			if start < 0 {
 				start = 0
 			}
+
 			sig := bt.Strategy.Evaluate(sym, c[start:i+1])
 			// Confirmation: the action must repeat on N consecutive bars before
 			// acting (a HOLD or flip resets the run), like the live engine.
@@ -252,22 +293,39 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			} else {
 				st = btStreak{action: sig.Action, count: 1}
 			}
+
 			streaks[sym] = st
+
 			confirm := bt.ConfirmBuy
+
 			if sig.Action == strategy.Sell {
 				confirm = bt.ConfirmSell
 			}
+
 			if sig.Action != strategy.Hold && st.count < confirm {
 				continue
 			}
+
 			price := prices[sym]
 			switch sig.Action {
+			case strategy.Hold:
+				// nothing to do
+
 			case strategy.Buy:
 				held := pf.PositionQty(sym)
 				if price > 0 && (bt.AllowPyramiding || held <= 0) {
 					size := bt.sizeForStrength(sig.Strength)
-					exec(broker.Order{Symbol: sym, Side: broker.Buy, Qty: size / price, Type: broker.Market}, sig.Reason)
+					exec(
+						broker.Order{
+							Symbol: sym,
+							Side:   broker.Buy,
+							Qty:    size / price,
+							Type:   broker.Market,
+						},
+						sig.Reason,
+					)
 				}
+
 			case strategy.Sell:
 				if held := pf.PositionQty(sym); held > 0 {
 					// Minimum hold: strategy sells wait out keep_interval
@@ -277,18 +335,30 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 							continue
 						}
 					}
-					exec(broker.Order{Symbol: sym, Side: broker.Sell, Qty: held, Type: broker.Market}, sig.Reason)
+
+					exec(
+						broker.Order{
+							Symbol: sym,
+							Side:   broker.Sell,
+							Qty:    held,
+							Type:   broker.Market,
+						},
+						sig.Reason,
+					)
 				}
 			}
 		}
 
 		acct, _ := brk.GetAccount(ctx)
+
 		equity = append(equity, EquityPoint{Time: ts, Equity: acct.Equity})
 	}
 
 	return bt.metrics(data, symbols, equity, trades, wins, losses, maxLen)
 }
 
+// exitReason reports which protective exit (if any) fires at price for a
+// position with the given entry and peak, as a human-readable tag.
 func (bt *Backtester) exitReason(price, entry, peak float64) string {
 	switch {
 	case bt.Exits.StopLossPct > 0 && price <= entry*(1-bt.Exits.StopLossPct):
@@ -298,12 +368,17 @@ func (bt *Backtester) exitReason(price, entry, peak float64) string {
 	case bt.Exits.TrailingStopPct > 0 && peak > entry && price <= peak*(1-bt.Exits.TrailingStopPct):
 		return fmt.Sprintf("trailing-stop %.2f<=peak %.2f", price, peak)
 	}
+
 	return ""
 }
 
+// metrics assembles the final Result: returns, win rate, max drawdown, the
+// buy & hold benchmark and Sharpe.
+//
+//nolint:cyclop // independent metric computations over the same inputs
 func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
-	equity []EquityPoint, trades []engine.TradeRecord, wins, losses, bars int) Result {
-
+	equity []EquityPoint, trades []engine.TradeRecord, wins, losses, bars int,
+) Result {
 	r := Result{
 		StartingCash: bt.Cash, Bars: bars, Trades: trades, Equity: equity,
 		NumTrades: len(trades), Wins: wins, Losses: losses,
@@ -313,9 +388,11 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 	} else {
 		r.FinalEquity = bt.Cash
 	}
+
 	if bt.Cash > 0 {
 		r.TotalReturnPct = (r.FinalEquity/bt.Cash - 1) * 100
 	}
+
 	if wins+losses > 0 {
 		r.WinRatePct = float64(wins) / float64(wins+losses) * 100
 	}
@@ -323,22 +400,30 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 	// Max drawdown from the equity curve.
 	peak := math.Inf(-1)
 	maxDD := 0.0
+
 	for _, p := range equity {
 		if p.Equity > peak {
 			peak = p.Equity
 		}
-		if peak > 0 {
-			dd := (peak - p.Equity) / peak
-			if dd > maxDD {
-				maxDD = dd
-			}
+
+		if peak <= 0 {
+			continue
+		}
+
+		dd := (peak - p.Equity) / peak
+		if dd > maxDD {
+			maxDD = dd
 		}
 	}
+
 	r.MaxDrawdownPct = maxDD * 100
 
 	// Equal-weighted buy & hold benchmark.
-	var sum float64
-	var n int
+	var (
+		sum float64
+		n   int
+	)
+
 	for _, s := range symbols {
 		c := data[s]
 		if len(c) > 1 && c[0].Close > 0 {
@@ -346,6 +431,7 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 			n++
 		}
 	}
+
 	if n > 0 {
 		r.BuyHoldReturnPct = sum / float64(n) * 100
 	}
@@ -358,28 +444,40 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 				rets = append(rets, equity[i].Equity/equity[i-1].Equity-1)
 			}
 		}
+
 		r.Sharpe = sharpe(rets)
 	}
+
 	return r
 }
 
+// sharpe computes a (non-annualised) Sharpe ratio over per-bar returns.
 func sharpe(rets []float64) float64 {
 	if len(rets) < 2 {
 		return 0
 	}
+
 	var mean float64
+
 	for _, x := range rets {
 		mean += x
 	}
+
 	mean /= float64(len(rets))
+
 	var variance float64
+
 	for _, x := range rets {
 		variance += (x - mean) * (x - mean)
 	}
+
 	variance /= float64(len(rets) - 1)
+
 	sd := math.Sqrt(variance)
+
 	if sd == 0 {
 		return 0
 	}
+
 	return mean / sd * math.Sqrt(float64(len(rets))) // scaled by sqrt(N)
 }

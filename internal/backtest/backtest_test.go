@@ -39,9 +39,15 @@ func TestBacktestWindowCoversTrendPeriod(t *testing.T) {
 	}
 	bt := &Backtester{
 		Strategy: strategy.New(cfg),
-		Limits:   config.Limits{MaxOrderValue: 1000, MaxPerPosition: 1000, MaxTotalInvested: 10000, MaxDailySpend: 10000, MaxOpenPositions: 10},
-		Exits:    config.ExitsConfig{},
-		Cash:     100000,
+		Limits: config.Limits{
+			MaxOrderValue:    1000,
+			MaxPerPosition:   1000,
+			MaxTotalInvested: 10000,
+			MaxDailySpend:    10000,
+			MaxOpenPositions: 10,
+		},
+		Exits:     config.ExitsConfig{},
+		Cash:      100000,
 		OrderSize: 500,
 	}
 	res := bt.Run(data)
