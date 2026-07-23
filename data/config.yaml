@@ -175,6 +175,11 @@ engine:
   eval_interval: 30s          # how often signals are re-evaluated
   bar_interval: 1m            # candle size built from live ticks (default 1m);
                               # larger bars trade on coarser, less noisy candles
+  # ⚠️ WARNING: setting trading_enabled: true places REAL orders on the
+  # configured broker (real money on a live endpoint). By enabling it you accept
+  # all risk of financial loss — see the risk warning in the README. Prove your
+  # strategy on the simulator and a paper/demo account first, and set
+  # conservative money limits before ever turning this on.
   trading_enabled: false      # false => dry-run (signals only, no orders)
   order_size_usd: 250         # target notional per buy (used when min_positions = 0)
   min_positions: 0            # 0 = fixed order_size_usd; >0 caps each buy at
