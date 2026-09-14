@@ -8,8 +8,12 @@ bot
 bot.exe
 *.exe
 
-# local data & secrets (mounted at runtime, never baked into the image)
-data/
+# local data & secrets (mounted at runtime, never baked into the image).
+# Deliberately NOT a blanket "data/" rule: data/embed.go embeds
+# data/config.example.yaml at compile time (see its doc comment) and the
+# build stage needs both in its context, or `go build ./cmd/bot` fails with
+# "no required module provides package .../data". The patterns below still
+# catch every actual runtime file in that directory by name/extension.
 *.db
 *.db-journal
 *.db-wal
