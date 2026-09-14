@@ -22,6 +22,267 @@ decides when to buy and sell using technical indicators, and can place
 (paper or live) orders — all behind **hard, always-enforced m
 oney limits**.
 
+## Contents
+
+**Getting started**
+- [Quick start](#quick-start)
+  - [**The settings that actually matter**](#the-settings-that-actually-matter)
+- [Supported brokers](#supported-brokers)
+- [Architecture](#architecture)
+
+**Configuring the bot**
+- [Settings and config.yaml](#settings-and-configyaml)
+- [Profiles](#profiles)
+- [Web server and API access](#web-server-and-api-access)
+- [Market data feed](#market-data-feed)
+- [Crypto data](#crypto-data)
+- [Bars](#bars)
+- [Symbols and broker tickers](#symbols-and-broker-tickers)
+- [Finding symbols](#finding-symbols)
+- [Screener (automatic universe selection)](#screener-automatic-universe-selection)
+- [Detectors & combiner](#detectors--combiner)
+  - [The detectors](#the-detectors)
+    - [`ema_cross`](#ema_cross--ema-crossover-trend)
+    - [`rsi`](#rsi--relative-strength-index-mean-reversion)
+    - [`macd`](#macd--moving-average-convergencedivergence-momentum)
+    - [`bollinger`](#bollinger--bollinger-bands-mean-reversion)
+    - [`stochastic`](#stochastic--stochastic-oscillator-mean-reversion)
+    - [`trend`](#trend--least-squares-regression-slope-trend)
+    - [`supertrend`](#supertrend--atr-banded-trend-follow)
+    - [`adx`](#adx--average-directional-index-trend-strength-filter)
+    - [`donchian`](#donchian--channel-breakout)
+    - [`atr`](#atr--volatility-breakout)
+    - [`vwap`](#vwap--volume-weighted-average-price-volume)
+    - [`rvol`](#rvol--relative-volume-volume-confirmation)
+    - [`volume_profile`](#volume_profile--value-area-and-point-of-control-volume)
+    - [`ai`](#ai--llm-advisor)
+    - [`ml`](#ml--learned-classifier)
+- [Per-symbol strategy parameters](#per-symbol-strategy-parameters)
+- [Multi-timeframe confirmation](#multi-timeframe-confirmation)
+- [AI advisor (the `ai` detector)](#ai-advisor-the-ai-detector)
+- [ML detector (learned signal)](#ml-detector-learned-signal)
+- [Money limits (the hard requirement)](#money-limits-the-hard-requirement)
+- [Position sizing](#position-sizing)
+- [Portfolio limits (concentration)](#portfolio-limits-concentration)
+- [Entries](#entries)
+- [Order execution](#order-execution)
+- [Protective exits](#protective-exits)
+- [Protections](#protections)
+- [Trading costs](#trading-costs)
+- [Autotune (unsupervised re-optimisation)](#autotune-unsupervised-re-optimisation)
+- [Test mode (simulated trading over the real feed)](#test-mode-simulated-trading-over-the-real-feed)
+- [Notifications](#notifications)
+- [Persistence](#persistence)
+- [Order rate limiting and the circuit breaker](#order-rate-limiting-and-the-circuit-breaker)
+- [Automated-trading safety (Saxo live-cert mapping)](#automated-trading-safety-saxo-live-cert-mapping)
+
+**Offline tools**
+- [Backtesting](#backtesting)
+- [Parameter optimizer](#parameter-optimizer)
+
+**Running it**
+- [Web UI](#web-ui)
+- [API](#api)
+- [Notes & next steps](#notes--next-steps)
+
+## Quick start
+
+```bash
+go run ./cmd/bot                         # runs offline (mock feed + sim broker)
+# optional: copy data/config.example.yaml to data/config.yaml to customise;
+# defaults run without one
+```
+
+### The settings that actually matter
+
+The bot starts with **no config file at all** — offline mock feed, simulated
+broker, `trading_enabled: false`. Everything below has a shipped default. But
+the defaults are a demo, not your account, and four of them are wrong for
+everybody.
+
+Work down this list in order. Each row links to its chapter.
+
+**1 — Must be set before the bot is useful**
+
+| setting | why | default |
+|---|---|---|
+| [`watchlist:`](#symbols-and-broker-tickers) | nothing to trade without it (or a [screener](#screener-automatic-universe-selection) that fills it) | empty |
+| [`finnhub.api_key`](#market-data-feed) *or* [`feed: "binance"`](#crypto-data) | without one you are on the mock feed — fine for clicking around the UI, useless for decisions | mock |
+| [`server.auth_token`](#web-server-and-api-access) | one token is full trading control. Empty means **no auth at all** | empty |
+
+**2 — Must be set before real money moves**
+
+| setting | why | default |
+|---|---|---|
+| [`broker:`](#supported-brokers) | `sim` is the in-memory paper broker | `sim` |
+| broker credentials | [Alpaca](#supported-brokers) key/secret, [Trading 212](#supported-brokers) api_key/secret, or [Saxo](#supported-brokers) token/certificate. **Validated at startup** — the bot refuses to run with trading on and creds missing | empty |
+| [`limits:`](#money-limits-the-hard-requirement) | the defaults assume a ~10,000 account: 500/order, 1,000/position, 10,000 total. On a 1,000 account that is no limit at all | see chapter |
+| [`engine.trading_enabled`](#going-live-paper-first) | the final switch. **Leave it false until everything above is deliberate** | `false` |
+
+**3 — Should be reviewed, not just accepted**
+
+| setting | why | default |
+|---|---|---|
+| [`exits:`](#protective-exits) | a 5% stop and a 20% take-profit are round numbers, not a decision about your instruments | on, 5% / 20% |
+| [`protections:`](#protections) | drawdown and daily-loss halts. **On by default** at 20% / 8% — generous numbers you should either shrink or consciously accept | on |
+| [`safety.max_orders_per_min`](#order-rate-limiting-and-the-circuit-breaker) | the runaway-loop circuit breaker. **On by default** at 20/min, which a healthy small book never approaches — lower it | `20` |
+| [`portfolio:`](#portfolio-limits-concentration) | stops six positions from being one bet | off |
+| [`costs:`](#trading-costs) | commission and spread your broker really charges; wrong here makes every backtest lie | zeros |
+
+Everything else has a defensible default and can wait until you have a reason
+to change it.
+
+> **The order matters.** Set the limits *before* the credentials, and the
+> credentials *before* `trading_enabled`. Each step is recoverable on its own;
+> doing them in the other order means the first thing that works is a live
+> order against demo limits.
+
+### Docker
+
+Prebuilt multi-arch images (amd64 + arm64) are published to Docker Hub at
+[kellerman81/go_finance_bot](https://hub.docker.com/r/kellerman81/go_finance_bot)
+on every release — no checkout or build needed:
+
+```bash
+docker run -d --name go_finance_bot \
+  -p 8080:8080 \
+  -v "$PWD/data:/app/data" \
+  kellerman81/go_finance_bot:latest
+curl localhost:8080/health
+```
+
+Or in [docker-compose.yml](docker-compose.yml), drop the `build:` block and set
+`image: kellerman81/go_finance_bot:latest`. Pin a version tag (e.g. `:1.2`)
+instead of `:latest` for reproducible deployments.
+
+Alternatively build it yourself: a multi-stage [Dockerfile](Dockerfile) compiles
+a static, CGO-free binary into a small Alpine image;
+[docker-compose.yml](docker-compose.yml) builds and runs it:
+
+```bash
+docker compose up --build -d        # build + start
+docker compose logs -f              # follow logs
+curl localhost:8080/health
+docker compose down                 # stop
+```
+
+- A **single mounted directory** `./data` holds *both* `config.yaml` and the
+  SQLite DB — edit `data/config.yaml` on the host; the DB persists in the same
+  dir, so trades and **open positions survive container restarts**. Nothing is
+  baked into the image.
+- A `/health` healthcheck and `restart: unless-stopped` keep it running.
+
+Config lives at **`data/config.yaml`** (the default `-config` path); the DB
+location comes from `storage.path` (or `BOT_STORAGE_PATH`) — `data/finance_bot.db`
+in the shipped config; without any config file the built-in default is
+`./finance_bot.db`. The same layout is used for local runs.
+
+Out of the box it runs **fully offline**: a synthetic price feed and an
+in-memory simulated broker, with `trading_enabled: false` (dry-run — signals are
+computed and shown but no orders are placed).
+
+### Going live (paper first!)
+
+1. Get a free [Finnhub](https://finnhub.io) API key → set `finnhub.api_key`
+   (or `FINNHUB_API_KEY`).
+2. Pick a broker via `broker:` and provide its credentials (below).
+3. Flip `engine.trading_enabled: true` only when you trust the signals.
+
+The `broker` setting selects the execution venue — the `Broker` interface means
+the rest of the bot is unchanged:
+
+| `broker` | Venue | Setup |
+|----------|-------|-------|
+| `sim` | offline simulator | nothing — uses `alpaca.sim_cash` as starting balance |
+| `alpaca` | Alpaca (US) | set `alpaca.key_id`/`secret_key`, `base_url` (paper endpoint by default) |
+| `saxo` | **Saxo Bank OpenAPI (EU)** | set `saxo.token` (or `SAXO_TOKEN`); `base_url` defaults to the simulation gateway |
+| `trading212` | **Trading 212 (EU)** | set `trading212.api_key` + `trading212.secret` (or `T212_API_KEY`/`T212_SECRET`); `base_url` defaults to the demo endpoint |
+
+#### Trading 212 (EU, no approval)
+
+1. In the Trading 212 app → **Settings → API (Beta)**, generate an **API key +
+   secret** (self-service, **no app-approval gate** — unlike Saxo live; available
+   for Invest and Stocks ISA accounts, not CFD/SIPP). The secret is shown **only
+   once** — store it. Set `broker: trading212`, `trading212.api_key` +
+   `trading212.secret` (or `T212_API_KEY`/`T212_SECRET`). They are sent as HTTP
+   Basic auth (`Authorization: Basic base64(key:secret)`).
+2. Starts on the **demo** endpoint (`https://demo.trading212.com/api/v0`); switch
+   `base_url` to `https://live.trading212.com/api/v0` for real money. The key is
+   tied to its environment, so the base URL must match the key.
+3. The adapter resolves plain symbols (`AAPL`) to Trading 212 tickers
+   (`AAPL_US_EQ`) via instrument metadata, supports fractional shares, and paces
+   requests to respect the API's strict per-endpoint rate limits.
+4. Order capabilities: market orders, plus **list working orders** (`GET
+   /api/orders/open`) and **cancel** (`DELETE /api/orders/:id`). It has no native
+   bracket/OCO or order-modify, so those `/api/orders/*` endpoints return a clear
+   "not supported" for Trading 212 (use Saxo for native brackets).
+5. **Symbol mapping**: watchlist symbols are resolved to Trading 212 tickers via
+   the instrument metadata, handling exchange suffixes and ISINs — e.g.
+   `LXS.DE → LXSd_EQ` (German listing), `SAP.DE → SAPd_EQ` (the German SAP, not
+   Canadian "Saputo"), `AAPL → AAPL_US_EQ`. When an instrument has several
+   currency listings, `trading212.preferred_currency` (default `EUR`) picks one.
+   For instruments not resolvable by ticker, map them to an ISIN:
+   ```yaml
+   trading212:
+     preferred_currency: "EUR"
+     isins:
+       CSPXJ.SW: "IE00B52MJY50"   # -> the EUR listing
+       UNPRF:    "GB00BVZK7T90"
+   ```
+   Check what your watchlist can trade with `GET /api/orderable`. Note EU retail
+   accounts can't buy US-domiciled ETFs (e.g. `SPY`, `VOO`) on Trading 212 — they
+   show as not orderable regardless.
+
+> Trading 212's API has **no market-data stream** and is heavily rate-limited, so
+> keep Finnhub for near-real-time tracking and use Trading 212 only for execution.
+> The adapter is built to the documented API and unit-tested for request shape,
+> but validate on the demo endpoint with your own key before live use.
+
+#### Saxo (EU)
+
+1. Sign in at [developer.saxo](https://www.developer.saxo) and copy a **24-hour
+   simulation token** → set `saxo.token` (or `SAXO_TOKEN`), `broker: saxo`.
+2. On start the bot resolves your account via `/port/v1/accounts/me`, maps each
+   ticker to a Saxo **Uic** via instrument search (`asset_types: "Stock,Etf"`),
+   and submits day market orders. Saxo trades **whole shares**, so fractional
+   sizes are floored — set `limits.max_order_value` accordingly.
+3. For live trading, swap `saxo.base_url` to
+   `https://gateway.saxobank.com/openapi`. **The token environment and the
+   gateway must match** — a SIM token on the live gateway (or vice versa) returns
+   `401`.
+
+**Auth modes** (`saxo.auth_mode`):
+
+- **`token`** (default) — a static bearer token. Fine for the 24-hour SIM token,
+  but it must be replaced by hand when it expires.
+- **`certificate`** — unattended live auth with **no daily re-paste**. The bot
+  signs a JWT assertion (RS256) with your Saxo certificate and exchanges it for
+  an access token via the `personal-jwt` grant, then auto-refreshes in the
+  background. Requires an **approved live application + certificate** from Saxo
+  (request via [developer.saxo](https://www.developer.saxo) → link your live
+  account → download the certificate from MyAccount). Configure:
+
+  ```yaml
+  saxo:
+    auth_mode: "certificate"
+    app_key:   "<live client_id>"
+    app_secret: "<live client_secret>"   # or SAXO_APP_SECRET
+    app_url:   "<registered app URL>"     # JWT "spurl" claim
+    user_id:   "<user the cert is for>"   # JWT "sub" claim
+    cert_path: "saxo.p12"                 # .p12/.pfx or PEM cert+key
+    cert_password: "<pw>"                 # or SAXO_CERT_PASSWORD
+    base_url:  "https://gateway.saxobank.com/openapi"
+  ```
+
+> The 24-hour SIM token expires daily and the adapter surfaces a clear `401`
+> (now naming the token/gateway mismatch). Certificate auth avoids this.
+> The crypto path (cert loading, JWT signing) is unit-tested, but the live token
+> exchange and order placement should be validated against your own Saxo
+> credentials before relying on them.
+
+> Live money (any broker): the money limits still apply to every order. Prove
+> the strategy in paper/sim first.
+
 ## Supported brokers
 
 | Broker | Region | Paper/demo | Live | Notes |
@@ -77,319 +338,124 @@ The **gin HTTP API** exposes everything for tracking and control.
 | Backtest | `internal/backtest`, `cmd/backtest` | replay history, report metrics |
 | API | `internal/api` | gin REST server |
 
-## Detectors & combiner
+## Settings and config.yaml
 
-The strategy is a set of **detectors** (one indicator each) merged by a combiner.
-Configure which to run and how to merge them:
+Changes made in the web interface apply immediately **and are written back to
+`config.yaml`**, so they survive a restart.
 
-```yaml
-strategy:
-  detectors: ["rsi", "macd", "bollinger", "vwap", "atr", "rvol", "volume_profile",
-              "trend", "adx", "stochastic", "supertrend", "donchian"]
-  combine: "unanimous"       # BUY merge: majority | unanimous | weighted
-  combine_sell: "majority"   # SELL merge (empty = same as combine) — be strict to
-                             # enter, quick to exit
-```
+The write is a surgical edit, not a re-serialisation. The file is parsed to a
+YAML syntax tree, only the scalars that changed are replaced, and the result is
+written atomically (temp file + rename — this file holds live broker
+credentials). Everything else is carried through untouched: comments, key order,
+blank lines, commented-out blocks, and any key the settings screen does not know
+about.
 
-**Asymmetric entry/exit:** the BUY and SELL sides are configured independently —
-`detectors`/`combine`/`min_strength` drive buys and `detectors_sell`/
-`combine_sell`/`min_strength_sell` drive sells (each `*_sell` empty/−1 = inherit
-the buy setting). So you can enter strictly (all detectors agree, high
-conviction) and exit readily (a majority of different detectors at a lower bar).
-Protective exits — stop-loss / trailing / take-profit — sell on price alone,
-independent of all this.
+That is not fussiness. Measured on a real 679-line config, the obvious
+implementation — unmarshal, mutate, marshal — produced 304 lines with **none** of
+the 342 comment lines, and silently deleted the whole `strategy_overrides` block
+(`SymbolStrategy` is `yaml:"-"`, derived at load time, so a marshal cannot emit
+it).
 
-**Don't churn (holding & confirmation):**
+Two safeguards worth knowing:
 
-```yaml
-engine:
-  keep_interval: 2h      # min hold before a *strategy* sell (exits still fire). 0 = off
-  confirm_buy: 2         # need N consecutive evaluations agreeing before buying
-  confirm_sell: 2        # ditto for selling — a single down-tick won't dump a position
-```
+- **The result is verified before it is written.** The patched document is
+  re-read and compared against the settings that were applied; if it would not
+  read back the same, nothing is written and the UI says so. This is what stops a
+  multi-line value such as `ai.system_prompt` from being quietly reflowed.
+- **A failed save never reverts the live change.** The bot keeps running the new
+  value and the UI reports "applied, but not saved" — telling you plainly rather
+  than leaving you to discover it at the next restart.
 
-`confirm_*` require the signal to persist for N×`eval_interval` before acting;
-`keep_interval` blocks strategy sells for a minimum holding time after entry
-(protective exits bypass it). All three are editable live in the UI
-("Holding & confirmation") or via `PUT /api/behavior`.
+Run with `--config <path>` and that is the file that gets edited.
 
-| Detector | Signal logic |
-|----------|--------------|
-| `ema_cross` | fast EMA vs slow EMA (trend) |
-| `rsi` | `rsi_mode: midline` → graded mean-reversion vote around 50 (always participates); `extremes` → only votes at oversold/overbought |
-| `macd` | histogram sign (momentum) |
-| `bollinger` | price below lower band → buy, above upper → sell (mean reversion) |
-| `vwap` | price above/below VWAP (trend bias) |
-| `atr` | move > `atr_mult`×ATR vs prior close (volatility breakout) |
-| `rvol` | high relative volume confirms the latest move |
-| `volume_profile` | price outside the value area vs the point of control |
-| `trend` | least-squares regression slope over up to a week of bars — follows the prevailing direction; with `trend_gate: true` it also blocks buys in a downtrend / strategy sells in an uptrend |
-| `adx` | Average Directional Index: only votes when ADX ≥ `adx_threshold` (a real trend), then +DI vs −DI sets the direction |
-| `stochastic` | %K at/below `stoch_oversold` → buy, at/above `stoch_overbought` → sell (mean reversion) |
-| `supertrend` | price above/below the ATR-based Supertrend band (trend follow); `supertrend_mult` sets flip sensitivity |
-| `donchian` | close breaking above the `donchian_period` highest high → buy, below the lowest low → sell (breakout) |
-| `ai` | an LLM (local Ollama by default) reads the same normalised indicator snapshot and votes — see [AI advisor](#ai-advisor-the-ai-detector) |
-| `ml` | a logistic-regression classifier retrained on a rolling window predicts whether the next N bars are up — see [ML detector](#ml-detector-learned-signal) |
+## Profiles
 
-> Volume caveat: the live engine builds its bars (size `engine.bar_interval`,
-> default 1m — larger bars trade on coarser, less noisy candles) from the quote
-> stream, which has no trade sizes, so a live bar's "volume" is its **tick count**. The volume-driven
-> detectors (`vwap`, `rvol`, `volume_profile`) therefore run on tick counts live
-> but on real share volume in backtests (CSV/Yahoo history) — expect their live
-> behaviour to differ from backtested results.
-
-**Comparison:** with more than one detector, each is evaluated and the signal
-`reason` shows every detector's vote, e.g.
-`rsi:BUY(0.60), macd:HOLD(0.00), vwap:SELL(0.30) => BUY by majority`.
-Merge modes: **majority** (more votes wins), **unanimous** (all opinionated
-detectors must agree), **weighted** (sign of the strength-weighted net).
-
-**Per-detector weights:** `strategy.weights` multiplies each detector's strength
-when combining (missing entries default to 1.0), so a `weighted` merge can trust
-some signals more than others; a zero or negative weight mutes a detector's
-strength contribution without removing its vote:
+The settings above interact. A strategy that trades often needs different exits
+and different protections than one that waits for high conviction, and picking
+each knob independently is how people end up with a bot that takes 40 trades a
+day behind a 20% stop. A profile is a set of choices made *together*:
 
 ```yaml
-strategy:
-  weights:
-    trend: 2.0    # count the regression trend double
-    rsi: 0.5
+profile: conservative   # conservative | balanced | aggressive
 ```
 
-**Tuning for fewer losses:** two knobs cut over-trading (the main cause of
-death-by-a-thousand-losses on noisy data):
+It seeds strategy, exits, sizing and protections before the rest of your file is
+applied, so anything you set explicitly still wins. `BOT_PROFILE` does the same
+thing without a config file. A profile is a starting point to tune from — not a
+recommendation, and never a substitute for backtesting your own data.
 
-- `strategy.min_strength` (0..1) — minimum combined confidence to act; weaker
-  signals become HOLD. Higher → fewer, higher-conviction trades. On the
-  synthetic sample, raising it from 0 → 0.30 took win rate **43% → 100%**,
-  Sharpe **0.4 → 2.5**, and losses **4 → 0**.
-- `engine.allow_pyramiding: false` (default) — at most one entry per symbol
-  until it's exited, so the bot can't keep adding to a position every bar.
-
-> Note: a slightly-upward random walk is *designed* to reward buy-and-hold, so
-> beating the benchmark on synthetic data isn't the goal — minimising losses and
-> trade quality is. Validate real edge by backtesting **real** CSV history
-> (`-csv`), especially across choppy/down markets.
-
-## AI advisor (the `ai` detector)
-
-An optional detector that asks a **local or remote LLM** what it makes of the
-current setup, and folds its answer in as one more vote. Ollama is the default,
-so it runs **fully offline on your own machine** with no API key and no data
-leaving the host:
-
-```bash
-ollama pull llama3.2 && ollama serve
-```
+## Web server and API access
 
 ```yaml
-ai:
-  enabled: true
-  provider: "ollama"                 # or "openai" for any OpenAI-compatible endpoint
-  base_url: "http://localhost:11434"
-  model: "llama3.2"
-  refresh_interval: 15m              # min time between calls per symbol
-  max_strength: 0.4                  # cap its influence (see below)
-
-strategy:
-  detectors: ["trend", "rsi", "macd", "ai"]
+server:
+  addr: ":8080"           # listen address
+  auth_token: ""          # shared bearer token; empty = no auth
 ```
 
-**What the model actually sees.** Not raw candles — LLMs are poor at arithmetic
-over long number lists, and a few hundred bars would cost more tokens than the
-answer is worth. It gets a compact, *normalised* snapshot of the same readings
-the rule-based detectors vote on, so a $3 stock and a $3000 one read alike:
+`addr` is what the gin HTTP server binds. `:8080` listens on every interface —
+fine behind Docker on a private network, **not** fine on a machine reachable
+from the internet. Bind `127.0.0.1:8080` and put a reverse proxy in front if
+the host is exposed.
 
-```
-symbol: AAPL
-price: 231.4400
-return_last_bar_pct: +0.12
-return_5_bars_pct: +1.03
-return_20_bars_pct: +3.51
-ema_fast_vs_slow_pct: +0.84
-rsi: 61.2
-macd_histogram_pct_of_price: +0.041
-bollinger_position: 0.78 (0=lower band, 1=upper band)
-atr_pct_of_price: 1.12
-adx: 28.4 (+DI 26.1, -DI 14.9)
-stochastic: %K 71.3, %D 68.0
-relative_volume: 1.34 (1.0 = average)
-range_position: 0.81 (0=period low, 1=period high)
-regression_trend_pct: +4.20 (fit quality R2 0.71)
-```
+`auth_token` is a single shared bearer token, compared in constant time. It is
+accepted either as `Authorization: Bearer <token>` or as a `?token=` query
+parameter — the query form exists because the browser's `EventSource` cannot
+set headers, and it is the weaker of the two: query strings land in proxy logs
+and `Referer` headers.
 
-Readings that can't be computed yet are **omitted**, never sent as a zero the
-model would read as real data. The answer must be one JSON object —
-`{"action":"BUY|SELL|HOLD","confidence":0..1,"reason":"..."}` — which becomes a
-normal detector vote (Ollama's `format: json` mode constrains the sampler, so
-small local models comply reliably).
+> **There are no user accounts.** One token grants full trading control —
+> placing orders, changing limits, flipping the kill switch. Treat it like a
+> broker password, not an API key.
 
-**It cannot stall the bot.** Verdicts are cached per symbol and refreshed in the
-background, so an evaluation tick — or a backtest bar — costs a map lookup, not
-a model round-trip. At most `max_concurrent` requests are in flight, and at most
-one per symbol per `refresh_interval` (and only when the readings actually
-moved: an unchanged snapshot reuses the cached answer rather than buying the
-same opinion twice).
+The `/v2` UI shell and its static assets are deliberately unauthenticated; the
+data behind them is not. Every `/api/*` route requires the token when one is
+set.
 
-**It fails to HOLD.** Advisor disabled, model unreachable, request timed out,
-answer unparseable, verdict older than `max_age`, confidence below
-`min_confidence` — every one of those is a HOLD. The advisor can decline to have
-an opinion; it can never invent a trade. Failures land in `GET /api/errors` (and
-the UI's error panel) under source `ai`, and `GET /api/ai` reports the model,
-call count and last error.
-
-**Keep it on a leash.** `max_strength` caps the strength this detector can
-contribute: at `0.4` the LLM can tilt a marginal decision but a `majority` or
-`weighted` combine still needs the real indicators to agree. `strategy.weights`
-works on it like any other detector. Treat it as a sentiment-ish overlay, not a
-strategy — it is a language model pattern-matching on numbers, not an edge.
-
-**Backtesting it is deliberately awkward.** The background-refresh design that
-keeps live trading fast means a backtest races past the model and mostly reads
-an empty cache; `cmd/backtest` and `cmd/optimize` warn when `ai` is in the
-detector set for exactly that reason. Setting `ai.blocking: true` makes the
-backtest actually wait for the model — correct, and *very* slow. Do not enable
-live trading on the back of results the advisor never participated in.
-
-| Setting | Meaning |
-|---------|---------|
-| `enabled` | master switch; off ⇒ the detector exists but always votes HOLD |
-| `provider` | `ollama` (native `/api/chat`) or `openai` (any `/v1/chat/completions`: llama.cpp, LM Studio, vLLM, OpenRouter, OpenAI) |
-| `base_url` / `model` / `api_key` | endpoint, model name, bearer token (`BOT_AI_API_KEY`) |
-| `timeout` | per-request deadline (default 20s) |
-| `refresh_interval` | minimum time between calls for one symbol (default 15m) |
-| `max_age` | verdicts older than this are not used (default 1h) |
-| `blocking` | wait for the model instead of using the cache — backtests only |
-| `temperature` | 0 (default) = as reproducible as the model allows |
-| `max_concurrent` | in-flight request cap (default 2) — protects a single local GPU |
-| `min_confidence` | below this the model's own answer is demoted to HOLD |
-| `max_strength` | ceiling on the strength it contributes (0..1) |
-| `system_prompt` | replaces the built-in instruction prompt |
-
-Env overrides: `BOT_AI_ENABLED`, `BOT_AI_PROVIDER`, `BOT_AI_BASE_URL`,
-`BOT_AI_MODEL`, `BOT_AI_API_KEY`.
-
-## ML detector (learned signal)
-
-A logistic-regression classifier over the **same** normalised indicator readings
-the rule-based detectors vote on, retrained on a rolling window, estimating the
-probability that the next `horizon` bars are up.
+## Market data feed
 
 ```yaml
-ml:
-  enabled: true
-  horizon: 10            # predict the next 10 bars
-  threshold: 0.005       # "up" means +0.5% or better over that window
-  train_bars: 1500       # rolling training window
-  retrain_every: 250     # refit every 250 new bars
-  min_skill: 0.02        # must beat the majority-class base rate by 2pp to vote
-  max_strength: 0.5      # cap its influence
-
-strategy:
-  detectors: ["trend", "macd", "ml"]
+feed: ""                  # "" = auto, "binance" = public crypto data
+finnhub:
+  api_key: ""             # enables the live WebSocket tick stream
+binance_base_url: ""      # override for a regional mirror
 ```
 
-**Every prediction is out-of-sample.** The model trains only on rows whose
-forward window has already closed, then predicts the current bar. That makes a
-backtest of it a continuous walk-forward rather than a fit to the data it's
-scored on — the distinction between a plausible ML signal and a fantasy. Two
-tests pin this down: the sample builder must leave the final `horizon` bars
-unlabelled, and adding future bars must not change any sample already built.
+`feed` selects where live prices come from:
 
-**`min_skill` is the important setting.** Bar-to-bar direction on liquid
-instruments is close to unpredictable from indicators alone, and a model that
-learned nothing still emits confident-looking probabilities. `min_skill` is the
-margin by which training accuracy must beat simply guessing the majority class;
-below it the detector says so and votes HOLD:
+| value | source | needs |
+|---|---|---|
+| `""` (default) | Finnhub when `finnhub.api_key` is set, otherwise the offline mock | a key, for live data |
+| `"binance"` | Binance public REST, polled every 5s | nothing |
 
-```
-ml: skill 0.004 below min_skill 0.020 (acc 0.548 vs base 0.544)
-```
+**The feed is independent of the broker.** Binance data is read-only, so crypto
+can be tracked and paper-traded against `broker: sim` while real orders keep
+going only to the equity brokers. See [Crypto data](#crypto-data).
 
-Expect to see that message a lot. It is the honest answer, not a malfunction.
+Historical bars come from a separate path — Yahoo by default (unauthenticated,
+paced and retried across mirror hosts), wrapped in a 15-second cache and a
+fallback chain. That is why backtests and indicator warmup work even with no
+`finnhub.api_key` set.
 
-**Why regression and not something bigger.** With ~16 features and a few
-thousand noisy samples the bottleneck is signal in the data, not model capacity;
-a gradient-boosted forest fits this better and generalises no better. Logistic
-regression is also inspectable — the reason string names the features driving the
-lean, since standardised weights are directly comparable:
+With neither a Finnhub key nor `feed: binance`, the bot runs against a mock
+feed: useful for exercising the UI and the plumbing, useless for decisions.
 
-```
-ml: p(up 10 bars)=0.612 BUY (acc 0.58 vs base 0.54, n=1240) [trend_pct+0.41 adx+0.22 rsi-0.19]
-```
-
-| Setting | Meaning |
-|---------|---------|
-| `enabled` | off ⇒ the `ml` detector exists but always votes HOLD |
-| `horizon` / `threshold` | the label: is the close `horizon` bars ahead at least `threshold` higher? |
-| `train_bars` / `retrain_every` / `min_samples` | rolling window, refit cadence (in **bars**, so backtest and live agree), and the floor to fit at all |
-| `buy_prob` / `sell_prob` | the probabilities at which it votes (default 0.58 / 0.42 — deliberately not 0.5) |
-| `min_skill` | required accuracy above the base rate before it may vote |
-| `max_strength` | ceiling on the strength it contributes |
-| `epochs` / `learning_rate` / `l2` | fitting hyperparameters; `l2` is the brake on overfitting the window |
-
-Fitting is deterministic (full-batch descent, no shuffling), so a model can be
-reasoned about and a backtest reproduced. `GET /api/ml` reports how many symbols
-have models, refit and failure counts, and the mean skill across them — if that
-average sits at zero, the models are finding nothing.
-
-Warmup is much longer than a technical detector's: a training window plus the
-horizon whose labels aren't knowable yet. Backtests are correspondingly slower
-(one refit per `retrain_every` bars per symbol).
-
-## Trading costs
-
-A commission model folds the true cost of trading into order sizing, the money
-limits and backtest P&L:
+## Crypto data
 
 ```yaml
-costs:
-  commission_pct: 0.001   # 0.1% of notional
-  commission_flat: 1.0    # flat fee per order
-  commission_min: 2.0     # minimum per order
+feed: "binance"            # public market data, no API key
+watchlist: ["BTCUSDT", "ETHUSDT"]
+broker: "sim"
 ```
 
-`commission = max(min, flat + pct × notional)`. Buys reserve cash for the fee
-(cash-reserve and daily-spend limits include it), the simulated broker debits it
-on every fill, and backtests report returns **net of costs**.
+**Read-only, by design.** The bot can track, signal on, backtest and
+paper-trade crypto through Binance's public endpoints — but it places no crypto
+orders. An exchange execution adapter carries withdrawal-capable keys and can't
+be meaningfully tested without a funded account; shipping one that had never
+filled a real order would be worse than shipping none. Execution stays on the
+audited broker adapters.
 
-**Friction** — the bid-ask spread and slippage — is charged on every simulated
-fill on top of commission:
-
-```yaml
-costs:
-  spread_pct: 0.0005    # FULL spread; half is paid on each fill
-  slippage_pct: 0.0002  # extra adverse move per fill
-  measure_spread: true  # …or estimate it per instrument instead
-```
-
-With `measure_spread`, each symbol is charged the spread estimated from its **own**
-bars rather than one number applied to everything. That matters on a mixed book:
-a megacap trades inside a basis point where a thin European ETF listing can cost
-twenty times that, and charging both the same flatters one and libels the other.
-The backtester measures from the series it was given; the live engine uses the
-figures the screener produced. **`spread_pct` remains a floor** — an estimate is
-evidence that the real cost is at least this high, not permission to assume a
-symbol is cheaper to trade than you budgeted for.
-
-## Symbols and broker tickers
-
-A broker may name an instrument differently from your watchlist: Trading 212
-lists `PRAJL.XC` as `PR1Jd`. The bot resolves each watched symbol to its broker
-ticker **when the symbol is added**, not when an order is first placed, so the
-positions the broker reports come back under the names the bot uses.
-
-That timing matters. The reverse mapping lives in memory, so resolving it lazily
-meant that after a restart a long-held position reported under the broker's name
-and matched no open-position record — and a position with no record is one the
-bot is not managing: no ROI ladder, no `max_hold`, a trailing peak that restarts
-from scratch, and a protective exit that would try to sell a name the broker
-cannot resolve. The **Reconciliation** panel on the Positions screen shows any
-symbol where the two sides still disagree.
-
-Resolution is best-effort and bounded: a symbol this broker does not offer is
-still tracked (signals, charts, paper positions), and a broker that is slow or
-down delays start-up rather than preventing it.
+Crypto trades continuously, so the market-hours gate is a no-op for these
+symbols and warmup history is always available.
 
 ## Bars
 
@@ -427,256 +493,24 @@ each an RVOL near 6.7 against a default threshold of 1.5 — the detector would
 fire on every traded minute. VWAP needs no special case: it weights by volume, so
 an empty interval contributes nothing.
 
-## Protective exits
+## Symbols and broker tickers
 
-Before any strategy signal, every open position is checked against the rules in
-`internal/exits`. A triggered exit always wins (force-sells):
+A broker may name an instrument differently from your watchlist: Trading 212
+lists `PRAJL.XC` as `PR1Jd`. The bot resolves each watched symbol to its broker
+ticker **when the symbol is added**, not when an order is first placed, so the
+positions the broker reports come back under the names the bot uses.
 
-- `stop_loss_pct` — sell when price falls this far below entry
-- `take_profit_pct` — sell when price rises this far above entry
-- `trailing_stop_pct` — sell when price falls this far below the peak since entry
+That timing matters. The reverse mapping lives in memory, so resolving it lazily
+meant that after a restart a long-held position reported under the broker's name
+and matched no open-position record — and a position with no record is one the
+bot is not managing: no ROI ladder, no `max_hold`, a trailing peak that restarts
+from scratch, and a protective exit that would try to sell a name the broker
+cannot resolve. The **Reconciliation** panel on the Positions screen shows any
+symbol where the two sides still disagree.
 
-Exits respect the trading toggle (recorded as dry-run when trading is off) and
-still pass through the risk manager. **Protective exits always go to market**
-regardless of the execution settings below: when a stop fires, filling matters
-more than filling well.
-
-**Volatility-adaptive stops.** A fixed 5% stop is far too tight on a volatile
-instrument — ordinary noise stops you out — and far too loose on a calm one. An
-ATR multiple is the same *statistical* distance on both:
-
-```yaml
-exits:
-  atr_period: 14
-  atr_stop_mult: 2      # stop two ATRs below entry
-  atr_trail_mult: 3     # trail three ATRs below the peak
-```
-
-When both a percentage and an ATR multiple are set, the **wider** stop wins, so
-the percentage acts as a floor — a momentarily tiny ATR can't place the stop on
-top of the current price and guarantee an instant exit. With no ATR available
-yet, the percentage rules apply unchanged.
-
-**Time-decaying profit ladder (`roi`).** Demand a lot early, settle for less as
-a trade goes stale — the entry that hasn't worked in six hours probably isn't
-going to:
-
-```yaml
-exits:
-  roi:
-    "0s":  0.10   # 10% straight away
-    "30m": 0.05   # after 30 minutes, 5% is enough
-    "2h":  0.02
-    "6h":  0      # after six hours, exit at any profit
-```
-
-The ladder and `take_profit_pct` combine into whichever target is nearer.
-
-**Two-stage trailing stop.** One trailing distance has to be two contradictory
-things at once: loose enough early that ordinary noise doesn't end a trade before
-it works, and tight enough late that a winner isn't handed back. So it is two:
-
-```yaml
-exits:
-  trailing_stop_pct: 0.10          # loose, while the trade is finding its feet
-  trailing_offset_pct: 0.05        # once up 5%…
-  trailing_tight_pct: 0.02         # …trail 2% below the peak instead
-  trailing_only_after_offset: false # true = no trail at all below the offset
-```
-
-With `trailing_only_after_offset`, the stop-loss is the only downside rule until
-the position is far enough ahead — use it when the trail exists to protect a
-gain, not to cap a loss. With no offset set, the trail behaves exactly as before.
-
-**Time barrier (`max_hold`).** The third barrier of the triple-barrier method:
-
-```yaml
-exits:
-  max_hold: 72h   # close unconditionally after three days
-```
-
-This closes a gap nothing else covers. The ROI ladder decays the profit *target*,
-so it can only ever exit at breakeven or better; a position sitting at −3% for
-three weeks trips no stop, meets no target, and quietly occupies a slot the next
-signal needed. `max_hold` exits it at whatever the market offers. A price barrier
-broken in the same bar always wins — that's the difference between filling at
-the stop and filling at the close.
-
-`max_hold` measures **wall clock** from the entry timestamp, not trading time:
-weekends, holidays and overnights all count. `720h` is 30 *calendar* days, about
-21 trading days; for 30 trading days use `~1000h`.
-
-That also makes it the only exit that can newly trigger while the venue is shut.
-Every other barrier is compared against a price, and out of hours the price cache
-is frozen at the last tick — a barrier that did not trip at the close will not
-trip overnight. The clock does not stop.
-
-**Exits defer while the venue is closed.** With `engine.market_hours_check: true`
-a triggered exit waits for the session to reopen instead of being submitted to a
-venue that cannot fill it. `checkExits` runs every `eval_interval`, so without
-this a barrier tripping on a Saturday resubmits every 30 seconds until Monday —
-thousands of rejected orders against a rate-limited broker. Nothing is lost by
-waiting: `max_hold` only grows, and a price barrier is re-tested at the open
-against a fresh quote rather than Friday's stale one. It also restores backtest
-parity, since historical candles only exist during sessions and the backtester
-could never fire a 03:00 Saturday exit in the first place. Symbols the exchange
-calendar does not recognise are treated as open, so a missing mapping can never
-strand a position.
-
-**Scale-out ladder (`partial_take_profit`).** Sell part of a position as it
-clears successive gains instead of holding all of it for one all-or-nothing exit:
-
-```yaml
-exits:
-  partial_take_profit:
-    - profit_pct: 0.05
-      sell_pct: 0.33   # a third off at +5%
-    - profit_pct: 0.12
-      sell_pct: 0.33   # another third at +12%
-```
-
-Each rung fires at most once per position, and fractions are of the **original**
-size — otherwise three 0.33 rungs would sell 70% of the position rather than all
-of it. A gap clearing several rungs takes all of them at once. Progress is
-persisted, so a restart mid-ladder doesn't re-sell a rung.
-
-Be clear about the trade: **scaling out trades expectancy for variance.** Taking
-a third off at +5% caps what that third can earn, and on the trades that would
-have run to +30% it costs real money. What it buys is that fewer trades round-trip
-all the way back to the stop. It is off by default; measure it in a backtest.
-
-The downside rules always outrank the ladder — a trailing stop tripping on the
-way back down from a rung closes the position rather than shaving it.
-
-> The live engine and the backtester call the **same** rule engine
-> (`internal/exits`), differing only in what they compare the levels against: a
-> live tick, or a bar's high and low. That's deliberate — two copies of "is this
-> position stopped out?" is how a backtest quietly stops describing the bot.
-
-## Protections
-
-Money limits cap what is at stake at any one moment. They cannot see *patterns*:
-a strategy that is wrong about a symbol four times in an hour, or one whose
-equity has slid 20% below its peak, is inside every per-order limit while it
-loses steadily. `internal/protect` watches outcomes over time and takes the bot
-off the field.
-
-```yaml
-protections:
-  enabled: true
-  cooldown_after_loss: 30m    # no new entry in a symbol for this long after a loss
-  stop_guard_trades: 4        # N protective stop-outs of one symbol...
-  stop_guard_lookback: 24h    # ...within this window...
-  stop_guard_lock: 4h         # ...locks that symbol for this long
-  max_drawdown_pct: 0.20      # halt ALL automated trading this far below the equity peak
-  max_daily_loss_pct: 0.08    # halt after losing this much of the day's starting equity
-
-  low_profit_trades: 4        # N closed trades in one symbol...
-  low_profit_lookback: 168h   # ...within this window (7 days)...
-  low_profit_min_pnl: 0       # ...netting no more than this...
-  low_profit_lock: 24h        # ...lock that symbol for this long
-```
-
-**The low-profit guard** catches a failure the others cannot see. The stop guard
-counts *stop-outs* — a symbol behaving unlike the backtest. The drawdown halt
-watches the whole account. Neither notices a symbol the strategy keeps trading to
-a small net loss: it trips no stop, moves the account very little, and just bleeds
-commission and spread. This one counts money, per symbol, over a window. It waits
-for `low_profit_trades` closes before judging — two losses on a strategy that wins
-six times in ten is ordinary, and locking on that would remove symbols for
-behaving exactly as designed. Set `low_profit_min_pnl` above zero to demand the
-symbol actually pays for itself rather than merely avoiding a loss.
-
-Two invariants: protections gate **entries only** — an exit is never blocked, so
-a cooldown can't trap you in a losing position — and a halt is **sticky**. It
-stays until `POST /api/protections/resume`, which also re-bases the drawdown peak
-to current equity. A protection that cleared itself on a timer would let an
-unattended bot walk straight back into whatever was draining the account.
-
-State and locks are at `GET /api/protections`; a single symbol can be released
-with `DELETE /api/protections/lock/:symbol`.
-
-## Notifications
-
-An unattended bot that can only be observed by opening its web UI is one you
-will not observe.
-
-```yaml
-notify:
-  enabled: true
-  events: ["trade", "halt", "error"]   # also "blocked" (noisy)
-  min_notional: 0                      # suppress fill alerts below this order value
-
-  webhook: ""                          # any URL — gets the event as a JSON POST
-  discord_webhook: ""
-  telegram_token: ""
-  telegram_chat_id: ""
-
-  pushover_token: ""                   # application/API token from pushover.net
-  pushover_user: ""                    # user or group key
-  pushover_device: ""                  # optional: one device only
-  pushover_priority: 0                 # -2 silent … 1 high; halts/errors get +1
-
-  apprise_url: ""                      # Apprise API server endpoint
-  apprise_services: ""                 # stateless mode: comma-separated service URLs
-  apprise_tag: ""                      # stored config: which entries to notify
-```
-
-| Sink | Reaches |
-|------|---------|
-| `webhook` | anything that accepts a JSON POST (Slack, Mattermost, n8n, your own script) |
-| `discord_webhook` | a Discord channel |
-| `telegram_*` | a Telegram chat, via a bot |
-| `pushover_*` | phones, with a real title and priority — a halt can bypass quiet hours while a routine fill doesn't |
-| `apprise_*` | the ~100 services [Apprise](https://github.com/caronc/apprise) supports — email, Matrix, ntfy, Gotify, Signal, SMS — through one [Apprise API](https://github.com/caronc/apprise-api) server, so this repo doesn't need an adapter per service |
-
-Every configured sink gets every subscribed event; a sink needing two
-credentials stays inactive until both are set. Apprise takes either a stored
-configuration (`http://apprise:8000/notify/mykey`) or the stateless endpoint
-(`http://apprise:8000/notify` plus `apprise_services`), and event kinds map onto
-Apprise's own types (trade→success, blocked→warning, halt/error→failure).
-
-Pushover's priority 2 (emergency, repeats until acknowledged) is deliberately
-unreachable: it needs a retry/expire and acknowledgement flow, and a trading bot
-that can wake you every 30 seconds until you tap a button is a footgun.
-
-Delivery never blocks trading: events are queued and sent by a background
-worker, and dropped when the queue backs up — a slow chat server must not slow
-the trading loop. Counters (sent / failed / dropped) are at `GET /api/notify`,
-and failures land in `GET /api/errors` under source `notify`. Env overrides:
-`BOT_NOTIFY_WEBHOOK`, `BOT_NOTIFY_DISCORD`, `BOT_NOTIFY_TELEGRAM_TOKEN`,
-`BOT_NOTIFY_TELEGRAM_CHAT`, `BOT_NOTIFY_PUSHOVER_TOKEN`,
-`BOT_NOTIFY_PUSHOVER_USER`, `BOT_NOTIFY_APPRISE_URL`.
-
-## Settings and config.yaml
-
-Changes made in the web interface apply immediately **and are written back to
-`config.yaml`**, so they survive a restart.
-
-The write is a surgical edit, not a re-serialisation. The file is parsed to a
-YAML syntax tree, only the scalars that changed are replaced, and the result is
-written atomically (temp file + rename — this file holds live broker
-credentials). Everything else is carried through untouched: comments, key order,
-blank lines, commented-out blocks, and any key the settings screen does not know
-about.
-
-That is not fussiness. Measured on a real 679-line config, the obvious
-implementation — unmarshal, mutate, marshal — produced 304 lines with **none** of
-the 342 comment lines, and silently deleted the whole `strategy_overrides` block
-(`SymbolStrategy` is `yaml:"-"`, derived at load time, so a marshal cannot emit
-it).
-
-Two safeguards worth knowing:
-
-- **The result is verified before it is written.** The patched document is
-  re-read and compared against the settings that were applied; if it would not
-  read back the same, nothing is written and the UI says so. This is what stops a
-  multi-line value such as `ai.system_prompt` from being quietly reflowed.
-- **A failed save never reverts the live change.** The bot keeps running the new
-  value and the UI reports "applied, but not saved" — telling you plainly rather
-  than leaving you to discover it at the next restart.
-
-Run with `--config <path>` and that is the file that gets edited.
+Resolution is best-effort and bounded: a symbol this broker does not offer is
+still tracked (signals, charts, paper positions), and a broker that is slow or
+down delays start-up rather than preventing it.
 
 ## Finding symbols
 
@@ -989,50 +823,665 @@ would dilute that rather than help. Note that "its own" means a
 `universe:` is not class-specific, so a class inheriting it still counts as
 having none.
 
-### Giving up on a symbol (`drop_after_losses`)
+## Detectors & combiner
 
-Every other per-symbol guard locks an instrument out for a while and then lets
-it back in. That is right for a bad patch and wrong for a bad match: some
-instruments simply do not suit the strategy, and a lockout that expires hands
-capital back to them every time it does.
+The strategy is a set of **detectors** (one indicator each) merged by a combiner.
+Configure which to run and how to merge them:
 
 ```yaml
-protections:
-  drop_after_losses: 8      # 0 = never
+strategy:
+  detectors: ["rsi", "macd", "bollinger", "vwap", "atr", "rvol", "volume_profile",
+              "trend", "adx", "stochastic", "supertrend", "donchian"]
+  combine: "unanimous"       # BUY merge: majority | unanimous | weighted
+  combine_sell: "majority"   # SELL merge (empty = same as combine) — be strict to
+                             # enter, quick to exit
 ```
 
-After that many **consecutive** losing closes the symbol is removed from the
-watchlist *and* its entry in `watchlist:` is commented out:
+**Asymmetric entry/exit:** the BUY and SELL sides are configured independently —
+`detectors`/`combine`/`min_strength` drive buys and `detectors_sell`/
+`combine_sell`/`min_strength_sell` drive sells (each `*_sell` empty/−1 = inherit
+the buy setting). So you can enter strictly (all detectors agree, high
+conviction) and exit readily (a majority of different detectors at a lower bar).
+Protective exits — stop-loss / trailing / take-profit — sell on price alone,
+independent of all this.
+
+**Don't churn (holding & confirmation):**
 
 ```yaml
-watchlist:
-  - SAP.DE
-  # - MRVL   # dropped by drop_after_losses: 8 consecutive losing closes (max 8), 2026-09-12
+engine:
+  keep_interval: 2h      # min hold before a *strategy* sell (exits still fire). 0 = off
+  confirm_buy: 2         # need N consecutive evaluations agreeing before buying
+  confirm_sell: 2        # ditto for selling — a single down-tick won't dump a position
 ```
 
-The file edit is the point. Startup re-adds every symbol in `watchlist:`, so a
-drop that only changed the running state would be undone by the next restart.
+`confirm_*` require the signal to persist for N×`eval_interval` before acting;
+`keep_interval` blocks strategy sells for a minimum holding time after entry
+(protective exits bypass it). All three are editable live in the UI
+("Holding & confirmation") or via `PUT /api/behavior`.
 
-**Commented, never deleted.** A deletion is a decision you cannot see, review or
-reverse. A comment keeps the symbol, the reason and the date, and un-dropping it
-is removing one `#`.
+### The detectors
 
-Three rules make it safe to leave on:
+Each one reads a single indicator and returns BUY, SELL or HOLD with a strength
+in 0..1. A detector with nothing to say votes HOLD and, under `unanimous`, is
+ignored rather than counted against the others.
 
-- **A win or breakeven close resets the count**, so it only fires on a symbol
-  that is losing and not recovering.
-- **A symbol with an open position is never dropped** — that would strand it
-  with no exits, no trailing stop and no way to sell. The streak keeps counting
-  while held, so it drops on the close after the position is flat.
-- **It only edits its own `watchlist:` block.** A flow-style list
-  (`watchlist: [A, B]`) has no per-symbol line to comment, so it is refused with
-  a clear error rather than being reformatted.
+They fall into four families, and mixing families is the point — three
+trend-followers agreeing tells you less than a trend-follower and a
+volume confirmation agreeing.
 
-If you also use `autotune.on_loss`, set this well above it — the intent is
-"re-tune a few times, and give up only if that did not help". Both read one
-consecutive-loss counter, which resets only on a win, so `on_loss` re-tunes
-every N in a row while the count climbs toward this threshold. At the threshold
-the drop wins and no re-tune is requested.
+| family | detectors | what it answers |
+|---|---|---|
+| Trend | `ema_cross`, `macd`, `trend`, `supertrend`, `adx` | which way is it going? |
+| Mean reversion | `rsi`, `bollinger`, `stochastic` | has it gone too far? |
+| Breakout | `donchian`, `atr` | has it broken out of its range? |
+| Volume | `vwap`, `rvol`, `volume_profile` | is the move backed by participation? |
+| Learned | `ai`, `ml` | what does a model make of all of it? |
+
+#### `ema_cross` — EMA crossover (trend)
+
+```yaml
+fast_ma: 12     # fast EMA period, in bars
+slow_ma: 26     # slow EMA period
+```
+
+The classic. Fast EMA above slow → BUY bias; below → SELL bias. Strength grows
+with the gap between them, so a wide separation votes harder than a fresh
+crossover.
+
+Cheap, always opinionated, and late by construction — it confirms a move that
+has already begun. Pair it with something that votes earlier.
+
+> EMAs are seed-dependent: a windowed series and a full-history series disagree
+> for the first 3–4 periods until the seed decays. Live and backtest can differ
+> slightly on the very first bars of a symbol for this reason.
+
+#### `rsi` — Relative Strength Index (mean reversion)
+
+```yaml
+rsi_period: 14
+rsi_oversold: 30
+rsi_overbought: 70
+rsi_mode: "midline"   # "midline" | "extremes"
+```
+
+`rsi_mode` changes this detector more than any threshold does:
+
+- **`midline`** (default) — a graded vote around 50. Below 50 leans BUY, above
+  leans SELL, strength scaling with the distance. It **always participates**,
+  which matters under `unanimous`: a detector that always has an opinion is a
+  detector that can always block.
+- **`extremes`** — votes only outside `rsi_oversold` / `rsi_overbought`, and
+  HOLDs in between. Far quieter, and under `unanimous` it stops being a veto
+  most of the time.
+
+If a `unanimous` strategy never fires, `rsi_mode: midline` is the first thing
+to check.
+
+#### `macd` — moving-average convergence/divergence (momentum)
+
+```yaml
+macd_fast: 12
+macd_slow: 26
+macd_signal: 9
+```
+
+Votes on the sign of the histogram — the MACD line minus its signal line.
+Positive → BUY, negative → SELL, strength from the magnitude.
+
+Momentum rather than level: it turns when the *rate* of the trend changes, so
+it leads `ema_cross` slightly and whipsaws more in a flat market.
+
+#### `bollinger` — Bollinger Bands (mean reversion)
+
+```yaml
+bb_period: 20
+bb_stddev: 2
+```
+
+Price below the lower band → BUY; above the upper → SELL. The bands are a
+moving average ± `bb_stddev` standard deviations, so they widen in volatile
+conditions and tighten in calm ones — the same absolute move votes differently
+depending on the regime.
+
+Its failure mode is the strong trend: price riding the upper band means
+"powerful uptrend", and this detector reads it as "sell, too far up".
+
+#### `stochastic` — stochastic oscillator (mean reversion)
+
+```yaml
+stoch_k_period: 14
+stoch_d_period: 3
+stoch_overbought: 80
+stoch_oversold: 20
+```
+
+Where the close sits inside the recent high/low range. %K at or below
+`stoch_oversold` → BUY; at or above `stoch_overbought` → SELL. `stoch_d_period`
+smooths %K into %D.
+
+Similar question to `rsi`, different arithmetic: RSI measures the size of
+up-moves against down-moves, the stochastic measures *position within the
+range*. They disagree often enough to be worth running together.
+
+#### `trend` — least-squares regression slope (trend)
+
+```yaml
+trend_period: 1950      # bars to regress over (~1 US trading week of 1-min bars)
+trend_threshold: 0.01   # min end-to-end move of the fitted line to count as a trend
+trend_gate: true        # also VETO counter-trend signals — ON in the shipped config
+```
+
+Fits a straight line through up to `trend_period` bars and votes on the
+end-to-end move of that line, normalised against the fitted level so the
+threshold means the same thing on a €15 ETF and a €900 share.
+
+**`trend_gate` changes its role entirely, and it ships ON.** With it, this
+stops being one vote among many and becomes a veto: no buys in a downtrend, no
+strategy sells in an uptrend, regardless of what every other detector says.
+Protective exits still fire — the gate never traps a position. If your strategy
+seems to ignore good signals in one direction, this is the first thing to
+check.
+
+> A documented discontinuity: when the fitted intercept is ≤ 0 the detector
+> falls back to the last close as its denominator, so the normalisation jumps.
+
+#### `supertrend` — ATR-banded trend follow
+
+```yaml
+supertrend_period: 10
+supertrend_mult: 3       # larger = fewer flips
+```
+
+An ATR-scaled band that flips sides when price crosses it. Above the band →
+BUY, below → SELL. `supertrend_mult` is the sensitivity dial: raise it to sit
+through noise, lower it to turn sooner and more often.
+
+Because the band is volatility-scaled it holds through ordinary wobble in a
+calm instrument while still turning quickly in a violent one.
+
+#### `adx` — Average Directional Index (trend strength filter)
+
+```yaml
+adx_period: 14
+adx_threshold: 25   # minimum ADX to vote at all
+```
+
+The only detector that measures **whether there is a trend at all** before
+saying which way. Below `adx_threshold` it HOLDs; above it, +DI versus −DI sets
+the direction.
+
+That makes it most useful as a companion: it stays silent in the chop where the
+mean-reversion detectors do their best work, and speaks up in the trends where
+they do their worst.
+
+#### `donchian` — channel breakout
+
+```yaml
+donchian_period: 20
+```
+
+Close above the highest high of the last `donchian_period` bars → BUY; below
+the lowest low → SELL. No smoothing, no thresholds — the range is broken or it
+is not.
+
+The oldest idea here and still one of the sharpest, at the cost of buying
+strength rather than weakness. Expect it to disagree with every mean-reversion
+detector by design.
+
+#### `atr` — volatility breakout
+
+```yaml
+atr_period: 14
+atr_mult: 1.5
+```
+
+Votes when the move from the prior close exceeds `atr_mult` × ATR — an unusual
+move *for this instrument*, which is what makes it comparable across a
+watchlist holding both a calm ETF and a volatile small cap.
+
+Direction comes from the move's sign, so it is a confirmation of something
+already happening rather than a prediction.
+
+#### `vwap` — volume-weighted average price (volume)
+
+```yaml
+vwap_period: 20
+```
+
+Price above VWAP → BUY bias, below → SELL bias. VWAP is where the average
+participant transacted, so trading above it means buyers are paying up.
+
+#### `rvol` — relative volume (volume confirmation)
+
+```yaml
+rvol_period: 20
+rvol_threshold: 1.5
+```
+
+Compares current volume against the trailing average of bars that actually
+traded. Above `rvol_threshold`, it confirms the direction of the latest move;
+below, it HOLDs.
+
+A confirmation detector, not a signal on its own: it has no view on direction
+until something else moves.
+
+#### `volume_profile` — value area and point of control (volume)
+
+```yaml
+vp_window: 120
+vp_buckets: 24
+vp_value_area_pct: 0.7
+```
+
+Buckets the window's closes by price, weighted by volume, then finds the
+**point of control** (the busiest price) and the **value area** around it
+holding `vp_value_area_pct` of the volume. Price outside the value area votes
+toward returning to it.
+
+The most expensive detector here, and the most sensitive to the volume caveat
+below.
+
+> **The volume caveat applies to all three.** The live engine builds bars from
+> the quote stream, which carries no trade sizes — so a live bar's "volume" is
+> its **tick count**, while backtests use real share volume from CSV or Yahoo
+> history. `vwap`, `rvol` and `volume_profile` therefore behave measurably
+> differently live than they did in your backtest. Weight them accordingly, or
+> prefer the other families for live decisions.
+
+#### `ai` — LLM advisor
+
+Reads the same normalised indicator snapshot and votes. Off the hot path,
+collapses to HOLD on any error, timeout or low confidence. No account,
+position or balance data is ever sent. See
+[AI advisor](#ai-advisor-the-ai-detector).
+
+#### `ml` — learned classifier
+
+A logistic regression — not deep learning — retrained per symbol on a rolling
+window over the same 16-feature vector, predicting whether the next N bars are
+up. Walk-forward labelled, no lookahead. See
+[ML detector](#ml-detector-learned-signal).
+
+**Comparison:** with more than one detector, each is evaluated and the signal
+`reason` shows every detector's vote, e.g.
+`rsi:BUY(0.60), macd:HOLD(0.00), vwap:SELL(0.30) => BUY by majority`.
+Merge modes: **majority** (more votes wins), **unanimous** (all opinionated
+detectors must agree), **weighted** (sign of the strength-weighted net).
+
+**Per-detector weights:** `strategy.weights` multiplies each detector's strength
+when combining (missing entries default to 1.0), so a `weighted` merge can trust
+some signals more than others; a zero or negative weight mutes a detector's
+strength contribution without removing its vote:
+
+```yaml
+strategy:
+  weights:
+    trend: 2.0    # count the regression trend double
+    rsi: 0.5
+```
+
+**Tuning for fewer losses:** two knobs cut over-trading (the main cause of
+death-by-a-thousand-losses on noisy data):
+
+- `strategy.min_strength` (0..1) — minimum combined confidence to act; weaker
+  signals become HOLD. Higher → fewer, higher-conviction trades. On the
+  synthetic sample, raising it from 0 → 0.30 took win rate **43% → 100%**,
+  Sharpe **0.4 → 2.5**, and losses **4 → 0**.
+- `engine.allow_pyramiding: false` (default) — at most one entry per symbol
+  until it's exited, so the bot can't keep adding to a position every bar.
+
+> Note: a slightly-upward random walk is *designed* to reward buy-and-hold, so
+> beating the benchmark on synthetic data isn't the goal — minimising losses and
+> trade quality is. Validate real edge by backtesting **real** CSV history
+> (`-csv`), especially across choppy/down markets.
+
+## Per-symbol strategy parameters
+
+One set of parameters for a volatile small cap and a short-duration bond ETF is a
+compromise that suits neither. An RSI period tuned on NVDA says nothing useful
+about IBCI.DE, and a 14-bar ATR breakout on an instrument that moves 5 bps a day
+fires on noise.
+
+```yaml
+strategy:
+  detectors: ["ema_cross", "rsi", "macd"]
+  min_strength: 0.25
+  rsi_period: 14
+
+strategy_overrides:
+  NVDA:
+    min_strength: 0.45      # demand more conviction on a volatile name
+  IBCI.DE:
+    detectors: ["trend"]    # a quiet bond ETF: trend only
+    min_strength: 0.50
+```
+
+**Overrides inherit.** An override that names only `min_strength` keeps every
+other parameter from the base — otherwise writing one field would silently zero
+the RSI period, the MACD lengths and the detector list, and that symbol would
+trade on a config nobody wrote. List fields (like `detectors`) are replaced
+wholesale, which is the useful semantics for "trade this one differently".
+
+Resolution order is profile → `strategy:` → `strategy_overrides:`. A bad override
+fails the config load naming the symbol, rather than leaving one symbol quietly
+broken. The detector table and each trade's indicator snapshot use the symbol's
+own parameters, so the UI shows what actually drove a decision.
+
+## Multi-timeframe confirmation
+
+A buy signal on 1-minute bars inside an hourly downtrend is usually noise
+dressed up as an entry. Rather than guess, the strategy can re-run real
+detectors on genuinely coarser bars:
+
+```yaml
+strategy:
+  htf_multiple: 15            # aggregate every 15 bars into one
+  htf_detectors: ["trend"]    # what to run on them (default: trend)
+  htf_mode: "gate"            # "gate" vetoes counter-trend signals; "vote" just adds an opinion
+```
+
+Aggregation is by **bar count**, not wall-clock time, so it behaves identically
+whether the base bars are 1-minute live ticks or daily candles from a CSV, and
+the newest aggregate always ends on the newest bar (so the reading never
+flickers as a bucket fills). The cost is warmup: confirmation needs
+`htf_multiple` times as much history before it can say anything, and the
+strategy's warmup grows accordingly.
+
+## AI advisor (the `ai` detector)
+
+An optional detector that asks a **local or remote LLM** what it makes of the
+current setup, and folds its answer in as one more vote. Ollama is the default,
+so it runs **fully offline on your own machine** with no API key and no data
+leaving the host:
+
+```bash
+ollama pull llama3.2 && ollama serve
+```
+
+```yaml
+ai:
+  enabled: true
+  provider: "ollama"                 # or "openai" for any OpenAI-compatible endpoint
+  base_url: "http://localhost:11434"
+  model: "llama3.2"
+  refresh_interval: 15m              # min time between calls per symbol
+  max_strength: 0.4                  # cap its influence (see below)
+
+strategy:
+  detectors: ["trend", "rsi", "macd", "ai"]
+```
+
+**What the model actually sees.** Not raw candles — LLMs are poor at arithmetic
+over long number lists, and a few hundred bars would cost more tokens than the
+answer is worth. It gets a compact, *normalised* snapshot of the same readings
+the rule-based detectors vote on, so a $3 stock and a $3000 one read alike:
+
+```
+symbol: AAPL
+price: 231.4400
+return_last_bar_pct: +0.12
+return_5_bars_pct: +1.03
+return_20_bars_pct: +3.51
+ema_fast_vs_slow_pct: +0.84
+rsi: 61.2
+macd_histogram_pct_of_price: +0.041
+bollinger_position: 0.78 (0=lower band, 1=upper band)
+atr_pct_of_price: 1.12
+adx: 28.4 (+DI 26.1, -DI 14.9)
+stochastic: %K 71.3, %D 68.0
+relative_volume: 1.34 (1.0 = average)
+range_position: 0.81 (0=period low, 1=period high)
+regression_trend_pct: +4.20 (fit quality R2 0.71)
+```
+
+Readings that can't be computed yet are **omitted**, never sent as a zero the
+model would read as real data. The answer must be one JSON object —
+`{"action":"BUY|SELL|HOLD","confidence":0..1,"reason":"..."}` — which becomes a
+normal detector vote (Ollama's `format: json` mode constrains the sampler, so
+small local models comply reliably).
+
+**It cannot stall the bot.** Verdicts are cached per symbol and refreshed in the
+background, so an evaluation tick — or a backtest bar — costs a map lookup, not
+a model round-trip. At most `max_concurrent` requests are in flight, and at most
+one per symbol per `refresh_interval` (and only when the readings actually
+moved: an unchanged snapshot reuses the cached answer rather than buying the
+same opinion twice).
+
+**It fails to HOLD.** Advisor disabled, model unreachable, request timed out,
+answer unparseable, verdict older than `max_age`, confidence below
+`min_confidence` — every one of those is a HOLD. The advisor can decline to have
+an opinion; it can never invent a trade. Failures land in `GET /api/errors` (and
+the UI's error panel) under source `ai`, and `GET /api/ai` reports the model,
+call count and last error.
+
+**Keep it on a leash.** `max_strength` caps the strength this detector can
+contribute: at `0.4` the LLM can tilt a marginal decision but a `majority` or
+`weighted` combine still needs the real indicators to agree. `strategy.weights`
+works on it like any other detector. Treat it as a sentiment-ish overlay, not a
+strategy — it is a language model pattern-matching on numbers, not an edge.
+
+**Backtesting it is deliberately awkward.** The background-refresh design that
+keeps live trading fast means a backtest races past the model and mostly reads
+an empty cache; `cmd/backtest` and `cmd/optimize` warn when `ai` is in the
+detector set for exactly that reason. Setting `ai.blocking: true` makes the
+backtest actually wait for the model — correct, and *very* slow. Do not enable
+live trading on the back of results the advisor never participated in.
+
+| Setting | Meaning |
+|---------|---------|
+| `enabled` | master switch; off ⇒ the detector exists but always votes HOLD |
+| `provider` | `ollama` (native `/api/chat`) or `openai` (any `/v1/chat/completions`: llama.cpp, LM Studio, vLLM, OpenRouter, OpenAI) |
+| `base_url` / `model` / `api_key` | endpoint, model name, bearer token (`BOT_AI_API_KEY`) |
+| `timeout` | per-request deadline (default 20s) |
+| `refresh_interval` | minimum time between calls for one symbol (default 15m) |
+| `max_age` | verdicts older than this are not used (default 1h) |
+| `blocking` | wait for the model instead of using the cache — backtests only |
+| `temperature` | 0 (default) = as reproducible as the model allows |
+| `max_concurrent` | in-flight request cap (default 2) — protects a single local GPU |
+| `min_confidence` | below this the model's own answer is demoted to HOLD |
+| `max_strength` | ceiling on the strength it contributes (0..1) |
+| `system_prompt` | replaces the built-in instruction prompt |
+
+Env overrides: `BOT_AI_ENABLED`, `BOT_AI_PROVIDER`, `BOT_AI_BASE_URL`,
+`BOT_AI_MODEL`, `BOT_AI_API_KEY`.
+
+## ML detector (learned signal)
+
+A logistic-regression classifier over the **same** normalised indicator readings
+the rule-based detectors vote on, retrained on a rolling window, estimating the
+probability that the next `horizon` bars are up.
+
+```yaml
+ml:
+  enabled: true
+  horizon: 10            # predict the next 10 bars
+  threshold: 0.005       # "up" means +0.5% or better over that window
+  train_bars: 1500       # rolling training window
+  retrain_every: 250     # refit every 250 new bars
+  min_skill: 0.02        # must beat the majority-class base rate by 2pp to vote
+  max_strength: 0.5      # cap its influence
+
+strategy:
+  detectors: ["trend", "macd", "ml"]
+```
+
+**Every prediction is out-of-sample.** The model trains only on rows whose
+forward window has already closed, then predicts the current bar. That makes a
+backtest of it a continuous walk-forward rather than a fit to the data it's
+scored on — the distinction between a plausible ML signal and a fantasy. Two
+tests pin this down: the sample builder must leave the final `horizon` bars
+unlabelled, and adding future bars must not change any sample already built.
+
+**`min_skill` is the important setting.** Bar-to-bar direction on liquid
+instruments is close to unpredictable from indicators alone, and a model that
+learned nothing still emits confident-looking probabilities. `min_skill` is the
+margin by which training accuracy must beat simply guessing the majority class;
+below it the detector says so and votes HOLD:
+
+```
+ml: skill 0.004 below min_skill 0.020 (acc 0.548 vs base 0.544)
+```
+
+Expect to see that message a lot. It is the honest answer, not a malfunction.
+
+**Why regression and not something bigger.** With ~16 features and a few
+thousand noisy samples the bottleneck is signal in the data, not model capacity;
+a gradient-boosted forest fits this better and generalises no better. Logistic
+regression is also inspectable — the reason string names the features driving the
+lean, since standardised weights are directly comparable:
+
+```
+ml: p(up 10 bars)=0.612 BUY (acc 0.58 vs base 0.54, n=1240) [trend_pct+0.41 adx+0.22 rsi-0.19]
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `enabled` | off ⇒ the `ml` detector exists but always votes HOLD |
+| `horizon` / `threshold` | the label: is the close `horizon` bars ahead at least `threshold` higher? |
+| `train_bars` / `retrain_every` / `min_samples` | rolling window, refit cadence (in **bars**, so backtest and live agree), and the floor to fit at all |
+| `buy_prob` / `sell_prob` | the probabilities at which it votes (default 0.58 / 0.42 — deliberately not 0.5) |
+| `min_skill` | required accuracy above the base rate before it may vote |
+| `max_strength` | ceiling on the strength it contributes |
+| `epochs` / `learning_rate` / `l2` | fitting hyperparameters; `l2` is the brake on overfitting the window |
+
+Fitting is deterministic (full-batch descent, no shuffling), so a model can be
+reasoned about and a backtest reproduced. `GET /api/ml` reports how many symbols
+have models, refit and failure counts, and the mean skill across them — if that
+average sits at zero, the models are finding nothing.
+
+Warmup is much longer than a technical detector's: a training window plus the
+horizon whose labels aren't knowable yet. Backtests are correspondingly slower
+(one refit per `retrain_every` bars per symbol).
+
+## Money limits (the hard requirement)
+
+Every order — automated **and** manual — passes through `risk.Manager.Authorize`,
+which clamps order size down to fit and **fails closed** (rejects) if a limit
+has no headroom:
+
+- `max_order_value` — notional cap per single order
+- `max_per_position` — market-value cap per symbol
+- `max_total_invested` — cap on total invested across all positions
+- `max_daily_spend` — rolling per-day buy-notional cap
+- `cash_reserve` — cash that must stay uninvested
+- `max_open_positions` — cap on distinct symbols held
+
+The bot refuses to start with trading enabled unless `max_order_value` and
+`max_total_invested` are set.
+
+### Limits that scale with the account
+
+Every money limit above has a `_pct` twin taking a **fraction of current
+equity** instead of a fixed amount. `0` means "not set" for either half, and
+when both are set the **tighter** one binds. That gives three modes:
+
+| written as | behaviour |
+|---|---|
+| `max_total_invested: 950` | fixed ceiling, whatever the account does |
+| `max_total_invested_pct: 0.95` | scales with the account forever |
+| **both** | **"use 95%, up to 5000"** — scales while small, then stops |
+
+The third is usually the one you want:
+
+```yaml
+limits:
+  max_total_invested: 5000       # never more than 5000...
+  max_total_invested_pct: 0.95   # ...and never more than 95% of equity
+```
+
+| equity | resolves to | binding half |
+|---|---|---|
+| 1,000 | 950 | 95% of equity |
+| 5,000 | 4,750 | 95% of equity |
+| 6,000 | 5,000 | the 5000 ceiling (crossover ≈ 5,263) |
+| 50,000 | 5,000 | the 5000 ceiling |
+
+A fixed amount goes stale the moment the account grows — 950 is the whole book
+at 1000 equity and 9.5% of it at 10000, and nothing says so. Set the amounts to
+`0` and use percentages alone and the book scales itself:
+
+```yaml
+limits:
+  max_total_invested: 0
+  max_total_invested_pct: 0.95
+  max_per_position: 0
+  max_per_position_pct: 0.20
+  max_order_value: 0
+  max_order_value_pct: 0.20
+  cash_reserve: 0
+  cash_reserve_pct: 0.05
+```
+
+Position *sizing* already scaled: `max_pct_per_asset_class` and
+`min_positions_per_asset_class` are fractions, so a slot is a constant share of
+equity at any account size. These limits were what stopped that reaching the
+order.
+
+> **`cash_reserve_pct` resolves the other way.** It is a floor, not a ceiling,
+> so the **larger** of the two halves wins — the more conservative reserve. The
+> ceilings take the smaller. Resolving the reserve like a ceiling would leave a
+> grown account with a token buffer.
+
+Equity includes unrealised P&L, so a winning book raises its own limits and
+buys more near the top — that is what a percentage allocation means. The other
+direction is harmless: tighter limits gate buys only, never exits.
+
+**Spreading capital across positions:** set `engine.min_positions: N` so no
+single buy takes more than its share of what can actually be invested. `0`
+leaves the per-class slots (`portfolio.min_positions_per_asset_class`) to do
+it. Editable live in the UI ("Position sizing") or via `PUT /api/sizing`.
+
+## Position sizing
+
+There is no fixed order size. Every buy starts from the **money-limit
+headroom** — the tightest of `max_order_value`, `max_per_position`, the
+position slot, `max_total_invested`, `max_daily_spend` and `cash_reserve` —
+and risk scales it down from there. Nothing to keep in sync with `limits:`,
+because the limits *are* the size.
+
+```yaml
+engine:
+  min_positions: 4           # spread the budget over at least this many
+  max_risk_size_usd: 5000    # absolute cap on what sizing may produce
+  min_order_size_usd: 100    # below this, refuse the order rather than place it
+```
+
+**`min_positions`** stops one buy taking the lot: each position is capped at
+its share of what can actually be invested — equity less `cash_reserve`, capped
+at `max_total_invested`. `portfolio.min_positions_per_asset_class` refines it
+per asset class and wins for the classes it names; whatever it does not claim
+is what an unnamed class gets. See [Portfolio limits](#portfolio-limits-concentration).
+
+**Risk scaling** is always applied when a stop is configured. The headroom is
+reduced by how much wider this trade's actual stop is than the `stop_loss_pct`
+baseline. Buying 500 of a calm ETF behind a 2% stop risks 10; buying 500 of a
+volatile small cap behind a stop four times wider is a different trade, and it
+gets proportionally less capital. It can only *reduce* a position, never
+enlarge one — a way to take less risk, not a licence to take more.
+
+> **It does nothing until an ATR stop can out-widen `stop_loss_pct`.** With no
+> ATR stop every trade uses the same fixed percentage, so the ratio is exactly
+> 1 and every trade gets the full headroom.
+>
+> That threshold is harder to reach than it looks. ATR averages *per-bar* true
+> ranges, so on a 1-minute feed it is tiny — measured on AAPL, ATR(14)/price is
+> **0.074%**, meaning a 5% stop would need `atr_stop_mult: 68`. Lengthening
+> `atr_period` does not help (390 bars gives 0.096%); only a coarser
+> `bar_interval` does. At daily bars ATR(14) is 2.4% and the textbook `2` lands
+> right on a 5% stop — which is where that number comes from.
+>
+> So on 1-minute bars, risk sizing is inert unless you lower `stop_loss_pct` or
+> trade coarser bars. It is not broken; it has nothing to measure. See the
+> calibration table in `data/config.example.yaml` under `exits:`.
+
+**`min_order_size_usd` refuses, it does not round up.** An order the scaling
+puts below it is not placed. Raising it back up would enlarge exactly the
+trades the scaling just judged too risky to hold at full size — which is what
+this setting used to do, and it had the sizing backwards.
+
+The refusal is recorded once per symbol, not once per evaluation: the loop
+revisits every symbol every `eval_interval`, and a stop stays wide for as long
+as it stays wide.
 
 ## Portfolio limits (concentration)
 
@@ -1217,90 +1666,6 @@ asset_classes:
   PRAJL.XC: stock
 ```
 
-## Per-symbol strategy parameters
-
-One set of parameters for a volatile small cap and a short-duration bond ETF is a
-compromise that suits neither. An RSI period tuned on NVDA says nothing useful
-about IBCI.DE, and a 14-bar ATR breakout on an instrument that moves 5 bps a day
-fires on noise.
-
-```yaml
-strategy:
-  detectors: ["ema_cross", "rsi", "macd"]
-  min_strength: 0.25
-  rsi_period: 14
-
-strategy_overrides:
-  NVDA:
-    min_strength: 0.45      # demand more conviction on a volatile name
-  IBCI.DE:
-    detectors: ["trend"]    # a quiet bond ETF: trend only
-    min_strength: 0.50
-```
-
-**Overrides inherit.** An override that names only `min_strength` keeps every
-other parameter from the base — otherwise writing one field would silently zero
-the RSI period, the MACD lengths and the detector list, and that symbol would
-trade on a config nobody wrote. List fields (like `detectors`) are replaced
-wholesale, which is the useful semantics for "trade this one differently".
-
-Resolution order is profile → `strategy:` → `strategy_overrides:`. A bad override
-fails the config load naming the symbol, rather than leaving one symbol quietly
-broken. The detector table and each trade's indicator snapshot use the symbol's
-own parameters, so the UI shows what actually drove a decision.
-
-## Position sizing
-
-There is no fixed order size. Every buy starts from the **money-limit
-headroom** — the tightest of `max_order_value`, `max_per_position`, the
-position slot, `max_total_invested`, `max_daily_spend` and `cash_reserve` —
-and risk scales it down from there. Nothing to keep in sync with `limits:`,
-because the limits *are* the size.
-
-```yaml
-engine:
-  min_positions: 4           # spread the budget over at least this many
-  max_risk_size_usd: 5000    # absolute cap on what sizing may produce
-  min_order_size_usd: 100    # below this, refuse the order rather than place it
-```
-
-**`min_positions`** stops one buy taking the lot: each position is capped at
-its share of what can actually be invested — equity less `cash_reserve`, capped
-at `max_total_invested`. `portfolio.min_positions_per_asset_class` refines it
-per asset class and wins for the classes it names; whatever it does not claim
-is what an unnamed class gets. See [Portfolio limits](#portfolio-limits-concentration).
-
-**Risk scaling** is always applied when a stop is configured. The headroom is
-reduced by how much wider this trade's actual stop is than the `stop_loss_pct`
-baseline. Buying 500 of a calm ETF behind a 2% stop risks 10; buying 500 of a
-volatile small cap behind a stop four times wider is a different trade, and it
-gets proportionally less capital. It can only *reduce* a position, never
-enlarge one — a way to take less risk, not a licence to take more.
-
-> **It does nothing until an ATR stop can out-widen `stop_loss_pct`.** With no
-> ATR stop every trade uses the same fixed percentage, so the ratio is exactly
-> 1 and every trade gets the full headroom.
->
-> That threshold is harder to reach than it looks. ATR averages *per-bar* true
-> ranges, so on a 1-minute feed it is tiny — measured on AAPL, ATR(14)/price is
-> **0.074%**, meaning a 5% stop would need `atr_stop_mult: 68`. Lengthening
-> `atr_period` does not help (390 bars gives 0.096%); only a coarser
-> `bar_interval` does. At daily bars ATR(14) is 2.4% and the textbook `2` lands
-> right on a 5% stop — which is where that number comes from.
->
-> So on 1-minute bars, risk sizing is inert unless you lower `stop_loss_pct` or
-> trade coarser bars. It is not broken; it has nothing to measure. See the
-> calibration table in `data/config.example.yaml` under `exits:`.
-
-**`min_order_size_usd` refuses, it does not round up.** An order the scaling
-puts below it is not placed. Raising it back up would enlarge exactly the
-trades the scaling just judged too risky to hold at full size — which is what
-this setting used to do, and it had the sizing backwards.
-
-The refusal is recorded once per symbol, not once per evaluation: the loop
-revisits every symbol every `eval_interval`, and a stop stays wide for as long
-as it stays wide.
-
 ## Entries
 
 Three settings decide when a *new* position — or an addition to one — may open.
@@ -1378,59 +1743,439 @@ run in the diagnostics tab's API-errors list rather than letting the setting
 look effective. Alpaca and Saxo place real limit orders; the simulated broker
 fills one only when it is already marketable.
 
-## Multi-timeframe confirmation
+## Protective exits
 
-A buy signal on 1-minute bars inside an hourly downtrend is usually noise
-dressed up as an entry. Rather than guess, the strategy can re-run real
-detectors on genuinely coarser bars:
+Before any strategy signal, every open position is checked against the rules in
+`internal/exits`. A triggered exit always wins (force-sells):
 
-```yaml
-strategy:
-  htf_multiple: 15            # aggregate every 15 bars into one
-  htf_detectors: ["trend"]    # what to run on them (default: trend)
-  htf_mode: "gate"            # "gate" vetoes counter-trend signals; "vote" just adds an opinion
-```
+- `stop_loss_pct` — sell when price falls this far below entry
+- `take_profit_pct` — sell when price rises this far above entry
+- `trailing_stop_pct` — sell when price falls this far below the peak since entry
 
-Aggregation is by **bar count**, not wall-clock time, so it behaves identically
-whether the base bars are 1-minute live ticks or daily candles from a CSV, and
-the newest aggregate always ends on the newest bar (so the reading never
-flickers as a bucket fills). The cost is warmup: confirmation needs
-`htf_multiple` times as much history before it can say anything, and the
-strategy's warmup grows accordingly.
+Exits respect the trading toggle (recorded as dry-run when trading is off) and
+still pass through the risk manager. **Protective exits always go to market**
+regardless of the execution settings below: when a stop fires, filling matters
+more than filling well.
 
-## Profiles
-
-The settings above interact. A strategy that trades often needs different exits
-and different protections than one that waits for high conviction, and picking
-each knob independently is how people end up with a bot that takes 40 trades a
-day behind a 20% stop. A profile is a set of choices made *together*:
+**Volatility-adaptive stops.** A fixed 5% stop is far too tight on a volatile
+instrument — ordinary noise stops you out — and far too loose on a calm one. An
+ATR multiple is the same *statistical* distance on both:
 
 ```yaml
-profile: conservative   # conservative | balanced | aggressive
+exits:
+  atr_period: 14
+  atr_stop_mult: 2      # stop two ATRs below entry
+  atr_trail_mult: 3     # trail three ATRs below the peak
 ```
 
-It seeds strategy, exits, sizing and protections before the rest of your file is
-applied, so anything you set explicitly still wins. `BOT_PROFILE` does the same
-thing without a config file. A profile is a starting point to tune from — not a
-recommendation, and never a substitute for backtesting your own data.
+When both a percentage and an ATR multiple are set, the **wider** stop wins, so
+the percentage acts as a floor — a momentarily tiny ATR can't place the stop on
+top of the current price and guarantee an instant exit. With no ATR available
+yet, the percentage rules apply unchanged.
 
-## Crypto data
+**Time-decaying profit ladder (`roi`).** Demand a lot early, settle for less as
+a trade goes stale — the entry that hasn't worked in six hours probably isn't
+going to:
 
 ```yaml
-feed: "binance"            # public market data, no API key
-watchlist: ["BTCUSDT", "ETHUSDT"]
-broker: "sim"
+exits:
+  roi:
+    "0s":  0.10   # 10% straight away
+    "30m": 0.05   # after 30 minutes, 5% is enough
+    "2h":  0.02
+    "6h":  0      # after six hours, exit at any profit
 ```
 
-**Read-only, by design.** The bot can track, signal on, backtest and
-paper-trade crypto through Binance's public endpoints — but it places no crypto
-orders. An exchange execution adapter carries withdrawal-capable keys and can't
-be meaningfully tested without a funded account; shipping one that had never
-filled a real order would be worse than shipping none. Execution stays on the
-audited broker adapters.
+The ladder and `take_profit_pct` combine into whichever target is nearer.
 
-Crypto trades continuously, so the market-hours gate is a no-op for these
-symbols and warmup history is always available.
+**Two-stage trailing stop.** One trailing distance has to be two contradictory
+things at once: loose enough early that ordinary noise doesn't end a trade before
+it works, and tight enough late that a winner isn't handed back. So it is two:
+
+```yaml
+exits:
+  trailing_stop_pct: 0.10          # loose, while the trade is finding its feet
+  trailing_offset_pct: 0.05        # once up 5%…
+  trailing_tight_pct: 0.02         # …trail 2% below the peak instead
+  trailing_only_after_offset: false # true = no trail at all below the offset
+```
+
+With `trailing_only_after_offset`, the stop-loss is the only downside rule until
+the position is far enough ahead — use it when the trail exists to protect a
+gain, not to cap a loss. With no offset set, the trail behaves exactly as before.
+
+**Time barrier (`max_hold`).** The third barrier of the triple-barrier method:
+
+```yaml
+exits:
+  max_hold: 72h   # close unconditionally after three days
+```
+
+This closes a gap nothing else covers. The ROI ladder decays the profit *target*,
+so it can only ever exit at breakeven or better; a position sitting at −3% for
+three weeks trips no stop, meets no target, and quietly occupies a slot the next
+signal needed. `max_hold` exits it at whatever the market offers. A price barrier
+broken in the same bar always wins — that's the difference between filling at
+the stop and filling at the close.
+
+`max_hold` measures **wall clock** from the entry timestamp, not trading time:
+weekends, holidays and overnights all count. `720h` is 30 *calendar* days, about
+21 trading days; for 30 trading days use `~1000h`.
+
+That also makes it the only exit that can newly trigger while the venue is shut.
+Every other barrier is compared against a price, and out of hours the price cache
+is frozen at the last tick — a barrier that did not trip at the close will not
+trip overnight. The clock does not stop.
+
+**Exits defer while the venue is closed.** With `engine.market_hours_check: true`
+a triggered exit waits for the session to reopen instead of being submitted to a
+venue that cannot fill it. `checkExits` runs every `eval_interval`, so without
+this a barrier tripping on a Saturday resubmits every 30 seconds until Monday —
+thousands of rejected orders against a rate-limited broker. Nothing is lost by
+waiting: `max_hold` only grows, and a price barrier is re-tested at the open
+against a fresh quote rather than Friday's stale one. It also restores backtest
+parity, since historical candles only exist during sessions and the backtester
+could never fire a 03:00 Saturday exit in the first place. Symbols the exchange
+calendar does not recognise are treated as open, so a missing mapping can never
+strand a position.
+
+**Scale-out ladder (`partial_take_profit`).** Sell part of a position as it
+clears successive gains instead of holding all of it for one all-or-nothing exit:
+
+```yaml
+exits:
+  partial_take_profit:
+    - profit_pct: 0.05
+      sell_pct: 0.33   # a third off at +5%
+    - profit_pct: 0.12
+      sell_pct: 0.33   # another third at +12%
+```
+
+Each rung fires at most once per position, and fractions are of the **original**
+size — otherwise three 0.33 rungs would sell 70% of the position rather than all
+of it. A gap clearing several rungs takes all of them at once. Progress is
+persisted, so a restart mid-ladder doesn't re-sell a rung.
+
+Be clear about the trade: **scaling out trades expectancy for variance.** Taking
+a third off at +5% caps what that third can earn, and on the trades that would
+have run to +30% it costs real money. What it buys is that fewer trades round-trip
+all the way back to the stop. It is off by default; measure it in a backtest.
+
+The downside rules always outrank the ladder — a trailing stop tripping on the
+way back down from a rung closes the position rather than shaving it.
+
+> The live engine and the backtester call the **same** rule engine
+> (`internal/exits`), differing only in what they compare the levels against: a
+> live tick, or a bar's high and low. That's deliberate — two copies of "is this
+> position stopped out?" is how a backtest quietly stops describing the bot.
+
+## Protections
+
+Money limits cap what is at stake at any one moment. They cannot see *patterns*:
+a strategy that is wrong about a symbol four times in an hour, or one whose
+equity has slid 20% below its peak, is inside every per-order limit while it
+loses steadily. `internal/protect` watches outcomes over time and takes the bot
+off the field.
+
+```yaml
+protections:
+  enabled: true
+  cooldown_after_loss: 30m    # no new entry in a symbol for this long after a loss
+  stop_guard_trades: 4        # N protective stop-outs of one symbol...
+  stop_guard_lookback: 24h    # ...within this window...
+  stop_guard_lock: 4h         # ...locks that symbol for this long
+  max_drawdown_pct: 0.20      # halt ALL automated trading this far below the equity peak
+  max_daily_loss_pct: 0.08    # halt after losing this much of the day's starting equity
+
+  low_profit_trades: 4        # N closed trades in one symbol...
+  low_profit_lookback: 168h   # ...within this window (7 days)...
+  low_profit_min_pnl: 0       # ...netting no more than this...
+  low_profit_lock: 24h        # ...lock that symbol for this long
+```
+
+**The low-profit guard** catches a failure the others cannot see. The stop guard
+counts *stop-outs* — a symbol behaving unlike the backtest. The drawdown halt
+watches the whole account. Neither notices a symbol the strategy keeps trading to
+a small net loss: it trips no stop, moves the account very little, and just bleeds
+commission and spread. This one counts money, per symbol, over a window. It waits
+for `low_profit_trades` closes before judging — two losses on a strategy that wins
+six times in ten is ordinary, and locking on that would remove symbols for
+behaving exactly as designed. Set `low_profit_min_pnl` above zero to demand the
+symbol actually pays for itself rather than merely avoiding a loss.
+
+Two invariants: protections gate **entries only** — an exit is never blocked, so
+a cooldown can't trap you in a losing position — and a halt is **sticky**. It
+stays until `POST /api/protections/resume`, which also re-bases the drawdown peak
+to current equity. A protection that cleared itself on a timer would let an
+unattended bot walk straight back into whatever was draining the account.
+
+State and locks are at `GET /api/protections`; a single symbol can be released
+with `DELETE /api/protections/lock/:symbol`.
+
+### Giving up on a symbol (`drop_after_losses`)
+
+Every other per-symbol guard locks an instrument out for a while and then lets
+it back in. That is right for a bad patch and wrong for a bad match: some
+instruments simply do not suit the strategy, and a lockout that expires hands
+capital back to them every time it does.
+
+```yaml
+protections:
+  drop_after_losses: 8      # 0 = never
+```
+
+After that many **consecutive** losing closes the symbol is removed from the
+watchlist *and* its entry in `watchlist:` is commented out:
+
+```yaml
+watchlist:
+  - SAP.DE
+  # - MRVL   # dropped by drop_after_losses: 8 consecutive losing closes (max 8), 2026-09-12
+```
+
+The file edit is the point. Startup re-adds every symbol in `watchlist:`, so a
+drop that only changed the running state would be undone by the next restart.
+
+**Commented, never deleted.** A deletion is a decision you cannot see, review or
+reverse. A comment keeps the symbol, the reason and the date, and un-dropping it
+is removing one `#`.
+
+Three rules make it safe to leave on:
+
+- **A win or breakeven close resets the count**, so it only fires on a symbol
+  that is losing and not recovering.
+- **A symbol with an open position is never dropped** — that would strand it
+  with no exits, no trailing stop and no way to sell. The streak keeps counting
+  while held, so it drops on the close after the position is flat.
+- **It only edits its own `watchlist:` block.** A flow-style list
+  (`watchlist: [A, B]`) has no per-symbol line to comment, so it is refused with
+  a clear error rather than being reformatted.
+
+If you also use `autotune.on_loss`, set this well above it — the intent is
+"re-tune a few times, and give up only if that did not help". Both read one
+consecutive-loss counter, which resets only on a win, so `on_loss` re-tunes
+every N in a row while the count climbs toward this threshold. At the threshold
+the drop wins and no re-tune is requested.
+
+## Trading costs
+
+A commission model folds the true cost of trading into order sizing, the money
+limits and backtest P&L:
+
+```yaml
+costs:
+  commission_pct: 0.001   # 0.1% of notional
+  commission_flat: 1.0    # flat fee per order
+  commission_min: 2.0     # minimum per order
+```
+
+`commission = max(min, flat + pct × notional)`. Buys reserve cash for the fee
+(cash-reserve and daily-spend limits include it), the simulated broker debits it
+on every fill, and backtests report returns **net of costs**.
+
+**Friction** — the bid-ask spread and slippage — is charged on every simulated
+fill on top of commission:
+
+```yaml
+costs:
+  spread_pct: 0.0005    # FULL spread; half is paid on each fill
+  slippage_pct: 0.0002  # extra adverse move per fill
+  measure_spread: true  # …or estimate it per instrument instead
+```
+
+With `measure_spread`, each symbol is charged the spread estimated from its **own**
+bars rather than one number applied to everything. That matters on a mixed book:
+a megacap trades inside a basis point where a thin European ETF listing can cost
+twenty times that, and charging both the same flatters one and libels the other.
+The backtester measures from the series it was given; the live engine uses the
+figures the screener produced. **`spread_pct` remains a floor** — an estimate is
+evidence that the real cost is at least this high, not permission to assume a
+symbol is cheaper to trade than you budgeted for.
+
+## Autotune (unsupervised re-optimisation)
+
+**Off by default, and the only feature in this bot that rewrites your trading
+config without asking.** Read this section before enabling it.
+
+```yaml
+autotune:
+  enabled: false
+  interval: 24h             # restart-only to change; 0 also means 24h
+  bars: 1440                # candle window per symbol per run
+  min_trades: 10            # reject a candidate that barely traded
+  objective: "blend"        # what "better" means
+  min_return_pct: 0         # floor on the winner's own backtested return
+  run_only_for_symbols: []  # allow-list; empty = every watchlist symbol
+  exclude_symbols: []       # removed regardless of the allow-list
+  on_loss:
+    enabled: false
+    after_losses: 3         # consecutive losing closes that trigger a re-tune
+    cooldown: 6h            # minimum gap between reactive re-tunes per symbol
+```
+
+### What it does
+
+On each pass it runs the same bounded parameter search the UI's "optimize this
+symbol" button runs — then, unlike the button, **writes the winner straight
+into `strategy_overrides` and into the live engine**, with no confirmation
+step. The next evaluation trades the new parameters.
+
+### What stops a bad proposal
+
+Four gates, all of which must pass:
+
+| gate | rejects |
+|---|---|
+| `min_trades` | a config that only "won" because it barely traded |
+| `objective` | whichever candidate scores worst on your chosen metric |
+| `min_return_pct` | a winner that beat a weak baseline while still losing money |
+| dual baseline | a winner that beats an isolated backtest but not the symbol's **real** track record |
+
+That last one matters most. An isolated backtest hands one symbol the full
+account cash for the whole run — something live trading never does, since
+capital is shared across the watchlist. So a proposal must beat both the
+what-if *and* the symbol's actual history since the last autotune apply, on
+win rate and expectancy specifically.
+
+`min_trades` defaults to 10, deliberately stricter than the manual button's
+floor of 3: a thin sample is a smaller risk on a human-reviewed click than on
+an unsupervised, every-symbol, real-money scheduled write.
+
+### `objective` — what "better" means
+
+| value | ranks on |
+|---|---|
+| `blend` (default) | return and win rate, penalising drawdown |
+| `return` / `winrate` | exactly one of those, alone |
+| `sharpe` / `sortino` / `calmar` | risk-adjusted return |
+| `profitfactor` / `expectancy` | trade quality, independent of position size |
+
+An unrecognised value falls back to `blend` rather than failing the load. This
+only picks the search winner — the gate against real history always compares
+win rate and expectancy whatever you set here.
+
+### `on_loss` — reacting instead of waiting
+
+With `on_loss.enabled`, a symbol that closes `after_losses` trades in a row at
+a loss is re-tuned immediately rather than at the next scheduled pass.
+
+It adds **no new way to win**: a streak only decides *when* to look, and the
+proposal still has to clear all four gates above. `cooldown` bounds how often
+one symbol can trigger it.
+
+The loss counter resets only on a win, never on a tune — so it is "losses in a
+row", not "losses since we last acted". The same counter feeds
+`protections.drop_after_losses`, which is checked first and wins: a symbol bad
+enough to drop is dropped rather than re-tuned. See
+[Giving up on a symbol](#giving-up-on-a-symbol-drop_after_losses).
+
+### Scoping it
+
+`run_only_for_symbols` is an allow-list; empty means every watchlist symbol.
+`exclude_symbols` is applied afterwards, so a symbol in both lists is excluded
+— which is how you keep a hand-tuned override out of the scheduler's reach
+without maintaining an allow-list of everything else.
+
+### Before you enable it
+
+- `interval` and the bar window are **restart-only**; the ticker is built once
+  when the background goroutine starts.
+- A symbol with fewer cached bars than the search needs is skipped for that
+  run, silently.
+- Only one search runs at a time process-wide, shared with the manual button.
+  A reactive `on_loss` request that arrives while the slot is busy is
+  **dropped, not queued**.
+- Everything it writes is visible in `strategy_overrides` in your config file
+  and in the UI's per-symbol view. If you do not recognise a parameter there,
+  autotune put it there.
+
+## Test mode (simulated trading over the real feed)
+
+```yaml
+test_mode:
+  enabled: false
+  duration: 48h           # 0 also means 48h
+```
+
+Test mode runs the whole decision path — live prices, real signals, real
+sizing and risk checks — but swaps the broker for an in-memory simulator
+**seeded from your actual account**: its cash and its open positions, at the
+moment the window starts. It reverts to the real broker on its own when
+`duration` expires.
+
+It is the honest middle ground between `trading_enabled: false` (which
+computes signals but never exercises the order path at all) and live trading.
+Orders are placed, filled and closed, so `keep_interval`, the exit ladders and
+realized P&L all behave as they will for real.
+
+Fills use your configured cost model — commission, spread and slippage — so a
+simulated result is not flattered by frictionless fills.
+
+Trades taken in a window are marked `Simulated` in the trade log, so they never
+get confused with real fills.
+
+Two things it refuses to do:
+
+- **It will not start while a protection halt is active.** Resume the halt
+  deliberately first, rather than letting a fresh simulated window paper over a
+  real one.
+- **It ends early if the trade-rate circuit breaker trips.** A bot placing
+  orders fast enough to trip it is not one worth continuing to exercise.
+
+Start and stop it from the UI, or set `enabled: true` to open a window
+automatically at startup.
+
+## Notifications
+
+An unattended bot that can only be observed by opening its web UI is one you
+will not observe.
+
+```yaml
+notify:
+  enabled: true
+  events: ["trade", "halt", "error"]   # also "blocked" (noisy)
+  min_notional: 0                      # suppress fill alerts below this order value
+
+  webhook: ""                          # any URL — gets the event as a JSON POST
+  discord_webhook: ""
+  telegram_token: ""
+  telegram_chat_id: ""
+
+  pushover_token: ""                   # application/API token from pushover.net
+  pushover_user: ""                    # user or group key
+  pushover_device: ""                  # optional: one device only
+  pushover_priority: 0                 # -2 silent … 1 high; halts/errors get +1
+
+  apprise_url: ""                      # Apprise API server endpoint
+  apprise_services: ""                 # stateless mode: comma-separated service URLs
+  apprise_tag: ""                      # stored config: which entries to notify
+```
+
+| Sink | Reaches |
+|------|---------|
+| `webhook` | anything that accepts a JSON POST (Slack, Mattermost, n8n, your own script) |
+| `discord_webhook` | a Discord channel |
+| `telegram_*` | a Telegram chat, via a bot |
+| `pushover_*` | phones, with a real title and priority — a halt can bypass quiet hours while a routine fill doesn't |
+| `apprise_*` | the ~100 services [Apprise](https://github.com/caronc/apprise) supports — email, Matrix, ntfy, Gotify, Signal, SMS — through one [Apprise API](https://github.com/caronc/apprise-api) server, so this repo doesn't need an adapter per service |
+
+Every configured sink gets every subscribed event; a sink needing two
+credentials stays inactive until both are set. Apprise takes either a stored
+configuration (`http://apprise:8000/notify/mykey`) or the stateless endpoint
+(`http://apprise:8000/notify` plus `apprise_services`), and event kinds map onto
+Apprise's own types (trade→success, blocked→warning, halt/error→failure).
+
+Pushover's priority 2 (emergency, repeats until acknowledged) is deliberately
+unreachable: it needs a retry/expire and acknowledgement flow, and a trading bot
+that can wake you every 30 seconds until you tap a button is a footgun.
+
+Delivery never blocks trading: events are queued and sent by a background
+worker, and dropped when the queue backs up — a slow chat server must not slow
+the trading loop. Counters (sent / failed / dropped) are at `GET /api/notify`,
+and failures land in `GET /api/errors` under source `notify`. Env overrides:
+`BOT_NOTIFY_WEBHOOK`, `BOT_NOTIFY_DISCORD`, `BOT_NOTIFY_TELEGRAM_TOKEN`,
+`BOT_NOTIFY_TELEGRAM_CHAT`, `BOT_NOTIFY_PUSHOVER_TOKEN`,
+`BOT_NOTIFY_PUSHOVER_USER`, `BOT_NOTIFY_APPRISE_URL`.
 
 ## Persistence
 
@@ -1445,6 +2190,71 @@ shutdown): a buy writes the symbol, quantity, entry price/time and trailing-stop
 high-water mark; a closing sell deletes the row. So after a crash or restart the
 bot still knows exactly what is open — including the trailing-stop peak — even
 for the in-memory simulated broker. View them at `GET /api/open`.
+
+## Order rate limiting and the circuit breaker
+
+```yaml
+safety:
+  max_orders_per_min: 10      # trip the breaker above this rate (0 = off)
+  min_order_interval: 1100ms  # minimum gap between submissions
+```
+
+Two different protections against a bot that has started misbehaving
+mechanically — as opposed to `protections:`, which watches whether it is
+*losing money*.
+
+### `max_orders_per_min` — the circuit breaker
+
+A runaway loop is the failure mode that costs the most the fastest. If the
+engine submits this many orders inside a rolling minute, the breaker trips and
+**automated trading is switched off**: not throttled, not delayed, off. It
+stays off until you re-enable it deliberately from the UI or the API.
+
+Tripping also records a `halted` trade record with the reason, logs at `Error`,
+and ends any active [test mode](#test-mode-simulated-trading-over-the-real-feed)
+window.
+
+**It only counts automated orders.** Orders you place by hand through the API
+or the UI pass through unguarded — if you are clicking the button, you already
+know how many orders you are placing.
+
+Set it low enough that normal operation never approaches it. With
+`eval_interval: 30s` and a handful of watchlist symbols, a healthy bot places
+orders in ones and twos per minute, not tens.
+
+### `min_order_interval` — pacing
+
+The minimum gap the **Saxo** adapter leaves between submissions. Saxo enforces
+roughly one order per second per session and rejects bursts, so the default of
+1100ms sits just outside it.
+
+It is a pace, not a limit: orders queue behind it rather than being refused.
+The other adapters do their own pacing internally (Trading 212 per endpoint
+group, Alpaca not at all), so this setting reaches only Saxo.
+
+> These two are also what satisfies the "throttle rapid orders" and "stop if
+> trades exceed a limit" items on Saxo's live-application checklist — see
+> [Automated-trading safety](#automated-trading-safety-saxo-live-cert-mapping).
+
+## Automated-trading safety (Saxo live-cert mapping)
+
+Controls that satisfy Saxo's live-application checklist:
+
+| Requirement | Where |
+|-------------|-------|
+| Throttle rapid orders | Saxo adapter paces orders to `safety.min_order_interval` (~1/sec, Saxo's session limit) |
+| Stop if trades/time exceeds a limit | engine **circuit breaker**: `safety.max_orders_per_min` trips and **halts** automated trading |
+| Prevent invalid orders | reject wrong side, negative/NaN/Inf qty, bad limit price (broker) + money limits clamp oversized orders (risk) |
+| Handle rejections gracefully | broker errors are caught, recorded as `error` trades, and never crash the engine |
+| Final confirmation / dry run | `engine.trading_enabled: false` computes and shows signals without placing orders |
+| Daily review of activity | every decision persisted to SQLite + `GET /api/trades` |
+| Win/loss performance tracking | realized P&L + win/loss recorded on every closing sell, with the entry/exit detector snapshots preserved for later analysis — `GET /api/stats` and the "Trade performance" panel in the web UI |
+| Order types & combinations | native **bracket** (entry + stop-loss + take-profit), **modify** and **cancel** via the `/api/orders/*` endpoints (Saxo `AdvancedBroker`) |
+
+The automated engine places **day market orders** and manages exits itself, but
+the API also exposes **native Saxo bracket/OCO orders with modify & cancel**, so
+the multi-leg order-type scenarios can be exercised directly. Bracket entries
+still pass through the money-limit risk manager and order-rate guard.
 
 ## Backtesting
 
@@ -1701,258 +2511,6 @@ iteration prefer `-random 300`-ish and a few thousand bars over a giant grid on
 > Optimise on **real** history and hold back a period for out-of-sample
 > checking — grid-search on one dataset will happily overfit.
 
-## Money limits (the hard requirement)
-
-Every order — automated **and** manual — passes through `risk.Manager.Authorize`,
-which clamps order size down to fit and **fails closed** (rejects) if a limit
-has no headroom:
-
-- `max_order_value` — notional cap per single order
-- `max_per_position` — market-value cap per symbol
-- `max_total_invested` — cap on total invested across all positions
-- `max_daily_spend` — rolling per-day buy-notional cap
-- `cash_reserve` — cash that must stay uninvested
-- `max_open_positions` — cap on distinct symbols held
-
-The bot refuses to start with trading enabled unless `max_order_value` and
-`max_total_invested` are set.
-
-### Limits that scale with the account
-
-Every money limit above has a `_pct` twin taking a **fraction of current
-equity** instead of a fixed amount. `0` means "not set" for either half, and
-when both are set the **tighter** one binds. That gives three modes:
-
-| written as | behaviour |
-|---|---|
-| `max_total_invested: 950` | fixed ceiling, whatever the account does |
-| `max_total_invested_pct: 0.95` | scales with the account forever |
-| **both** | **"use 95%, up to 5000"** — scales while small, then stops |
-
-The third is usually the one you want:
-
-```yaml
-limits:
-  max_total_invested: 5000       # never more than 5000...
-  max_total_invested_pct: 0.95   # ...and never more than 95% of equity
-```
-
-| equity | resolves to | binding half |
-|---|---|---|
-| 1,000 | 950 | 95% of equity |
-| 5,000 | 4,750 | 95% of equity |
-| 6,000 | 5,000 | the 5000 ceiling (crossover ≈ 5,263) |
-| 50,000 | 5,000 | the 5000 ceiling |
-
-A fixed amount goes stale the moment the account grows — 950 is the whole book
-at 1000 equity and 9.5% of it at 10000, and nothing says so. Set the amounts to
-`0` and use percentages alone and the book scales itself:
-
-```yaml
-limits:
-  max_total_invested: 0
-  max_total_invested_pct: 0.95
-  max_per_position: 0
-  max_per_position_pct: 0.20
-  max_order_value: 0
-  max_order_value_pct: 0.20
-  cash_reserve: 0
-  cash_reserve_pct: 0.05
-```
-
-Position *sizing* already scaled: `max_pct_per_asset_class` and
-`min_positions_per_asset_class` are fractions, so a slot is a constant share of
-equity at any account size. These limits were what stopped that reaching the
-order.
-
-> **`cash_reserve_pct` resolves the other way.** It is a floor, not a ceiling,
-> so the **larger** of the two halves wins — the more conservative reserve. The
-> ceilings take the smaller. Resolving the reserve like a ceiling would leave a
-> grown account with a token buffer.
-
-Equity includes unrealised P&L, so a winning book raises its own limits and
-buys more near the top — that is what a percentage allocation means. The other
-direction is harmless: tighter limits gate buys only, never exits.
-
-**Spreading capital across positions:** set `engine.min_positions: N` so no
-single buy takes more than its share of what can actually be invested. `0`
-leaves the per-class slots (`portfolio.min_positions_per_asset_class`) to do
-it. Editable live in the UI ("Position sizing") or via `PUT /api/sizing`.
-
-## Automated-trading safety (Saxo live-cert mapping)
-
-Controls that satisfy Saxo's live-application checklist:
-
-| Requirement | Where |
-|-------------|-------|
-| Throttle rapid orders | Saxo adapter paces orders to `safety.min_order_interval` (~1/sec, Saxo's session limit) |
-| Stop if trades/time exceeds a limit | engine **circuit breaker**: `safety.max_orders_per_min` trips and **halts** automated trading |
-| Prevent invalid orders | reject wrong side, negative/NaN/Inf qty, bad limit price (broker) + money limits clamp oversized orders (risk) |
-| Handle rejections gracefully | broker errors are caught, recorded as `error` trades, and never crash the engine |
-| Final confirmation / dry run | `engine.trading_enabled: false` computes and shows signals without placing orders |
-| Daily review of activity | every decision persisted to SQLite + `GET /api/trades` |
-| Win/loss performance tracking | realized P&L + win/loss recorded on every closing sell, with the entry/exit detector snapshots preserved for later analysis — `GET /api/stats` and the "Trade performance" panel in the web UI |
-| Order types & combinations | native **bracket** (entry + stop-loss + take-profit), **modify** and **cancel** via the `/api/orders/*` endpoints (Saxo `AdvancedBroker`) |
-
-The automated engine places **day market orders** and manages exits itself, but
-the API also exposes **native Saxo bracket/OCO orders with modify & cancel**, so
-the multi-leg order-type scenarios can be exercised directly. Bracket entries
-still pass through the money-limit risk manager and order-rate guard.
-
-## Quick start
-
-```bash
-go run ./cmd/bot                         # runs offline (mock feed + sim broker)
-# optional: copy data/config.example.yaml to data/config.yaml to customise;
-# defaults run without one
-```
-
-### Docker
-
-Prebuilt multi-arch images (amd64 + arm64) are published to Docker Hub at
-[kellerman81/go_finance_bot](https://hub.docker.com/r/kellerman81/go_finance_bot)
-on every release — no checkout or build needed:
-
-```bash
-docker run -d --name go_finance_bot \
-  -p 8080:8080 \
-  -v "$PWD/data:/app/data" \
-  kellerman81/go_finance_bot:latest
-curl localhost:8080/health
-```
-
-Or in [docker-compose.yml](docker-compose.yml), drop the `build:` block and set
-`image: kellerman81/go_finance_bot:latest`. Pin a version tag (e.g. `:1.2`)
-instead of `:latest` for reproducible deployments.
-
-Alternatively build it yourself: a multi-stage [Dockerfile](Dockerfile) compiles
-a static, CGO-free binary into a small Alpine image;
-[docker-compose.yml](docker-compose.yml) builds and runs it:
-
-```bash
-docker compose up --build -d        # build + start
-docker compose logs -f              # follow logs
-curl localhost:8080/health
-docker compose down                 # stop
-```
-
-- A **single mounted directory** `./data` holds *both* `config.yaml` and the
-  SQLite DB — edit `data/config.yaml` on the host; the DB persists in the same
-  dir, so trades and **open positions survive container restarts**. Nothing is
-  baked into the image.
-- A `/health` healthcheck and `restart: unless-stopped` keep it running.
-
-Config lives at **`data/config.yaml`** (the default `-config` path); the DB
-location comes from `storage.path` (or `BOT_STORAGE_PATH`) — `data/finance_bot.db`
-in the shipped config; without any config file the built-in default is
-`./finance_bot.db`. The same layout is used for local runs.
-
-Out of the box it runs **fully offline**: a synthetic price feed and an
-in-memory simulated broker, with `trading_enabled: false` (dry-run — signals are
-computed and shown but no orders are placed).
-
-### Going live (paper first!)
-
-1. Get a free [Finnhub](https://finnhub.io) API key → set `finnhub.api_key`
-   (or `FINNHUB_API_KEY`).
-2. Pick a broker via `broker:` and provide its credentials (below).
-3. Flip `engine.trading_enabled: true` only when you trust the signals.
-
-The `broker` setting selects the execution venue — the `Broker` interface means
-the rest of the bot is unchanged:
-
-| `broker` | Venue | Setup |
-|----------|-------|-------|
-| `sim` | offline simulator | nothing — uses `alpaca.sim_cash` as starting balance |
-| `alpaca` | Alpaca (US) | set `alpaca.key_id`/`secret_key`, `base_url` (paper endpoint by default) |
-| `saxo` | **Saxo Bank OpenAPI (EU)** | set `saxo.token` (or `SAXO_TOKEN`); `base_url` defaults to the simulation gateway |
-| `trading212` | **Trading 212 (EU)** | set `trading212.api_key` + `trading212.secret` (or `T212_API_KEY`/`T212_SECRET`); `base_url` defaults to the demo endpoint |
-
-#### Trading 212 (EU, no approval)
-
-1. In the Trading 212 app → **Settings → API (Beta)**, generate an **API key +
-   secret** (self-service, **no app-approval gate** — unlike Saxo live; available
-   for Invest and Stocks ISA accounts, not CFD/SIPP). The secret is shown **only
-   once** — store it. Set `broker: trading212`, `trading212.api_key` +
-   `trading212.secret` (or `T212_API_KEY`/`T212_SECRET`). They are sent as HTTP
-   Basic auth (`Authorization: Basic base64(key:secret)`).
-2. Starts on the **demo** endpoint (`https://demo.trading212.com/api/v0`); switch
-   `base_url` to `https://live.trading212.com/api/v0` for real money. The key is
-   tied to its environment, so the base URL must match the key.
-3. The adapter resolves plain symbols (`AAPL`) to Trading 212 tickers
-   (`AAPL_US_EQ`) via instrument metadata, supports fractional shares, and paces
-   requests to respect the API's strict per-endpoint rate limits.
-4. Order capabilities: market orders, plus **list working orders** (`GET
-   /api/orders/open`) and **cancel** (`DELETE /api/orders/:id`). It has no native
-   bracket/OCO or order-modify, so those `/api/orders/*` endpoints return a clear
-   "not supported" for Trading 212 (use Saxo for native brackets).
-5. **Symbol mapping**: watchlist symbols are resolved to Trading 212 tickers via
-   the instrument metadata, handling exchange suffixes and ISINs — e.g.
-   `LXS.DE → LXSd_EQ` (German listing), `SAP.DE → SAPd_EQ` (the German SAP, not
-   Canadian "Saputo"), `AAPL → AAPL_US_EQ`. When an instrument has several
-   currency listings, `trading212.preferred_currency` (default `EUR`) picks one.
-   For instruments not resolvable by ticker, map them to an ISIN:
-   ```yaml
-   trading212:
-     preferred_currency: "EUR"
-     isins:
-       CSPXJ.SW: "IE00B52MJY50"   # -> the EUR listing
-       UNPRF:    "GB00BVZK7T90"
-   ```
-   Check what your watchlist can trade with `GET /api/orderable`. Note EU retail
-   accounts can't buy US-domiciled ETFs (e.g. `SPY`, `VOO`) on Trading 212 — they
-   show as not orderable regardless.
-
-> Trading 212's API has **no market-data stream** and is heavily rate-limited, so
-> keep Finnhub for near-real-time tracking and use Trading 212 only for execution.
-> The adapter is built to the documented API and unit-tested for request shape,
-> but validate on the demo endpoint with your own key before live use.
-
-#### Saxo (EU)
-
-1. Sign in at [developer.saxo](https://www.developer.saxo) and copy a **24-hour
-   simulation token** → set `saxo.token` (or `SAXO_TOKEN`), `broker: saxo`.
-2. On start the bot resolves your account via `/port/v1/accounts/me`, maps each
-   ticker to a Saxo **Uic** via instrument search (`asset_types: "Stock,Etf"`),
-   and submits day market orders. Saxo trades **whole shares**, so fractional
-   sizes are floored — set `limits.max_order_value` accordingly.
-3. For live trading, swap `saxo.base_url` to
-   `https://gateway.saxobank.com/openapi`. **The token environment and the
-   gateway must match** — a SIM token on the live gateway (or vice versa) returns
-   `401`.
-
-**Auth modes** (`saxo.auth_mode`):
-
-- **`token`** (default) — a static bearer token. Fine for the 24-hour SIM token,
-  but it must be replaced by hand when it expires.
-- **`certificate`** — unattended live auth with **no daily re-paste**. The bot
-  signs a JWT assertion (RS256) with your Saxo certificate and exchanges it for
-  an access token via the `personal-jwt` grant, then auto-refreshes in the
-  background. Requires an **approved live application + certificate** from Saxo
-  (request via [developer.saxo](https://www.developer.saxo) → link your live
-  account → download the certificate from MyAccount). Configure:
-
-  ```yaml
-  saxo:
-    auth_mode: "certificate"
-    app_key:   "<live client_id>"
-    app_secret: "<live client_secret>"   # or SAXO_APP_SECRET
-    app_url:   "<registered app URL>"     # JWT "spurl" claim
-    user_id:   "<user the cert is for>"   # JWT "sub" claim
-    cert_path: "saxo.p12"                 # .p12/.pfx or PEM cert+key
-    cert_password: "<pw>"                 # or SAXO_CERT_PASSWORD
-    base_url:  "https://gateway.saxobank.com/openapi"
-  ```
-
-> The 24-hour SIM token expires daily and the adapter surfaces a clear `401`
-> (now naming the token/gateway mismatch). Certificate auth avoids this.
-> The crypto path (cert loading, JWT signing) is unit-tested, but the live token
-> exchange and order placement should be validated against your own Saxo
-> credentials before relying on them.
-
-> Live money (any broker): the money limits still apply to every order. Prove
-> the strategy in paper/sim first.
-
 ## Web UI
 
 Two interfaces are served, in parallel, from the same binary:
@@ -2178,3 +2736,4 @@ curl -X POST localhost:8080/api/trading -d '{"enabled":true}'
 - Natural extensions: per-symbol strategy parameters, an options/futures asset
   class, and portfolio-level correlation limits (nothing currently stops the bot
   holding twenty names that all move together).
+
