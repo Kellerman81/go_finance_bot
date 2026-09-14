@@ -65,10 +65,17 @@ func (e *Engine) PlaceBracket(
 		return broker.BracketResult{}, errors.New("order rate limited")
 	}
 
-	e.met.onOrder()
+	// Hold this entry's estimated cash cost against risk.Manager's headroom
+	// for the round trip to the broker — see risk.Manager.Reserve.
+	var resID uint64
+	if b.Side == broker.Buy {
+		resID = e.rm.ReserveBuy(b.Qty, price)
+	}
 
 	res, err := ab.PlaceBracket(ctx, b)
 	if err != nil {
+		e.rm.Release(resID)
+
 		e.record(TradeRecord{
 			Time: time.Now(), Symbol: b.Symbol, Side: b.Side, Qty: b.Qty,
 			Price: price, Status: "error", Reason: "bracket", Err: err.Error(),
@@ -77,8 +84,11 @@ func (e *Engine) PlaceBracket(
 		return res, err
 	}
 
+	e.met.onOrder() // count only orders the broker accepted
+
 	if b.Side == broker.Buy {
 		e.rm.RecordBuy(b.Qty * price)
+		e.rm.Release(resID)
 		e.persistSpend()
 	}
 
@@ -93,6 +103,13 @@ func (e *Engine) PlaceBracket(
 }
 
 // ModifyOrder changes a working order via the broker.
+//
+// A modification is authorized exactly like a fresh order at the requested
+// quantity/price: without this, PATCH /api/orders/:id was the one
+// order-placement path with no money-limit check at all — every other path
+// (ManualOrder, PlaceBracket, the strategy's own act()) passes through
+// rm.Authorize first. See CODE_REVIEW_FINDINGS.md's PATCH-skips-
+// authorization finding.
 func (e *Engine) ModifyOrder(
 	ctx context.Context,
 	m broker.OrderModification,
@@ -104,6 +121,35 @@ func (e *Engine) ModifyOrder(
 			e.brk.Name(),
 		)
 	}
+
+	price := m.Price
+	if price <= 0 {
+		if p, ok := e.prices.Get(m.Symbol); ok {
+			price = p
+		}
+	}
+
+	if price <= 0 {
+		return broker.OrderResult{}, fmt.Errorf("no price for %s to authorize the modification", m.Symbol)
+	}
+
+	snap := e.pf.Snapshot()
+	if m.Side == broker.Buy {
+		snap = e.pendingExposure(snap)
+	}
+
+	authOrder, decision := e.rm.Authorize(
+		broker.Order{Symbol: m.Symbol, Side: m.Side, Qty: m.Qty, Type: m.Type}, price, snap)
+	if !decision.Approved {
+		e.record(TradeRecord{
+			Time: time.Now(), Symbol: m.Symbol, Side: m.Side, Price: price,
+			Status: "blocked", Reason: "modify: " + decision.Reason,
+		})
+
+		return broker.OrderResult{}, fmt.Errorf("blocked by risk: %s", decision.Reason)
+	}
+
+	m.Qty = authOrder.Qty
 
 	res, err := ab.ModifyOrder(ctx, m)
 	if err != nil {

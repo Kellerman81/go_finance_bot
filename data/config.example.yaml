@@ -1,0 +1,1162 @@
+# Example configuration — copy to data/config.yaml and fill in your own values.
+# Everything here runs OFFLINE out of the box: mock price feed, simulated
+# broker, trading disabled (dry-run). No secrets are required to start.
+#
+# ⚠️ WARNING: trading happens entirely at your own risk. This software can lose
+# money; the authors accept no responsibility for any losses. Prove a strategy
+# in paper/sim first and never trade money you cannot afford to lose.
+#
+# Secrets can also come from environment variables (which override this file):
+# FINNHUB_API_KEY, ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
+# ALPACA_USE_SIM, BOT_BROKER, SAXO_TOKEN, SAXO_BASE_URL, SAXO_APP_SECRET,
+# SAXO_CERT_PASSWORD, T212_API_KEY, T212_SECRET, T212_BASE_URL,
+# BOT_SERVER_ADDR, BOT_AUTH_TOKEN, BOT_PROFILE,
+# BOT_NOTIFY_WEBHOOK, BOT_NOTIFY_DISCORD, BOT_NOTIFY_TELEGRAM_TOKEN,
+# BOT_NOTIFY_TELEGRAM_CHAT, BOT_NOTIFY_PUSHOVER_TOKEN, BOT_NOTIFY_PUSHOVER_USER,
+# BOT_NOTIFY_APPRISE_URL,
+# BOT_AI_ENABLED, BOT_AI_PROVIDER, BOT_AI_BASE_URL, BOT_AI_MODEL, BOT_AI_API_KEY.
+
+# Optional profile ("conservative" | "balanced" | "aggressive", or BOT_PROFILE)
+# seeds a coherent set of strategy/exit/protection settings before everything
+# else in this file is applied — anything set explicitly below still wins.
+# Empty (the default) = no profile, just the settings in this file.
+# profile: ""
+
+server:
+  addr: ":8080"                # HTTP listen address for the API + web UI
+  # When set, every /api request must present this token — as
+  # "Authorization: Bearer <token>" or a ?token= query parameter (SSE stream).
+  # Empty disables auth. Set it (or BOT_AUTH_TOKEN) before exposing the port
+  # beyond localhost: the API can place orders and toggle live trading.
+  auth_token: ""
+
+# Market-data source: "" = auto (Finnhub when finnhub.api_key is set, otherwise
+# the offline mock feed), or "binance" for public crypto data.
+#
+# Crypto data is READ-ONLY: the bot can track, signal on, backtest and paper-trade
+# it, but places no crypto orders — so "binance" only makes sense with
+# broker: sim. Orders always go to the broker selected below.
+feed: ""
+binance_base_url: ""                # override the public host (e.g. api.binance.us
+                                    # where api.binance.com is geo-blocked)
+
+finnhub:
+  api_key: ""                       # free key from https://finnhub.io — leave empty to run on the offline mock feed
+  rest_base: "https://finnhub.io/api/v1"
+  ws_base: "wss://ws.finnhub.io"
+
+# Execution venue: "sim" (offline simulator), "alpaca" (US), "saxo" (EU) or
+# "trading212" (EU).
+broker: "sim"
+
+alpaca:
+  key_id: ""                        # API key ID     (or set ALPACA_KEY_ID)
+  secret_key: ""                    # API secret key (or set ALPACA_SECRET_KEY)
+  base_url: "https://paper-api.alpaca.markets"  # paper trading endpoint
+  paper: true
+  use_sim: true                     # true => internal simulator, no Alpaca calls
+  sim_cash: 100000                  # starting cash for the simulator
+  preferred_currency: ""            # empty = report in the account's native currency
+
+# Saxo Bank OpenAPI (EU broker).
+# IMPORTANT: the token environment and base_url MUST match.
+#   SIM  token  -> base_url https://gateway.saxobank.com/sim/openapi
+#   LIVE token  -> base_url https://gateway.saxobank.com/openapi
+# auth_mode:
+#   "token"       static bearer token (e.g. the 24h SIM token from
+#                 developer.saxo) — must be replaced by hand when it expires.
+#   "certificate" unattended live auth: signs a JWT with your certificate and
+#                 auto-refreshes — no daily re-paste. Requires an approved live
+#                 application + certificate from Saxo (developer.saxo / MyAccount).
+saxo:
+  auth_mode: "token"
+  token: ""                         # OAuth bearer token (or set SAXO_TOKEN)
+  base_url: "https://gateway.saxobank.com/sim/openapi"   # SIM gateway
+  account_key: ""                   # optional; empty => first account
+  asset_types: "Stock,Etf"          # instrument-search scope for ticker -> Uic
+  preferred_currency: ""            # empty = report in each instrument's own currency
+
+  # --- certificate-based auth (set auth_mode: "certificate") ---
+  app_key: ""                       # live application client_id
+  app_secret: ""                    # live application client_secret (or SAXO_APP_SECRET)
+  app_url: ""                       # registered application URL (JWT "spurl" claim)
+  user_id: ""                       # user the certificate is issued for (JWT "sub")
+  auth_url: ""                      # empty => derived from base_url (sim/live)
+  cert_path: ""                     # path to .p12/.pfx or PEM cert+key
+  cert_password: ""                 # certificate password (or SAXO_CERT_PASSWORD)
+
+# Trading 212 (EU). Self-service API key + secret — generate them in the
+# Trading 212 app (Settings -> API (Beta)), NO app approval needed. Start on
+# the demo endpoint.
+#   demo: https://demo.trading212.com/api/v0   live: https://live.trading212.com/api/v0
+# The key is tied to its environment, so base_url must match the key.
+# Note: the API has strict per-endpoint rate limits and no market-data stream,
+# so keep Finnhub for tracking and use Trading 212 only for execution.
+trading212:
+  api_key: ""                       # API key    (or set T212_API_KEY)
+  secret: ""                        # API secret (or set T212_SECRET) — sent as Basic auth
+  base_url: "https://demo.trading212.com/api/v0"  # demo by default; switch to
+                                     # the live URL above once you trust the setup
+  preferred_currency: "EUR"         # pick the EUR listing when an instrument has several
+  # Map watchlist symbols that aren't resolvable by ticker to their ISIN, e.g.:
+  # isins:
+  #   LEM.PA: "FR0010429068"
+
+# A few hundred symbols are supported; this is a small starter set.
+watchlist:
+  - AAPL
+  - MSFT
+  - NVDA
+  - QQQ
+  - SAP.DE
+  - SIE.DE
+
+# Hard money limits — enforced on EVERY order (automated and manual).
+#
+# Each one can be written as a FIXED AMOUNT, as a FRACTION OF EQUITY, or as
+# BOTH. 0 means "not set" for either half. The three modes:
+#
+#   amount only        a fixed ceiling, whatever the account does.
+#                        max_total_invested: 950
+#
+#   percentage only    scales with the account forever, no edits ever.
+#                        max_total_invested_pct: 0.95
+#
+#   BOTH               "use 95% of equity, up to 5000" — scales while the
+#                      account is small, then stops at a hard ceiling.
+#                        max_total_invested: 5000
+#                        max_total_invested_pct: 0.95
+#
+# That third mode is usually the one you want, and it is just the tighter of
+# the two halves winning. Worked through:
+#
+#      equity   max_total_invested   which half binds
+#       1,000              950.00    95% of equity
+#       5,000            4,750.00    95% of equity
+#       6,000            5,000.00    the 5000 ceiling   <- crossover ~5,263
+#      50,000            5,000.00    the 5000 ceiling
+#
+# Why the percentages exist: a fixed amount goes stale the moment the account
+# grows. 950 is the whole book at 1000 equity and 9.5% of it at 10000, and
+# nothing tells you. Percentages track the account with no edits.
+#
+# Position SIZING already scales on its own — max_pct_per_asset_class and
+# min_positions_per_asset_class are fractions, so a slot is a constant share of
+# equity at any account size. These limits are what stops that reaching the
+# order, which is why they are the half that needed percentages.
+#
+# NOTE the direction: the ceilings take the SMALLER of the two halves, but
+# cash_reserve is a FLOOR and takes the LARGER — the more conservative reserve
+# wins, or a growing account would end up with a token reserve.
+#
+# max_order_value and max_total_invested must have at least one half > 0 when
+# trading is enabled.
+limits:
+  max_total_invested: 10000   # cap on total market value of all positions
+  max_total_invested_pct: 0   # ...or as a fraction of equity (0.95 = 95%)
+  max_per_position: 1000      # cap per single symbol
+  max_per_position_pct: 0     # ...or as a fraction of equity (0.20 = 20%)
+  max_order_value: 500        # cap on a single order's notional value
+  max_order_value_pct: 0      # ...or as a fraction of equity (0.20 = 20%)
+  max_daily_spend: 2000       # cap on cumulative buy notional per day
+  max_daily_spend_pct: 0      # ...or as a fraction of equity
+  cash_reserve: 100           # cash that must always remain uninvested
+  cash_reserve_pct: 0         # ...or as a fraction of equity (0.05 = 5%).
+                              # A FLOOR: the LARGER of the two wins.
+  max_open_positions: 50      # max distinct symbols held at once
+
+  # A book that scales itself, for reference. Written this way, an account
+  # growing from 1000 to 10000 needs no edits at all — every limit and every
+  # position slot moves with it:
+  #
+  #   max_total_invested: 0
+  #   max_total_invested_pct: 0.95
+  #   max_per_position: 0
+  #   max_per_position_pct: 0.20
+  #   max_order_value: 0
+  #   max_order_value_pct: 0.20
+  #   cash_reserve: 0
+  #   cash_reserve_pct: 0.05
+  #
+  # One caveat worth understanding: equity includes unrealised P&L, so a
+  # winning book raises its own limits and buys more near the top. That is
+  # what a percentage allocation means. The other direction is harmless —
+  # tighter limits gate buys only, never exits.
+
+strategy:
+  # Detectors to run. With more than one, their results are compared/merged.
+  # Available: ema_cross, rsi, macd, bollinger, vwap, atr, rvol, volume_profile,
+  #            trend, adx, stochastic, supertrend, donchian
+  detectors: ["ema_cross", "rsi", "macd", "trend"]
+  # Detector set for SELL decisions; empty => reuse the buy detectors above.
+  # Lets you exit on different indicators than you enter on.
+  detectors_sell: []
+  # How to merge multiple detectors:
+  #   majority  - act on the side with strictly more votes
+  #   unanimous - act only if all opinionated detectors agree (none opposes)
+  #   weighted  - act on the sign of the net (strength-weighted) score
+  combine: "majority"
+  # Separate merge mode for SELL decisions (empty => same as combine above).
+  # Lets you be strict to enter and quick to exit.
+  combine_sell: ""
+  # Minimum combined confidence (0..1) required to BUY; weaker => HOLD.
+  # Higher = fewer, higher-conviction trades (fewer losses). 0.30 ~ very selective.
+  min_strength: 0.25
+  # Minimum confidence to SELL. -1 => same as min_strength. A lower value lets
+  # the bot exit on a weaker signal than it needs to enter.
+  min_strength_sell: -1
+  # Per-detector strength multipliers used when combining (missing => 1.0).
+  # Lets a "weighted" combine trust some signals more; 0 or negative mutes a
+  # detector's strength contribution without removing its vote. E.g.:
+  # weights:
+  #   trend: 2.0    # count the regression trend double
+  #   rsi: 0.5
+
+  fast_ma: 12               # EMA crossover: fast/slow period (bars). Fast > slow => BUY
+  slow_ma: 26               # bias, fast < slow => SELL bias.
+  rsi_period: 14            # RSI lookback (bars)
+  rsi_overbought: 70        # RSI reading treated as overbought (favours SELL)
+  rsi_oversold: 30          # RSI reading treated as oversold (favours BUY)
+  rsi_mode: "midline"       # "midline" (graded, always votes) or "extremes" (only 30/70)
+  macd_fast: 12             # MACD: fast/slow EMA period for the MACD line...
+  macd_slow: 26
+  macd_signal: 9            # ...and the EMA period of its signal line (crossover = vote)
+  bb_period: 20             # Bollinger Bands
+  bb_stddev: 2
+  vwap_period: 20           # VWAP window
+  atr_period: 14            # ATR breakout
+  atr_mult: 1.5
+  rvol_period: 20           # Relative Volume
+  rvol_threshold: 1.5
+  vp_window: 120            # Volume Profile window
+  vp_buckets: 24
+  vp_value_area_pct: 0.7
+  adx_period: 14            # ADX trend strength (+DI/-DI direction)
+  adx_threshold: 25         # min ADX to vote a trend
+  stoch_k_period: 14        # Stochastic oscillator
+  stoch_d_period: 3
+  stoch_overbought: 80
+  stoch_oversold: 20
+  supertrend_period: 10     # Supertrend ATR lookback
+  supertrend_mult: 3        # ATR multiple for the flip band (larger = fewer flips)
+  donchian_period: 20       # Donchian breakout channel lookback
+
+  # Trend: a least-squares regression slope over up to a week of 1-minute bars,
+  # so buy/sell decisions follow the prevailing direction instead of reacting to
+  # the last bar or two. Uses all available bars up to trend_period.
+  trend_period: 1950        # lookback in bars (~1 US trading week of 1-min bars)
+  trend_threshold: 0.01     # min end-to-end move of the fitted line to count as a trend
+  trend_gate: true          # uptrend blocks SELLs, downtrend blocks BUYs (exits still fire)
+  # Optional SELL-only override: lets the exit veto react faster (a shorter
+  # period) or looser/stricter (a different threshold) than the BUY veto
+  # above, instead of sharing its long lookback. 0 (the default) inherits
+  # trend_period/trend_threshold for both.
+  trend_period_sell: 0      # 0 = inherit trend_period
+  trend_threshold_sell: 0   # 0 = inherit trend_threshold
+
+  # Deny gate: a short-term veto checked ONLY on a BUY that already passed
+  # every other gate — unlike combine/weights, it never adds a vote or nudges
+  # strength, it can only block. Two independent checks, either one denies;
+  # a <=0 period disables that specific check while leaving the other active.
+  # SELL is never denied (exits must never be blocked, same rule as
+  # trend_gate above and risk.Manager.Authorize).
+  deny_gate: false            # off by default; see the two checks below
+  # 1. False breakout: price is at/through a fresh N-bar high but relative
+  #    volume doesn't confirm it — a breakout without volume is the classic
+  #    false-breakout setup.
+  deny_breakout_period: 20            # short Donchian lookback (bars); 0 = off
+  deny_breakout_rvol_period: 0        # relative-volume lookback; 0 inherits deny_breakout_period
+  deny_breakout_rvol_threshold: 1.2   # min relative volume to trust the breakout
+  # 2. Overextension: a short %K is already at an extreme — buying into a
+  #    move that's already stretched this far on a short lookback is a
+  #    classic setup for an imminent pullback, regardless of what the
+  #    longer-period trend/momentum detectors say.
+  deny_reversal_stoch_period: 5       # short %K lookback (bars); 0 = off
+  deny_reversal_overbought: 85        # %K level past which a buy is denied
+
+  # Multi-timeframe confirmation: aggregate every N bars into one and read the
+  # larger trend there, so a 1-minute buy inside an hourly downtrend is vetoed.
+  # Aggregation is by BAR COUNT, not wall clock, so it behaves the same live and
+  # on any CSV. The cost is warmup: it needs htf_multiple times as much history.
+  htf_multiple: 0           # e.g. 15 = a 15-bar view of 1-minute bars (0/1 = off)
+  htf_detectors: ["trend"]  # what to run on the higher timeframe
+  htf_mode: "gate"          # "gate" vetoes counter-trend signals; "vote" just adds an opinion
+
+# Trading commission model — folded into order sizing, money limits and P&L.
+# commission = max(commission_min, commission_flat + commission_pct * notional)
+costs:
+  commission_pct: 0.001     # e.g. 0.001 = 0.1% of notional
+  commission_flat: 0.0      # flat fee per order
+  commission_min: 0.0       # minimum commission per order
+  # The costs that never appear on a statement but decide whether a strategy is
+  # profitable. A market buy lifts the offer and a market sell hits the bid, so
+  # half the spread is paid on EVERY fill; slippage is the rest of the gap
+  # between the price you decided on and the price you got. Ignoring them is the
+  # most common way a backtest flatters a strategy — an edge of 3 bps per trade
+  # is a losing strategy once a 5 bps spread is paid on both legs.
+  spread_pct: 0.0005        # full bid-ask spread as a fraction of price (5 bps)
+  slippage_pct: 0.0002      # extra adverse move per fill (2 bps)
+  # Estimate each instrument's spread from its OWN bars instead of applying the
+  # single number above to everything. One spread across a mixed book is wrong
+  # for every symbol in it: a megacap trades inside a basis point where a thin
+  # ETF listing can cost twenty times that. spread_pct stays a FLOOR - a
+  # measurement says the real cost is at least that high, never less.
+  measure_spread: false
+
+engine:
+  eval_interval: 30s          # how often signals are re-evaluated
+  bar_interval: 1m            # candle size built from live ticks (default 1m);
+                              # larger bars trade on coarser, less noisy candles
+  # Minimum gap between background broker polls (account/positions + working
+  # orders). Raise it for slow/rate-limited broker APIs — Trading 212 returns
+  # 500s under frequent polling, so 60s+ is recommended there. 0 = default
+  # (eval_interval/2 for the portfolio sync, 15s for the order reconcile).
+  # Order paths always force an immediate sync after a fill, so this never
+  # affects trade freshness — only the background refresh cadence.
+  sync_interval: 0s
+  # ⚠️ WARNING: setting trading_enabled: true places REAL orders on the
+  # configured broker (real money on a live endpoint). By enabling it you accept
+  # all risk of financial loss — see the risk warning in the README. Prove your
+  # strategy on the simulator and a paper/demo account first, and set
+  # conservative money limits before ever turning this on.
+  trading_enabled: false      # false => dry-run (signals only, no orders)
+  # ---- ORDER SIZING ----
+  #
+  # There is no fixed order size. Every buy starts from the real money-limit
+  # HEADROOM — the tightest of max_order_value, max_per_position, the position
+  # slot below, max_total_invested, max_daily_spend and cash_reserve — and risk
+  # scales it down from there. Nothing to keep in sync with limits:, because
+  # the limits ARE the size.
+  min_positions: 4            # spread the budget over at least this many positions,
+                              # so no single buy takes more than its share of what
+                              # can actually be invested (equity less cash_reserve,
+                              # capped at max_total_invested). 0 = no global split.
+                              #
+                              # portfolio.min_positions_per_asset_class refines this
+                              # per asset class and wins for the classes it names;
+                              # whatever it does not claim is what an unnamed class
+                              # gets. See the portfolio: block near the end.
+
+  # Risk scaling is ALWAYS applied when a stop is configured. The headroom is
+  # scaled DOWN by how much wider this trade's actual stop is than the
+  # stop_loss_pct baseline: a trade at exactly the baseline keeps the full
+  # headroom, and one whose ATR-derived stop is wider (a genuinely riskier
+  # entry right now, per exits' own "wider stop wins" rule) gets
+  # proportionally less, approaching zero as the stop widens.
+  #
+  # With no ATR stop configured every trade uses the same fixed stop_loss_pct,
+  # so the ratio is exactly 1 and every trade gets the full headroom — the
+  # variation only appears once atr_stop_mult can come out wider than
+  # stop_loss_pct for a given symbol/moment. If you want risk sizing to
+  # actually do something, set exits.atr_stop_mult.
+  max_risk_size_usd: 0        # absolute cap on what sizing may produce (0 = none)
+  min_order_size_usd: 0       # smallest order worth placing. This REFUSES an order
+                              # the risk scaling puts below it — it does not round one
+                              # up. Raising such an order would enlarge exactly the
+                              # trades the scaling just judged too risky to hold at
+                              # full size. 0 = no threshold.
+
+  # How an approved order reaches the venue. Market orders always cross the
+  # spread; a passive limit order earns it instead, at the risk of not filling —
+  # hence the timeout and fallback. Protective exits ALWAYS go to market: when a
+  # stop fires, filling matters more than filling well.
+  execution:
+    # "limit" needs a broker that can place one. Trading 212's API offers only
+    # a market-order endpoint, so against it "limit" still crosses the spread
+    # and limit_offset_pct/limit_timeout/market_fallback below do nothing; the
+    # adapter records a note in the diagnostics tab's API-errors list when it
+    # happens. Alpaca and Saxo place real limit orders; the simulated broker
+    # fills one only when it is already marketable.
+    type: "market"            # "market" or "limit"
+    limit_offset_pct: 0.0005  # place the limit this far inside the touch (5 bps)
+    limit_timeout: 2m         # give up on an unfilled limit order after this
+    market_fallback: true     # then re-send it as a market order
+    slice_notional: 0         # split orders bigger than this into clips (0 = off)
+    max_slices: 5             # never split into more than this many
+  allow_pyramiding: false     # false => one entry per symbol until exited (avoids churn)
+  # With max_open_positions reached, a BUY on an unheld symbol cannot be
+  # authorized, so evaluating one spends work to be refused - and that work
+  # includes LLM advisor calls and ML inference. Held symbols are always
+  # evaluated (they still need sell signals) and exits run regardless.
+  skip_full_slots: false
+  # Averaging down, on an explicit capped schedule (freqtrade's
+  # adjust_trade_position / Hummingbot's DCA executor).
+  #
+  # READ THIS BEFORE ENABLING. It improves the entry price of every trade that
+  # eventually recovers and increases the size of every trade that does not - it
+  # converts a series of small losses into a smaller series of large ones. What
+  # makes it survivable rather than a martingale is the hard cap on adds, an add
+  # size that cannot exceed one ordinary order, and the stop-loss still applying
+  # to the enlarged position. The first two are ENFORCED, not advised.
+  scale_in:
+    enabled: false
+    step_pct: 0.03            # 3% below the AVERAGE entry before the next add
+    max_adds: 2               # hard cap - required when enabled
+    size_pct: 0.5             # each add as a fraction of a normal order (max 1)
+    require_signal: true      # only add while the strategy still says BUY
+  # Minimum time to hold before a STRATEGY sell is allowed — stops the bot
+  # dumping a position seconds after buying on a blip. Protective exits
+  # (stop-loss/trailing/take-profit) still fire immediately. 0 = disabled.
+  keep_interval: 2h
+  # Require this many consecutive evaluations (eval_interval apart) to agree
+  # before acting, so a one-off reading doesn't trigger a trade. 1 = act at once.
+  confirm_buy: 2              # wait for a 2nd confirming check before buying
+  confirm_sell: 2             # wait for a 2nd confirming check before selling
+
+  # Only place automated orders when (or just before) the symbol's exchange is
+  # open, so the bot doesn't act on a price left stale by a closed venue.
+  # Protective exits are NOT gated. Holidays are not modelled.
+  market_hours_check: true
+  pre_open_window: 5m         # also allow orders this long before the open
+  # Re-confirm the execution price from market data right before an automated
+  # order. The live feed may lag or be a different listing/currency than the
+  # broker trades; the confirmed venue price is used for sizing and risk.
+  venue_price_check: true
+  max_price_deviation: 0.02   # block a BUY if the venue price moved >2% from the signal (0 = don't block)
+
+# Protective exits applied to open positions BEFORE strategy signals.
+# Percentages are fractions (0.05 = 5%); set to 0 to disable a rule.
+exits:
+  enabled: true
+  # Off by default: a halt freezes protective exits too, exactly like every
+  # other order. Turn this on to let stop-loss/trailing-stop/take-profit/
+  # max-hold/scale-out keep submitting REAL sell orders even while trading is
+  # off — a manual toggle, a protections halt, or a circuit breaker — the
+  # same way a manual sell already always bypasses the toggle. Only affects
+  # these automatic protective exits; strategy-driven entries/exits still
+  # fully respect a halt either way.
+  bypass_trading_halt: false
+  stop_loss_pct: 0.05         # sell if price falls 5% below entry
+  trailing_stop_pct: 0.08     # sell if price falls 8% below peak-since-entry
+  take_profit_pct: 0.20       # sell if price rises 20% above entry
+
+  # Volatility-adaptive stops. A fixed 5% stop is far too tight on a volatile
+  # instrument (ordinary noise stops you out) and far too loose on a calm one;
+  # an ATR multiple is the same *statistical* distance on both. When both are
+  # set the WIDER stop wins, so the percentage acts as a floor.
+  atr_period: 14
+  atr_stop_mult: 0            # e.g. 2 = stop two ATRs below entry (0 = off)
+  atr_trail_mult: 0           # e.g. 3 = trail three ATRs below the peak (0 = off)
+
+  # ---- CALIBRATING atr_stop_mult TO YOUR BAR INTERVAL ----
+  #
+  # The textbook "2" assumes DAILY bars. It is not a universal number, and on a
+  # 1-minute feed it does nothing at all: the wider stop wins, so an ATR stop
+  # only takes effect once
+  #
+  #     atr_stop_mult x (ATR / price)  >  stop_loss_pct
+  #
+  # ATR is an average of per-bar TRUE RANGES, so its size is set by how much
+  # price moves within ONE bar. A 1-minute bar barely moves. Measured on AAPL,
+  # against a 5% stop_loss_pct:
+  #
+  #   bar_interval  atr_period        ATR/price   atr_stop_mult for a 5% stop
+  #   1m            14   (~14 min)      0.074%        68x
+  #   1m            90   (~1.5 h)       0.064%        78x
+  #   1m            390  (~1 day)       0.096%        52x
+  #   15m           14   (~3.5 h)       0.296%        17x
+  #   1h            14   (~2 days)      0.787%         6x
+  #   1d            14   (~3 weeks)     2.422%         2x   <- where "2" comes from
+  #
+  # Note rows 1-3: LENGTHENING atr_period on 1-minute bars does NOT help. It
+  # averages more small ranges, not bigger ones. Only a coarser bar_interval
+  # makes ATR comparable to a percentage stop.
+  #
+  # So on 1-minute bars with a 5% stop there is no sane multiple: 68x is not a
+  # volatility-adaptive stop, it is a number picked to defeat a threshold. The
+  # three honest choices are
+  #
+  #   - leave atr_stop_mult at 0 and keep the fixed percentage stop;
+  #   - lower stop_loss_pct until an ATR multiple can reach it (a 1% stop needs
+  #     ~14x here) - but that is a real change to how often you get stopped out,
+  #     not a sizing tweak;
+  #   - move to a coarser bar_interval, where 2-6x means something.
+  #
+  # This matters beyond the stop itself: engine risk sizing scales each order by
+  # stop_loss_pct / actual_stop_distance, so while the percentage stop is the
+  # wider one, that ratio is exactly 1 and every order gets the full headroom.
+  # Risk sizing is not broken there - it has nothing to measure.
+  #
+  # Measure your own instruments rather than reusing the table above; ATR/price
+  # varies several-fold across a watchlist (0.039%-0.121% across one 1-minute
+  # watchlist measured here).
+
+  # Two-stage trailing stop. One trailing distance has to be loose enough early
+  # that ordinary noise doesn't end a trade before it works AND tight enough late
+  # that a winner isn't handed back - contradictory, so it is two. 0 = single
+  # stage, exactly as before.
+  trailing_offset_pct: 0      # e.g. 0.05 = once up 5%...
+  trailing_tight_pct: 0       # ...trail this much below the peak instead
+  trailing_only_after_offset: false  # true = no trail at all below the offset (stop-loss only)
+
+  # Time barrier (the third barrier of the triple-barrier method). The roi ladder
+  # below decays the profit TARGET, so it can only ever exit at breakeven or
+  # better; nothing else closes a position that is simply dead money at a small
+  # loss while it occupies a slot. Go durations only - no "d" unit. 0s = off.
+  max_hold: 0s                # e.g. 72h
+
+  # Scale-out ladder: sell part of a position at successive gains instead of
+  # holding all of it for one all-or-nothing exit. Each rung fires at most once;
+  # sell_pct is a fraction of the ORIGINAL size and the rungs must sum to <= 1.
+  # This trades expectancy for variance - it caps what the sold tranche can earn
+  # in exchange for fewer trades round-tripping back to the stop. Empty = off.
+  # partial_take_profit:
+  #   - profit_pct: 0.05
+  #     sell_pct: 0.33
+  #   - profit_pct: 0.12
+  #     sell_pct: 0.33
+
+  # Time-decaying profit ladder, keyed by how long the position has been held.
+  # Demand a lot early, settle for less as a trade goes stale: an entry that has
+  # not worked in six hours probably is not going to. Whichever is nearer — this
+  # or take_profit_pct — wins. Empty (the default) disables it.
+  # roi:
+  #   "0s":  0.10             # 10% straight away
+  #   "30m": 0.05             # after 30 minutes, 5% is enough
+  #   "2h":  0.02
+  #   "6h":  0                # after six hours, exit at any profit
+
+# Persistence of trades, watchlist and daily spend.
+storage:
+  driver: "sqlite"            # "sqlite" or "none"
+  path: "data/finance_bot.db" # kept alongside this config in the data/ dir
+
+# Automated-trading safety controls.
+safety:
+  max_orders_per_min: 20      # trip a breaker (halt auto-trading) above this rate; 0 disables
+  min_order_interval: 1100ms  # minimum gap between order submissions (Saxo ~1/sec)
+
+# ---------------------------------------------------------------------------
+# AI advisor (optional) — the "ai" detector.
+#
+# Shows a local (Ollama) or remote LLM the same normalised indicator readings
+# the other detectors vote on, and turns its answer into one more BUY/SELL/HOLD
+# vote. It is OFF by default. To use it, add "ai" to strategy.detectors.
+#
+#   ollama pull llama3.2 && ollama serve
+#
+# It never blocks the trading loop (verdicts are cached per symbol and refreshed
+# in the background) and it fails to HOLD: a timeout, an unreachable server, a
+# malformed answer or a stale verdict all vote HOLD, never a trade.
+#
+# ⚠️ An LLM is a heuristic, not an edge. Keep max_strength low so it can tilt a
+# decision but not carry one, and never enable live trading on the strength of
+# backtests that did not actually consult it (see ai.blocking).
+# ---------------------------------------------------------------------------
+ai:
+  enabled: false
+  provider: "ollama"                 # "ollama" (native API) or "openai"
+                                     # ("openai" = any OpenAI-compatible
+                                     # /v1/chat/completions endpoint: llama.cpp,
+                                     # LM Studio, vLLM, OpenRouter, OpenAI)
+  base_url: "http://localhost:11434" # Ollama default; e.g. https://api.openai.com
+  model: "llama3.2"                  # a small instruct model is plenty
+  api_key: ""                        # bearer token for "openai" (or BOT_AI_API_KEY)
+  timeout: 20s                       # per request
+  refresh_interval: 15m              # min time between calls for the same symbol
+  max_age: 1h                        # verdicts older than this are not used
+  blocking: false                     # false = never wait for the model (correct
+                                      # for live trading). true = wait — only for
+                                      # a deliberate, slow backtest of the advisor
+  temperature: 0                     # 0 = as reproducible as the model allows
+  max_concurrent: 2                  # in-flight requests (protects one local GPU)
+  min_confidence: 0.15               # below this the model's own answer becomes HOLD
+  max_strength: 1.0                  # cap on the strength this detector contributes;
+                                     # lower it (e.g. 0.3) to let the LLM tilt a
+                                     # decision without being able to carry one
+  system_prompt: ""                  # optional override of the built-in prompt
+
+# ---------------------------------------------------------------------------
+# Protections — the circuit breakers that stop the bot digging when it is
+# already in a hole.
+#
+# The money limits above cap what is at stake at any one moment. They cannot see
+# PATTERNS: a strategy that is wrong about a symbol four times in an hour, or one
+# whose equity has slid 20% below its peak, is within every per-order limit while
+# it loses steadily. These watch outcomes over time and take the bot off the
+# field. They gate ENTRIES only — an exit is never blocked.
+# ---------------------------------------------------------------------------
+protections:
+  enabled: true
+  cooldown_after_loss: 30m    # no new entry in a symbol for this long after a loss
+  stop_guard_trades: 4        # N protective stop-outs of one symbol...
+  stop_guard_lookback: 24h    # ...within this window...
+  stop_guard_lock: 4h         # ...locks that symbol for this long
+  max_drawdown_pct: 0.20      # halt ALL automated trading below this % off the peak (unrealized + realized)
+  max_daily_loss_pct: 0.08    # halt after losing this much of the day's starting equity
+
+  # Same idea as max_drawdown_pct, but counting ONLY cumulative REALIZED P&L
+  # (closed trades) against its own peak — ignores unrealized mark-to-market
+  # swings in positions still held entirely, so a heavy-exposure period with
+  # paper losses does not by itself trip it; only money actually locked in by
+  # closed trades counts. Independent of max_drawdown_pct: set either, both,
+  # or neither. 0 (the default) disables it.
+  max_realized_drawdown_pct: 0
+
+  # Low-profit guard: lock a symbol whose recent CLOSED trades net out to nothing.
+  # The stop guard counts stop-outs and the drawdown halt watches the account;
+  # neither notices a symbol the strategy keeps trading to a small net loss while
+  # it bleeds commission and spread. It waits for low_profit_trades closes before
+  # judging - two losses on a strategy that wins six times in ten is ordinary.
+  # 0 = off.
+  low_profit_trades: 0        # e.g. 4 closed trades in one symbol...
+  low_profit_lookback: 168h   # ...within this window (7 days)...
+  low_profit_min_pnl: 0       # ...netting no more than this (0 = must break even)...
+
+  # --- giving up on a symbol ----------------------------------------------
+  #
+  # Every guard above locks a symbol out for a while and then lets it back in.
+  # That is right for a bad patch and wrong for a bad match: some instruments
+  # simply do not suit the strategy, and a lockout that expires hands capital
+  # back to them every time it does.
+  #
+  # This one gives up. After this many CONSECUTIVE losing closes the symbol is
+  # removed from the watchlist AND its entry in `watchlist:` above is
+  # COMMENTED OUT, so the drop survives a restart (startup re-adds everything
+  # in watchlist:, so a running-state-only drop would be undone immediately).
+  #
+  # Commented, never deleted: the symbol, the reason and the date stay in the
+  # file, and undoing it is removing one "#".
+  #
+  # Two rules make it safe to leave on:
+  #   - a winning or breakeven close resets the count, so it only fires on a
+  #     symbol that is losing and NOT recovering;
+  #   - a symbol with an OPEN POSITION is never dropped (that would strand it
+  #     with no exits, no trailing stop and no way to sell it) - it waits for
+  #     the position to close and drops on the close after.
+  #
+  # Set it well above autotune.on_loss.after_losses if you use both: the
+  # intent is "re-tune a few times, and give up only if that did not help".
+  # At the drop threshold the drop wins and no re-tune is requested.
+  # 0 = never.
+  drop_after_losses: 0
+  low_profit_lock: 24h        # ...locks that symbol for this long
+  # A halt is sticky: clear it deliberately with POST /api/protections/resume.
+  # A protection that timed out on its own would let an unattended bot walk
+  # straight back into whatever was draining the account.
+
+# ---------------------------------------------------------------------------
+# Screener — automatic universe selection (off by default).
+#
+# A fixed watchlist trades whatever you picked months ago, including instruments
+# that have since gone illiquid or stopped moving. With this on, the tradeable
+# set is re-derived from recent history on a schedule. Symbols you HOLD are never
+# dropped, whatever the filters say — that would strand the position with no
+# exits.
+# ---------------------------------------------------------------------------
+screener:
+  enabled: false
+  # universe: ["AAPL","MSFT","NVDA","AMD","TSLA","GOOGL","AMZN","META"]
+  interval: 6h
+  max_symbols: 25             # keep the best N (0 = all survivors)
+  # How many SELECTED symbols may share a sector label (see `sectors:` below).
+  # The screener ranks on trend or volume, which correlate hard within an
+  # industry, so without this it fills every slot with one sector - and
+  # portfolio.max_positions_per_sector then refuses most of those buys at order
+  # time, after you have already paid for the feed subscription and the warmup
+  # history. Set it to that same number, or a little above so a closing
+  # position has a replacement ready. Counted across all asset classes (the
+  # guard does not care which class a position is in either); held and pinned
+  # symbols are exempt. 0 = no cap.
+  max_symbols_per_sector: 0
+  rank: "volume"              # volume | volatility | momentum | trend | cost
+  min_price: 5                # skip penny stocks
+  max_price: 0                # 0 = no upper bound
+  min_avg_volume: 100000      # skip thin names where the spread eats the edge
+  min_volatility_pct: 0.5     # ATR as % of price: too quiet is untradeable...
+  max_volatility_pct: 8       # ...too wild is unsurvivable
+  min_history_bars: 100       # never trade something the strategy can't warm up on
+  # Estimated bid-ask spread (Corwin-Schultz, computed from the bars themselves -
+  # no free candle feed reports one). It is paid TWICE per round trip and is
+  # invisible on a chart, so an instrument can look perfectly tradeable and still
+  # be unable to clear its own cost of entry. 0 = no bound.
+  max_spread_pct: 0           # e.g. 0.005 = 50 bps
+  # The filter chain, in the order it runs. Evaluation stops at the first failure
+  # so a verdict names the binding constraint rather than listing everything.
+  # Empty = every filter, default order. Remove a name to drop that filter
+  # outright instead of hunting for the value that means "no bound".
+  filters: []                 # e.g. [history, price, volume, volatility, trend, drawdown, spread, cost]
+  keep_held: true
+  # Make the screener purely additive. With this on, the symbols you listed in
+  # `watchlist:` above (and anything you add through the web interface) are never
+  # dropped and never count against max_symbols — so max_symbols means "how many
+  # borrowed names to run alongside mine", not "how many names in total". The
+  # screener's own picks stay temporary: they come and go as they qualify.
+  # Off = the original behaviour, where the screener owns the whole watchlist.
+  keep_manual: false
+
+  # --- what to inspect, and over how long ---------------------------------
+  #
+  # The single most type-dependent pair of settings there is. A broad
+  # accumulating ETF judged on one-minute bars is measured on noise: its ATR%,
+  # spread estimate and momentum all describe the tick rather than the fund.
+  # The same bars are exactly right for a liquid megacap. Set these to whatever
+  # most of your universe is and override the rest under by_asset_class below.
+  resolution: "1"             # 1 | 5 | 15 | 60 | D
+  lookback_days: 30           # must be long enough that `resolution` yields
+                               # more than min_history_bars - daily bars over
+                               # 30 days is ~20 observations, which supports
+                               # neither an ATR nor a trend fit
+
+  # --- what "good" means -------------------------------------------------
+  #
+  # Each of these needs its filter named in `filters:` to do anything.
+  #
+  # trend: a sideways chop that happens to end higher has real positive
+  # momentum and an R² near zero. Momentum alone cannot tell it from a clean
+  # advance, and trading it as a trend is how a trend-following config bleeds
+  # out in a range. R² says the trend is clean; slope says it is worth having.
+  min_trend_r2: 0             # 0..1, e.g. 0.5. 0 = no bound
+  min_trend_slope_pct: 0      # fraction of price per bar, e.g. 0.0005
+
+  # drawdown: a falling knife is certainly moving, so it passes a volatility
+  # band, and can pass momentum on a dead-cat bounce. This refuses it.
+  max_drawdown_pct: 0         # e.g. 0.30 = reject anything that fell >30%
+
+  # cost: the one screening number that decides whether an instrument can be
+  # profitable AT ALL. Something that moves 0.1% a bar against a 0.15% round
+  # trip (two spreads plus commission) loses money at every win rate, and no
+  # strategy setting fixes that. Measured close-to-close, not bar range - a
+  # trade captures the change in price, and the bar range is what the spread
+  # estimate is derived from in the first place.
+  min_cost_multiple: 0        # e.g. 3 = must typically move 3x its round trip
+
+  # --- where candidates come from ----------------------------------------
+  #
+  # An empty universe makes the screener FILTER-ONLY: it can drop symbols but
+  # never find any. Turn this on if you want it to find things but do not yet
+  # know what to list - it seeds any class with no universe of your own from a
+  # built-in starter pool of liquid, widely available instruments. A place to
+  # begin, not a recommendation: nothing in it skips a single filter.
+  #
+  # Settable PER CLASS under by_asset_class too, which is usually what you
+  # want: the two halves of a book are rarely at the same stage. You may know
+  # exactly which five stocks to screen and have no idea which trackers are
+  # worth looking at. A per-class value overrides this one, in both
+  # directions - it can seed one class while this stays off, or opt one class
+  # out while this is on.
+  #
+  # A class with a pool of its own (below) is never seeded: a curated list is
+  # a decision, and appending suggestions to it would dilute that rather than
+  # help.
+  suggest_universe: false
+
+  # Per-class candidate pools, for the common case where the pools have
+  # nothing to do with each other. A class with no entry here falls back to
+  # its profile's own `universe`, then to the shared `universe:` above.
+  universe_by_asset_class: {}
+  #   etf:   ["IWDA.AS", "VWCE.DE", "EUNL.DE", "XEON.DE"]
+  #   stock: ["AAPL", "MSFT", "NVDA", "SAP.DE", "ASML.AS"]
+
+  # --- per-asset-class overrides -----------------------------------------
+  #
+  # Every field above can be overridden per class, and each profile INHERITS
+  # every field it does not name - exactly like strategy_overrides, so setting
+  # one value cannot silently zero the rest. max_symbols is per class too:
+  # one shared cap ranked across classes lets whichever class scores higher on
+  # the shared metric take every slot, and "8 ETFs and 15 stocks" quietly
+  # becomes "23 stocks".
+  #
+  # Classes are the ones the classifier produces: stock, etf, fund, bond,
+  # crypto, option, future, cfd, currency, index. A symbol nothing could
+  # classify is screened against the base settings above rather than skipped.
+  by_asset_class:
+    etf:                      # a broad tracker like SEC0.DE or IWDA.AS
+      suggest_universe: true  # no curated etf pool above, so seed this class
+                              # from the starter list. Ignored the moment you
+                              # give etf a universe of its own.
+      resolution: "D"         # judge it on daily bars ...
+      lookback_days: 365      # ... over a year
+      max_symbols: 8
+      rank: "trend"           # volume | volatility | momentum | trend | cost
+      # Every threshold below needs its filter named here, or it is silently
+      # ignored. `volatility` is deliberately absent: an intraday ATR band
+      # would reject a broad tracker judged on daily bars.
+      filters: [history, price, volume, trend, drawdown, cost]
+      min_trend_r2: 0.5
+      min_avg_volume: 20000   # ETFs trade far thinner than megacaps
+    stock:                    # a liquid name like GOOGL
+      suggest_universe: false # screen only what `universe:` above names
+      resolution: "15"        # intraday character is the point here
+      lookback_days: 30
+      max_symbols: 15
+      rank: "momentum"
+      filters: [history, price, volume, volatility, spread, cost]
+      min_cost_multiple: 3
+    crypto:                   # screening/paper only: crypto is never ordered
+                              # at a live broker, so this is useful with
+                              # broker: sim and inert otherwise
+      max_symbols: 2
+
+  # --- does it actually perform? -----------------------------------------
+  #
+  # Every filter above answers "is this instrument tradeable?" - enough
+  # history, enough liquidity, moves enough to clear its costs. None of them
+  # answers the question you actually have: would MY strategy have made money
+  # on it? The probe answers that by running the real backtester over the
+  # candidate's own bars.
+  #
+  # It is the last stage and a bounded one - a search per candidate over a few
+  # hundred symbols is minutes of CPU - so only the best few per class, already
+  # ranked by the cheap filters, are ever probed. A probe can only DEMOTE or
+  # REJECT: an instrument that cannot clear its own spread does not become
+  # tradeable because a backtest of it looked good.
+  probe:
+    enabled: false
+    backtest: true            # run the LIVE strategy: "would what I run now
+                               # have worked here?"
+    autotune: false           # also search for the candidate's BEST config:
+                               # "could this work if I tuned for it?" - which
+                               # is only achievable if you then tune for it,
+                               # e.g. via autotune.on_loss or an override.
+                               # Much slower.
+    max_candidates: 10        # per asset class, best-first. Beyond the cutoff
+                               # a candidate keeps its ranking - not probed is
+                               # not the same as probed badly
+    min_trades: 5             # ignore a result built on fewer trades than this
+    min_expectancy_pct: 0     # reject below this expectancy per trade; 0 means
+                               # "must at least break even", below -1 scores
+                               # without ever rejecting
+
+# ---------------------------------------------------------------------------
+# Autotune — scheduled per-symbol auto-optimizer (off by default).
+#
+# The Strategy tab's "optimize this symbol" button runs a bounded search
+# against one symbol's own recent history and proposes a strategy_overrides
+# snippet for a human to review and paste in by hand. With this enabled, the
+# SAME search runs automatically on a schedule against every eligible
+# watchlist symbol, and — unlike that button — WRITES a winning config
+# straight into strategy_overrides below and into the running engine,
+# with no confirmation step. There is no human in this loop.
+#
+# The only safeguards against curve-fitting a live config to noise are
+# min_trades and the search's own dual-baseline gate: a proposal must beat
+# BOTH an isolated full-capital backtest AND (when the symbol has one) its
+# real, capital-constrained track record over the same window before it is
+# ever applied. Still: this changes what the bot actually trades with,
+# unattended, on a real account. Leave it off until you've watched the
+# Strategy tab's manual button produce sensible proposals for your own
+# symbols first.
+# ---------------------------------------------------------------------------
+autotune:
+  enabled: false
+  interval: 24h               # restart-only to change; 0 also defaults to 24h
+  bars: 1440                  # candle window per symbol per run (~1440 = one calendar day at 1-min bars)
+  min_trades: 10              # stricter than the manual button's own floor (3) — an unsupervised,
+                               # every-symbol, real-money write deserves less tolerance for a thin sample
+  objective: "blend"          # what "better" means: blend (both return and win rate, penalizes
+                               # drawdown) | return | winrate | sharpe | sortino | calmar |
+                               # profitfactor | expectancy — see internal/backtest's ScorerNames
+  min_return_pct: 0           # absolute floor on a proposal's OWN backtested return, regardless of
+                               # objective — beating a weak/empty baseline isn't the same as making
+                               # money. 0 rejects any loss; raise for stricter, or go negative to
+                               # deliberately tolerate a small one
+  # run_only_for_symbols: []  # non-empty = an allow-list; empty = every watchlist symbol is eligible
+  # exclude_symbols: []       # keep specific symbols (e.g. hand-tuned ones) out of the scheduler's
+                               # reach entirely; applied after run_only_for_symbols, so a symbol named
+                               # in both ends up excluded
+
+  # Re-tune ONE symbol reactively, the moment its recent record says its
+  # current config has stopped working — instead of waiting up to `interval`
+  # (24h by default) while it keeps trading a config the bot could already
+  # tell was failing.
+  #
+  # Requires `enabled: true` above: with autotune off, nothing here runs and
+  # nothing is written, so "autotune disabled = no automatic
+  # strategy_overrides writes" stays an unconditional guarantee.
+  #
+  # A losing streak decides only WHEN to look, never what is allowed to win:
+  # the search that follows uses the same min_trades floor, the same
+  # objective, the same min_return_pct floor and the same dual-baseline gate
+  # as a scheduled pass, and is expected to decline most of the time. It also
+  # honours run_only_for_symbols/exclude_symbols, so a symbol fenced off from
+  # the scheduler is not reachable through a loss streak either.
+  on_loss:
+    enabled: false
+    after_losses: 3           # CONSECUTIVE losing closes on one symbol that trigger a re-tune of
+                               # that symbol. A winning or breakeven close resets its counter, so a
+                               # symbol alternating wins and losses is never touched however many
+                               # losses it accumulates. The counter also resets when a tune fires,
+                               # so the next one needs a fresh streak. 0 also defaults to 3; below 2
+                               # is not recommended — one losing trade is noise, and tuning on it is
+                               # how you curve-fit a live config to a single bad fill
+    cooldown: 6h              # minimum time between two re-tunes of the SAME symbol, measured from
+                               # its last autotune apply. Bounds how fast one persistently losing
+                               # symbol can rewrite its own config — chasing a losing streak with a
+                               # fresh curve-fit every few trades is a good way to make it worse.
+                               # A streak arriving inside the cooldown is dropped and the counter
+                               # restarts. 0 = no cooldown
+
+# ---------------------------------------------------------------------------
+# Test mode — a "training phase". While active, the engine keeps reading real
+# market data and running its normal strategy/risk/exits loop, but every order
+# fills against an internal simulated broker seeded from the real account's
+# current cash and positions instead of the real configured broker. Simulated
+# trades get recorded exactly like real ones, feeding autotune's own
+# real-track-record gating, without the real broker ever being touched.
+#
+# NOTE: the code itself defaults this to enabled: true (48h) when the key is
+# absent, so a freshly deployed or reconfigured bot proves itself before it
+# can place a real order. It is written out here, disabled, so that default
+# is a deliberate choice rather than an implicit one. Start/stop early any
+# time from the dashboard regardless of this setting — this only controls
+# what happens automatically at process startup.
+# ---------------------------------------------------------------------------
+test_mode:
+  enabled: false
+  duration: 48h               # 0 also defaults to 48h
+
+# ---------------------------------------------------------------------------
+# Notifications — an unattended bot that can only be observed by opening its
+# web UI is one you will not observe.
+#
+# Delivery never blocks trading: alerts are queued and sent by a background
+# worker, and dropped if the queue backs up. Env overrides: BOT_NOTIFY_WEBHOOK,
+# BOT_NOTIFY_DISCORD, BOT_NOTIFY_TELEGRAM_TOKEN, BOT_NOTIFY_TELEGRAM_CHAT.
+# ---------------------------------------------------------------------------
+notify:
+  enabled: false
+  events: ["trade", "halt", "error", "audit"]   # also available: "blocked" (noisy)
+  # "audit" is the bot changing its own config unsupervised — see autotune:
+  # below. Included here because an explicit events: list REPLACES rather
+  # than adds to the default subscription (which does include "audit"); an
+  # operator who trims this list should trim it deliberately, not lose audit
+  # events as a side effect of an example file that predates autotune.
+  min_notional: 0             # suppress fill alerts below this order value
+  timeout: 10s
+
+  # Every configured sink receives every subscribed event; configure as many as
+  # you like. A sink needing two credentials is skipped until both are set.
+  webhook: ""                 # any URL — receives the event as a JSON POST
+  discord_webhook: ""
+  telegram_token: ""
+  telegram_chat_id: ""
+
+  # Pushover — push notifications to phones. Create an application at
+  # pushover.net to get the API token; the user key is on your dashboard.
+  pushover_token: ""          # application/API token (or BOT_NOTIFY_PUSHOVER_TOKEN)
+  pushover_user: ""           # user or group key    (or BOT_NOTIFY_PUSHOVER_USER)
+  pushover_device: ""         # optional: restrict to one device name
+  # Base priority for routine events: -2 silent, -1 quiet, 0 normal,
+  # 1 high (bypasses quiet hours). Halts and errors are sent one level higher,
+  # capped at 1. Priority 2 (emergency, repeats until acknowledged) is
+  # deliberately unreachable — a bot that can wake you every 30 seconds until
+  # you tap a button is a footgun.
+  pushover_priority: 0
+
+  # Apprise — one sink that reaches the ~100 services Apprise supports (email,
+  # Matrix, ntfy, Gotify, Signal, SMS, …) via an Apprise API server
+  # (github.com/caronc/apprise-api). Two deployment shapes:
+  #
+  #   stored config:  apprise_url: "http://apprise:8000/notify/mykey"
+  #   stateless:      apprise_url: "http://apprise:8000/notify"
+  #                   apprise_services: "ntfy://topic,mailto://user:pw@example.com"
+  #
+  # Event kinds map onto Apprise's types (trade→success, blocked→warning,
+  # halt/error→failure), which most downstream services colour differently.
+  apprise_url: ""             # Apprise API endpoint (or BOT_NOTIFY_APPRISE_URL)
+  apprise_services: ""        # stateless mode only: comma-separated service URLs
+  apprise_tag: ""             # stored config only: which entries to notify
+
+# ---------------------------------------------------------------------------
+# Portfolio limits — concentration caps the per-order money limits cannot see.
+#
+# Those limits are per-order and per-symbol: they will happily let the bot hold
+# twenty positions that are really one bet. Ten megacap tech names at 300 each is
+# not a 3000 diversified book, it is 3000 of Nasdaq with extra commission — and it
+# draws down like it.
+#
+# Correlations use the same bars the strategy trades on, and in a backtest only
+# the history that existed at that bar. An unmapped symbol is exempt from the
+# SECTOR caps (nothing to compare it to) but not from the correlation check; a
+# symbol with no history is allowed rather than blocked forever; and topping up a
+# position already held is never blocked by the sector/correlation caps. Exits
+# are never gated.
+#
+# max_pct_per_asset_class is the ALLOCATION budget, and it is the one cap that
+# does apply to topping up: "no more than 30% in ETFs" that stops applying the
+# moment you already own the ETF is not a limit at all. Once a class is at its
+# share of the book, further BUYS in it are refused (the block is recorded with
+# a reason, like any other); sells and exits are untouched.
+# ---------------------------------------------------------------------------
+portfolio:
+  enabled: false
+  max_per_sector: 0             # combined market value per sector (0 = no cap)
+  max_positions_per_sector: 0   # distinct symbols per sector (0 = no cap)
+  # Count the two caps above WITHIN each asset class instead of across the
+  # whole book, so a tech ETF and a tech stock do not compete for one slot.
+  # On means "N single-stock bets AND N diversified bets per sector" — a sector
+  # ETF holds dozens of companies while a stock holds one, and
+  # max_pct_per_asset_class already bounds each wrapper. Off (the default) is
+  # the stricter reading: a sector falls together whatever wrapper it comes in.
+  # screener.max_symbols_per_sector follows this setting, so both ends agree.
+  sector_caps_per_asset_class: false
+  correlation_threshold: 0.8    # above this, two symbols count as the same bet
+  max_correlated_positions: 0   # how many held symbols may exceed it (0 = no cap)
+  correlation_lookback: 200     # bars to correlate over
+
+  # Share of ACCOUNT EQUITY (cash + holdings) allowed per asset class, as a
+  # FRACTION - 0.30 means 30%, not 30.
+  #
+  # ⚠️  0 means NO CAP, not "blocked". A class with no entry here is unlimited,
+  # so listing a class at 0 does nothing - which is why only the classes this
+  # bot can actually trade are listed. Both are 0 out of the box, so nothing
+  # is capped until you choose a number.
+  #
+  # Only `stock` and `etf` are reachable on a real broker, for three reasons
+  # that hold across all of them:
+  #   - the engine is LONG-ONLY (risk.Authorize refuses a sell with no
+  #     position held), so nothing needing a short leg works;
+  #   - an Order is {symbol, side, qty, type, limit} - no strike, expiry,
+  #     contract multiplier, margin or leverage exists anywhere in the code;
+  #   - the adapters are cash-equity adapters. Trading 212 speaks only
+  #     /equity/... (its Invest universe; the CFD product has no public API).
+  #     Alpaca hardcodes time_in_force "day", which its crypto venue rejects.
+  #     Saxo floors to whole units, ships scoped to "Stock,Etf", and sends no
+  #     ToOpenClose, which derivatives require.
+  #
+  # A bond ETF classifies as `etf` and trades fine; an individual bond does
+  # not. Crypto is data-only by design - trackable, backtestable and
+  # paper-tradeable against broker: sim, but never ordered at a live broker.
+  #
+  # The remaining classifier outputs (fund, bond, crypto, option, future, cfd,
+  # currency, index) are still real labels the screener's by_asset_class can
+  # use; they are simply not something a cap can bind on.
+  max_pct_per_asset_class:
+    stock: 0                  # try 0.70 - ordinary shares, ADRs/GDRs
+    etf: 0                    # try 0.30 - ETFs, incl. ETC/ETN and bond ETFs
+    unclassified: 0           # try 0.10 - everything nothing could classify
+  #
+  # These are independent ceilings, NOT a target allocation: neither is a
+  # floor, and cash_reserve may stop both filling at once.
+  #
+  # `unclassified` is the reserved key for holdings no source could name: no
+  # type from the data provider, none from the broker, no asset_classes:
+  # override. It is the one bucket you cannot see coming - a ticker nobody
+  # recognises is exactly the position that would otherwise sit outside every
+  # allocation limit until you noticed it in the UI and wrote an
+  # asset_classes: entry by hand. Give it a share and it is budgeted like any
+  # other class, symbols you have not bought yet included.
+  #
+  # An instrument type the classifier does not recognise but the provider DID
+  # name keeps the provider's own word, lower-cased (e.g. Saxo's
+  # "FuturesStrategy" -> futuresstrategy) rather than being guessed into one
+  # of the above or counted as unclassified - it can be capped under that name
+  # too, once you have seen what your provider calls it.
+
+  # Split each class's share above into at least this many positions. The
+  # percentage alone is spent first-come-first-served: one early conviction buy
+  # can take the whole 30% of ETFs, the cap holds, and the class is then shut
+  # for every other candidate - the limit worked and the diversification it was
+  # written for did not happen.
+  #
+  # What one slot is worth depends on whether the class has a share above:
+  #
+  #   with a share:    that share of the investable book, split n ways.
+  #                    stock: 2 against stock: 0.70 on a 1000 book with
+  #                    cash_reserve 50 => 0.70 x 950 / 2 = 332.50 per position.
+  #   without a share: an equal cut of whatever the named shares did NOT claim.
+  #                    With no shares set at all and {stock: 2, etf: 2}, that is
+  #                    950 / 4 = 237.50 each - four positions that exactly fill
+  #                    the book.
+  #
+  # The divisor is the INVESTABLE book - equity less cash_reserve, capped at
+  # max_total_invested - not raw equity. Dividing equity would promise an Nth
+  # position the account can never fund.
+  #
+  # A class NOT named here falls back to whatever engine.min_positions has left
+  # over: global 5 against {stock: 2, etf: 2} leaves 1 for anything unnamed;
+  # global 4 leaves 0, meaning no slot ceiling for unnamed classes at all. Name
+  # more positions between the classes than min_positions has and the config is
+  # refused at load - the per-class counts come out of the global one.
+  #
+  # A ceiling, never a floor: it does not make the bot buy N positions, it only
+  # stops one from eating the budget. 0 means no split; 1 means no split for a
+  # class WITH a share (that is the whole share, which max_pct_per_asset_class
+  # already enforces) but is a real ceiling for one without.
+  #
+  # Every buy - a scale-in add included - is clamped to what is left of THAT
+  # SYMBOL's slot, exactly like limits.max_order_value, and whichever ceiling
+  # is lower wins.
+  min_positions_per_asset_class: {stock: 2, etf: 2}   # e.g. {stock: 2, etf: 2, unclassified: 2}
+
+# Sector labels for portfolio.max_per_sector. Only the symbols you list are
+# subject to the sector caps.
+# sectors:
+#   AAPL: tech
+#   MSFT: tech
+#   NVDA: tech
+#   XOM: energy
+
+# Asset classes for portfolio.max_pct_per_asset_class. You do NOT normally need
+# this block: the bot classifies every tracked symbol from the data provider's
+# instrument search, falls back to the broker's own instrument list for what the
+# provider cannot place, and caches the result across restarts. Entries here are
+# the override layer — write one when you disagree with what was classified, or
+# for a symbol nothing can classify. A symbol nothing can classify is never
+# guessed into a class: it counts against the `unclassified` bucket above, which
+# constrains it only if you gave that bucket a share.
+asset_classes: {}            # e.g. {IWDA.AS: etf, XEON.DE: etf, SAP.DE: stock}
+                             # Empty is the normal case: everything is
+                             # classified automatically. Add an entry only to
+                             # correct a classification, or for a symbol
+                             # nothing can place.
+
+# ---------------------------------------------------------------------------
+# Per-symbol strategy overrides.
+#
+# One set of parameters for a volatile small cap and a short-duration bond ETF is
+# a compromise that suits neither. Each override INHERITS every field it does not
+# name, so setting one value cannot silently zero the rest; list fields like
+# `detectors` are replaced wholesale. Resolution order is
+# profile -> strategy: -> strategy_overrides:.
+# ---------------------------------------------------------------------------
+# strategy_overrides:
+#   NVDA:
+#     min_strength: 0.45        # demand more conviction on a volatile name
+#   IBCI.DE:
+#     detectors: ["trend"]      # a quiet bond ETF: trend only
+#     min_strength: 0.50
+#   GOOG:                       # a symbol whose price action defeats the
+#                               # shared detector set can get its own,
+#                               # stricter combination instead of being
+#                               # dropped from the watchlist entirely — any
+#                               # strategy: field is overridable this way,
+#                               # not just the ones shown above.
+#     detectors: ["ema_cross", "rsi", "macd"]
+#     combine: "unanimous"
+#     min_strength: 0.20
+
+# ---------------------------------------------------------------------------
+# ML detector — a logistic-regression classifier over the same normalised
+# indicator readings the other detectors vote on, retrained on a rolling window,
+# predicting P(the next `horizon` bars are up).
+#
+# OFF, and it does nothing unless "ml" is in strategy.detectors.
+#
+# Every prediction is out-of-sample: the model trains only on rows whose forward
+# window has already closed, then predicts the current bar. So a backtest of it is
+# a continuous walk-forward, not a fit to the data it is scored on.
+#
+# Expect it to find very little. Bar-to-bar direction is close to unpredictable
+# from indicators alone, and min_skill exists so a model that learned nothing says
+# so instead of emitting confident probabilities from noise.
+# ---------------------------------------------------------------------------
+ml:
+  enabled: false
+  horizon: 10                 # bars ahead the label looks
+  threshold: 0.005            # forward return that counts as "up" (0.5%).
+                              # 0 asks "did price tick up", which after costs is
+                              # not a tradeable question
+  train_bars: 1500            # rolling training window
+  retrain_every: 250          # refit cadence, in BARS (so backtest == live)
+  min_samples: 200            # fewest labelled rows needed to fit at all
+  buy_prob: 0.58              # probability at which it votes BUY...
+  sell_prob: 0.42             # ...and SELL. Deliberately not 0.5: a model at the
+                              # coin-flip line should not be trading
+  min_skill: 0.02             # required accuracy ABOVE the majority-class base
+                              # rate (2pp) before it may vote at all
+  max_strength: 0.5           # cap on the strength it contributes
+  epochs: 300                 # fitting hyperparameters; l2 is the main brake on
+  learning_rate: 0.05         # overfitting the window
+  l2: 0.01

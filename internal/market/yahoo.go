@@ -16,6 +16,9 @@ import (
 // query1 fails (Yahoo load-balances between them and one can be throttled).
 var yahooHosts = []string{"query1.finance.yahoo.com", "query2.finance.yahoo.com"}
 
+// yahooUserAgent is required: Yahoo rejects requests without a browser-like one.
+const yahooUserAgent = "Mozilla/5.0 (compatible; go_finance_bot/1.0)"
+
 // YahooHistory fetches historical candles from Yahoo Finance's public chart
 // endpoint. It needs no API key and works for any broker, so it's a reliable
 // default warmup source where the live feed (e.g. Finnhub free tier) has no
@@ -30,6 +33,38 @@ type YahooHistory struct {
 
 	mu     sync.Mutex
 	nextAt time.Time // earliest time the next request may go out
+
+	// cooldownUntil, while in the future, makes fetch fail immediately with
+	// no network calls at all — see coolDown.
+	cooldownUntil time.Time
+
+	// base overrides the upstream host. Empty in production, where the two
+	// interchangeable Yahoo hosts are used; a test points it at a local server.
+	base string
+}
+
+// yahooCooldown is how long fetch backs off entirely after exhausting every
+// retry against a retryable (429/5xx/network) error. One symbol's Candles
+// call can already generate up to (fallback intervals) × (1 + maxRetries)
+// requests trying to get *some* data; without this, every other symbol's
+// Candles call during the same throttling episode — a screener rescan can be
+// dozens in a row — repeats that same full request storm, which only makes
+// the throttling worse right when the upstream is already struggling. See
+// CODE_REVIEW_FINDINGS.md's Yahoo retry-storm finding.
+const yahooCooldown = 30 * time.Second
+
+// endpoints returns the base URLs to try, in order.
+func (y *YahooHistory) endpoints() []string {
+	if y.base != "" {
+		return []string{y.base}
+	}
+
+	out := make([]string, 0, len(yahooHosts))
+	for _, h := range yahooHosts {
+		out = append(out, "https://"+h)
+	}
+
+	return out
 }
 
 // NewYahooHistory constructs a Yahoo Finance history provider.
@@ -101,7 +136,7 @@ func (y *YahooHistory) Candles(
 		lastErr error
 	)
 
-	for _, a := range attempts {
+	for i, a := range attempts {
 		candles, err := y.fetch(ctx, symbol, a[0], a[1])
 		if err != nil {
 			lastErr = err
@@ -113,6 +148,20 @@ func (y *YahooHistory) Candles(
 		}
 
 		if len(best) >= enough {
+			if i > 0 {
+				// A caller asked for interval (the first attempt) and silently
+				// got a[0] instead. venuePrice treats the last candle as "the
+				// venue's current price" for order sizing and the deviation
+				// gate — a stale daily close mistaken for a live price is a
+				// real mispricing risk, not just a display quirk. This
+				// doesn't change what's returned (the coarser data is still
+				// the best available and warmup genuinely wants it), but it
+				// makes the substitution visible instead of silent. See
+				// CODE_REVIEW_FINDINGS.md's Yahoo-granularity finding.
+				errlog.Recordf("yahoo", "%s: requested %s bars, serving %s (only %d bars available at the finer interval)",
+					symbol, interval, a[0], len(best))
+			}
+
 			return best, nil
 		}
 	}
@@ -128,6 +177,32 @@ func (y *YahooHistory) Candles(
 	return nil, fmt.Errorf("yahoo: no data for %s at any interval", symbol)
 }
 
+// throttled reports whether fetch is in a post-exhaustion cooldown (see
+// yahooCooldown) and should fail immediately without making any request.
+func (y *YahooHistory) throttled() bool {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	return time.Now().Before(y.cooldownUntil)
+}
+
+// coolDown starts (or extends) the cooldown window after a fetch exhausts
+// every retry against a retryable error.
+func (y *YahooHistory) coolDown() {
+	y.mu.Lock()
+	y.cooldownUntil = time.Now().Add(yahooCooldown)
+	y.mu.Unlock()
+}
+
+// clearCooldown ends an active cooldown once a request actually succeeds —
+// the upstream is reachable again, so there is no reason to keep refusing
+// requests for the rest of the window.
+func (y *YahooHistory) clearCooldown() {
+	y.mu.Lock()
+	y.cooldownUntil = time.Time{}
+	y.mu.Unlock()
+}
+
 // fetch retrieves one symbol/interval/range from Yahoo's chart endpoint,
 // pacing via the shared limiter and retrying on 429/5xx with exponential
 // backoff. It tries query1 then query2 on each attempt.
@@ -141,9 +216,17 @@ func (y *YahooHistory) fetch(
 		}
 	}()
 
+	if y.throttled() {
+		return nil, fmt.Errorf(
+			"yahoo: cooling down after repeated throttling; not retrying %s yet", symbol)
+	}
+
 	backoff := 400 * time.Millisecond
 
-	var lastErr error
+	var (
+		lastErr       error
+		lastRetryable bool
+	)
 
 	for attempt := 0; attempt <= y.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -162,17 +245,35 @@ func (y *YahooHistory) fetch(
 			backoff *= 2
 		}
 
-		host := yahooHosts[attempt%len(yahooHosts)]
+		// y.base (set by tests) previously only applied to the search path
+		// (endpoints() below) — the chart path hardcoded the public Yahoo
+		// hosts regardless, which is why Candles had no test coverage at
+		// all. Routing through the same endpoints() a mirror/proxy override
+		// would also apply here. See CODE_REVIEW_FINDINGS.md's
+		// YahooHistory.base finding.
+		endpoints := y.endpoints()
+		base := endpoints[attempt%len(endpoints)]
 
-		candles, retryable, ferr := y.fetchOnce(ctx, host, symbol, interval, rng)
+		candles, retryable, ferr := y.fetchOnce(ctx, base, symbol, interval, rng)
 		if ferr == nil {
+			y.clearCooldown() // upstream is reachable; end any earlier cooldown
 			return candles, nil
 		}
 
 		lastErr = ferr
+		lastRetryable = retryable
+
 		if !retryable {
 			return nil, ferr
 		}
+	}
+
+	// Every retry against every host was exhausted and the last error was
+	// still retryable (429/5xx/network) — a strong signal the throttling
+	// isn't a one-off blip. Cool down so the next Candles call, for this or
+	// any other symbol, doesn't immediately repeat the same request storm.
+	if lastRetryable {
+		y.coolDown()
 	}
 
 	return nil, lastErr
@@ -210,29 +311,29 @@ type yahooChartBody struct {
 	Chart yahooChart `json:"chart"`
 }
 
-// fetchOnce performs a single request against one host. retryable reports
-// whether the error is worth another attempt (throttling / transient 5xx / a
-// network error), as opposed to a permanent failure.
+// fetchOnce performs a single request against one base URL (scheme +
+// host — see endpoints()). retryable reports whether the error is worth
+// another attempt (throttling / transient 5xx / a network error), as
+// opposed to a permanent failure.
 //
 //nolint:cyclop // linear fetch → validate → decode → convert flow
 func (y *YahooHistory) fetchOnce(
 	ctx context.Context,
-	host, symbol, interval, rng string,
+	base, symbol, interval, rng string,
 ) (_ []Candle, retryable bool, err error) {
 	if err := y.wait(ctx); err != nil {
 		return nil, false, err
 	}
 
-	url := fmt.Sprintf("https://%s/v8/finance/chart/%s?interval=%s&range=%s",
-		host, symbol, interval, rng)
+	url := fmt.Sprintf("%s/v8/finance/chart/%s?interval=%s&range=%s",
+		base, symbol, interval, rng)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
 	}
 
-	// Yahoo rejects requests without a browser-like User-Agent.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; go_finance_bot/1.0)")
+	req.Header.Set("User-Agent", yahooUserAgent)
 
 	resp, err := y.http.Do(req)
 	if err != nil {

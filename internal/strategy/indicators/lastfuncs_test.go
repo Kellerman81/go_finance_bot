@@ -120,6 +120,58 @@ func TestADXTrendStrength(t *testing.T) {
 	}
 }
 
+// TestADXLastMatchesTextbookWilderSeeding reproduces the "ADXLast seeds one
+// bar later than textbook Wilder" finding with an exact numeric check: the
+// first DI/DX reading must come from the seed sums directly (index =
+// period, no recursive Wilder update applied yet), not from one bar later.
+//
+// Expected values were computed independently (Python, not this package) by
+// implementing Wilder's textbook recipe literally: seed trS/plusS/minusS as
+// the plain sum over bars 1..period, take the first DI/DX reading directly
+// from that seed at index period, accumulate DX over indices
+// period..2*period-1 to seed ADX, then Wilder-smooth from index 2*period
+// onward. See the fix's own comment in trend.go for the same description.
+func TestADXLastMatchesTextbookWilderSeeding(t *testing.T) {
+	high := []float64{100.0, 100.8, 101.4, 101.1, 101.7, 102.3, 102.0, 102.6, 103.2, 102.9, 103.5, 104.1}
+	low := []float64{99.0, 99.6, 100.2, 99.9, 100.5, 101.1, 100.8, 101.4, 102.0, 101.7, 102.3, 102.9}
+	closes := []float64{99.5, 100.1, 100.7, 100.4, 101.0, 101.6, 101.3, 101.9, 102.5, 102.2, 102.8, 103.4}
+
+	adx, plusDI, minusDI, ok := ADXLast(high, low, closes, 3)
+	if !ok {
+		t.Fatal("ADXLast not ok")
+	}
+
+	const tol = 1e-9
+
+	if math.Abs(adx-66.93209180887446) > tol {
+		t.Errorf("ADX = %.11f, want %.11f (textbook Wilder seeding)", adx, 66.93209180887446)
+	}
+
+	if math.Abs(plusDI-37.48128794526719) > tol {
+		t.Errorf("+DI = %.11f, want %.11f", plusDI, 37.48128794526719)
+	}
+
+	if math.Abs(minusDI-4.807757213819683) > tol {
+		t.Errorf("-DI = %.11f, want %.11f", minusDI, 4.807757213819683)
+	}
+}
+
+// TestADXLastPeriodOneSeedsImmediately covers the degenerate period == 1
+// case: the seed window is exactly one DX reading, already complete before
+// the recursive-smoothing loop ever runs (which only starts at index
+// period+1 = 2) — ADXLast must still report ok, not silently stay
+// unseeded.
+func TestADXLastPeriodOneSeedsImmediately(t *testing.T) {
+	high := []float64{100, 101, 99, 102, 98, 103}
+	low := []float64{99, 100, 98, 101, 97, 102}
+	closes := []float64{99.5, 100.5, 98.5, 101.5, 97.5, 102.5}
+
+	_, _, _, ok := ADXLast(high, low, closes, 1)
+	if !ok {
+		t.Error("ADXLast(period=1) not ok, want the degenerate single-bar seed to still work")
+	}
+}
+
 func TestStochasticExtremes(t *testing.T) {
 	n := 30
 	high := make([]float64, n)
@@ -175,5 +227,56 @@ func TestSupertrendDirection(t *testing.T) {
 	}
 	if level >= cl[n-1] {
 		t.Errorf("up-trend level %.2f should sit below price %.2f", level, cl[n-1])
+	}
+}
+
+// TestSupertrendLastNeverCrossedReportsUndefined reproduces the
+// "supertrendDetector can never vote HOLD" finding: a perfectly flat price
+// series (zero volatility, so ATR stays 0 and the bands sit exactly at
+// price) never closes strictly above or below either band — there is no
+// directional signal at all. SupertrendLast must report ok=false, not
+// default to a confident up-trend the price action never actually showed.
+func TestSupertrendLastNeverCrossedReportsUndefined(t *testing.T) {
+	n := 60
+	high := make([]float64, n)
+	low := make([]float64, n)
+	cl := make([]float64, n)
+
+	for i := range n {
+		high[i], low[i], cl[i] = 100, 100, 100
+	}
+
+	if _, _, ok := SupertrendLast(high, low, cl, 14, 3); ok {
+		t.Error("SupertrendLast ok=true on a series that never crossed either band, " +
+			"want ok=false — no real directional signal was ever observed")
+	}
+}
+
+// TestSupertrendLastNaNATRReportsUndefinedNotStale reproduces the
+// "SupertrendLast silently freezes its band ratchet forever after one NaN
+// ATR reading, while still reporting ok: true" finding: a NaN in the input
+// partway through the series poisons every subsequent Wilder-smoothed ATR
+// value (NaN arithmetic stays NaN). This must surface as ok=false, not a
+// value frozen at its last-good state that looks indistinguishable from a
+// genuinely current reading.
+func TestSupertrendLastNaNATRReportsUndefinedNotStale(t *testing.T) {
+	n := 60
+	high := make([]float64, n)
+	low := make([]float64, n)
+	cl := make([]float64, n)
+
+	for i := range n {
+		cl[i] = 100 + 2*float64(i)
+		high[i] = cl[i] + 1
+		low[i] = cl[i] - 1
+	}
+
+	// Inject a NaN well past the seed window (period=14), so this exercises
+	// the mid-loop poisoning path, not the initial-ATR-undefined guard.
+	high[30] = math.NaN()
+
+	if _, _, ok := SupertrendLast(high, low, cl, 14, 3); ok {
+		t.Error("SupertrendLast ok=true after a NaN ATR reading mid-series, " +
+			"want ok=false — the ratchet is unrecoverably poisoned from that point on")
 	}
 }

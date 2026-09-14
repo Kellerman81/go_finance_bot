@@ -65,6 +65,16 @@ var detectorRegs = []detectorReg{
 		[]string{"dc"},
 		func(c config.StrategyConfig) Detector { return newDonchianDetector(c) },
 	},
+	{
+		"ai",
+		[]string{"llm", "ollama"},
+		func(c config.StrategyConfig) Detector { return newAIDetector(c) },
+	},
+	{
+		"ml",
+		[]string{"model", "classifier"},
+		func(c config.StrategyConfig) Detector { return newMLDetector(c) },
+	},
 }
 
 // detectorByName maps every canonical name and alias to its factory.
@@ -88,6 +98,34 @@ func buildDetector(name string, cfg config.StrategyConfig) Detector {
 	}
 
 	return nil
+}
+
+// canonicalByName maps every canonical name and alias to the canonical one.
+var canonicalByName = func() map[string]string {
+	m := make(map[string]string, len(detectorRegs)*2)
+	for _, r := range detectorRegs {
+		m[r.canonical] = r.canonical
+		for _, a := range r.aliases {
+			m[a] = r.canonical
+		}
+	}
+
+	return m
+}()
+
+// CanonicalDetector resolves a configured detector name (canonical or alias,
+// case-insensitive) to its canonical form; ok is false for a name no detector
+// is registered under.
+//
+// It exists so a caller comparing a configured detector set against some other
+// list of names — internal/autotune checking whether the optimizer's search
+// space can even produce the symbol's current config — compares canonical
+// names on both sides. Without it, a config written as `detectors: [ema, bb]`
+// would read as two unknown detectors purely because it used the aliases.
+func CanonicalDetector(name string) (string, bool) {
+	c, ok := canonicalByName[strings.ToLower(strings.TrimSpace(name))]
+
+	return c, ok
 }
 
 // AvailableDetectors lists the canonical detector names that can be configured.

@@ -182,7 +182,7 @@ func (*Mock) Candles(
 	for i := range n {
 		open := p
 
-		p *= (1 + (rng.Float64()-0.48)*0.01)
+		p *= (1 + (rng.Float64()-0.5)*0.01)
 
 		high := math.Max(open, p) * (1 + rng.Float64()*0.003)
 		low := math.Min(open, p) * (1 - rng.Float64()*0.003)

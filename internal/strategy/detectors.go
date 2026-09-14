@@ -3,6 +3,7 @@ package strategy
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/strategy/indicators"
@@ -22,6 +23,28 @@ func (*emaCrossDetector) Name() string { return "ema_cross" }
 
 // WarmupBars reports the minimum bars for a stable read.
 func (d *emaCrossDetector) WarmupBars() int { return d.slow + 2 }
+
+// emaConvergenceMultiple is how many extra periods past its SMA-seeded
+// start an EMA needs before the seed's residual influence is negligible.
+// indicators.EMA seeds from a plain SMA over the first `period` bars, then
+// recurses with weight k=2/(period+1); after n further bars the seed's
+// remaining weight is (1-k)^n, which for n = 3*period works out to roughly
+// e^-6 (~0.25%) regardless of period — a period-independent convergence
+// margin. WarmupBars only reports the minimum to produce a non-NaN value,
+// not this — so a windowed backtest fed only WarmupBars-worth of history
+// produces an EMA still meaningfully shaped by its own seed, which a live
+// run (with far more history behind it) never sees. Measured to flip up to
+// 10% of votes at some configured periods before this fix. See
+// CODE_REVIEW_FINDINGS.md's "Combined.MaxLookback() doesn't scale with EMA
+// period".
+const emaConvergenceMultiple = 3
+
+// MaxLookback reports enough history for both EMAs to have converged past
+// their SMA seed, not just enough to produce a value — see
+// emaConvergenceMultiple.
+func (d *emaCrossDetector) MaxLookback() int {
+	return emaConvergenceMultiple*d.slow + 2
+}
 
 // Detect votes on the fast-vs-slow EMA relation (trend follow).
 func (d *emaCrossDetector) Detect(s series) (Action, float64, string) {
@@ -73,12 +96,19 @@ type trendDetector struct {
 
 // newTrendDetector builds the regression-trend detector from config.
 func newTrendDetector(c config.StrategyConfig) *trendDetector {
-	p := c.TrendPeriod
+	return newTrendDetectorParams(c.TrendPeriod, c.TrendThreshold)
+}
+
+// newTrendDetectorParams builds the regression-trend detector from an explicit
+// period/threshold, so the trend gate's BUY and SELL sides can each be built
+// with their own parameters (see StrategyConfig.TrendPeriodSell).
+func newTrendDetectorParams(period int, threshold float64) *trendDetector {
+	p := period
 	if p < trendMinBars {
 		p = trendMinBars
 	}
 
-	thr := c.TrendThreshold
+	thr := threshold
 	if thr <= 0 {
 		thr = 0.01
 	}
@@ -117,8 +147,17 @@ func (d *trendDetector) Detect(s series) (Action, float64, string) {
 
 	// Fractional change the fitted line implies across the window, anchored to
 	// the line's start value so the magnitude is comparable across price levels.
+	//
+	// The singularity is at intercept -> 0 from EITHER side, not just at or
+	// below it: an intercept a fraction of a cent from zero produces the same
+	// blowup (chg in the tens of thousands of percent) whether it's +0.02 or
+	// -0.02. A sign-only guard (base <= 0) catches the negative side and
+	// completely misses the positive side. Comparing the magnitude against a
+	// fraction of the current price catches both, anchored to something that
+	// scales with the instrument instead of a hardcoded epsilon. See
+	// CODE_REVIEW_FINDINGS.md's trend-formula-singularity finding.
 	base := intercept
-	if base <= 0 {
+	if math.Abs(base) < 0.01*s.close[n-1] {
 		base = s.close[n-1]
 	}
 
@@ -207,18 +246,46 @@ func (*macdDetector) Name() string { return "macd" }
 // WarmupBars reports the minimum bars for a stable read.
 func (d *macdDetector) WarmupBars() int { return d.slow + d.signal + 2 }
 
-// Detect votes on the MACD histogram sign (momentum).
+// MaxLookback reports enough history for the underlying fast/slow EMAs and
+// the signal-line EMA (itself seeded from their still-converging early
+// output) to have converged past their SMA seeds — see
+// emaCrossDetector.MaxLookback / emaConvergenceMultiple, which this mirrors
+// for both EMA stages MACD is built from.
+func (d *macdDetector) MaxLookback() int {
+	return emaConvergenceMultiple*(d.slow+d.signal) + 2
+}
+
+// macdStrengthScale converts the histogram's price-relative magnitude
+// (|h|/price) into a 0..1 conviction, saturating around a 5% swing — chosen
+// to land in the same rough range as ema_cross's `spread*15` at a typical
+// trending move. Un-normalized (raw |h|*2, price units) made this detector's
+// vote strength — and therefore whether it clears min_strength, and how much
+// it contributes under "weighted" combine — depend on the symbol's price
+// level rather than on the move's actual significance: mute on a $3 stock,
+// saturated on a $1000 one, for an identical relative move. See
+// CODE_REVIEW_FINDINGS.md's AT-7 finding. This changes existing signal
+// behaviour; a min_strength calibrated against the old (unnormalized) scale
+// wants re-tuning.
+const macdStrengthScale = 20
+
+// Detect votes on the MACD histogram sign (momentum), scaled by the
+// histogram's size relative to price so the same relative move votes with
+// the same conviction at any price level (see macdStrengthScale).
 func (d *macdDetector) Detect(s series) (Action, float64, string) {
 	_, _, h, ok := indicators.MACDLast(s.close, d.fast, d.slow, d.signal)
-	if !ok {
+
+	price := s.close[len(s.close)-1]
+	if !ok || price <= 0 {
 		return Hold, 0, "macd: undefined"
 	}
 
+	rel := h / price
+
 	switch {
 	case h > 0:
-		return Buy, clamp01(math.Abs(h) * 2), fmt.Sprintf("macd hist %.4f>0", h)
+		return Buy, clamp01(math.Abs(rel) * macdStrengthScale), fmt.Sprintf("macd hist %.4f>0", h)
 	case h < 0:
-		return Sell, clamp01(math.Abs(h) * 2), fmt.Sprintf("macd hist %.4f<0", h)
+		return Sell, clamp01(math.Abs(rel) * macdStrengthScale), fmt.Sprintf("macd hist %.4f<0", h)
 	}
 
 	return Hold, 0, "macd flat"
@@ -656,4 +723,48 @@ func (d *donchianDetector) Detect(s series) (Action, float64, string) {
 	}
 
 	return Hold, 0, fmt.Sprintf("donchian: inside [%.2f,%.2f]", lo, up)
+}
+
+// ----- Short-term deny gate (false breakout / overextension veto) -----
+
+// denyVote runs the two checks behind Combined.denyGate and reports whether a
+// BUY should be denied, and why. Either check alone is enough to deny; a
+// disabled (<=0 period) check never denies on its own. Both checks are
+// evaluated even if the first already denies, purely for a clearer combined
+// reason string — cheap relative to the detector tally that already ran this
+// bar.
+func (c *Combined) denyVote(s series) (string, bool) {
+	var reasons []string
+
+	if c.denyBreakoutPeriod > 0 {
+		up, _, ok := indicators.DonchianLast(s.high, s.low, c.denyBreakoutPeriod)
+		if ok && len(s.close) > 0 && s.close[len(s.close)-1] >= up {
+			rvolPeriod := c.denyBreakoutRVOLPeriod
+			if rvolPeriod <= 0 {
+				rvolPeriod = c.denyBreakoutPeriod
+			}
+
+			rv, rvOK := indicators.RVOLLast(s.volume, rvolPeriod)
+			if !rvOK || rv < c.denyBreakoutRVOLThresh {
+				reasons = append(reasons, fmt.Sprintf(
+					"breakout without volume (rvol %.2f<%.2f)", rv, c.denyBreakoutRVOLThresh,
+				))
+			}
+		}
+	}
+
+	if c.denyReversalStochPeriod > 0 {
+		k, _, ok := indicators.StochasticLast(s.high, s.low, s.close, c.denyReversalStochPeriod, 1)
+		if ok && k >= c.denyReversalOverbought {
+			reasons = append(reasons, fmt.Sprintf(
+				"overextended (%d-bar %%K %.1f>=%.1f)", c.denyReversalStochPeriod, k, c.denyReversalOverbought,
+			))
+		}
+	}
+
+	if len(reasons) == 0 {
+		return "", false
+	}
+
+	return strings.Join(reasons, "; "), true
 }

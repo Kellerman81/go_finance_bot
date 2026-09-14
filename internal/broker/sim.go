@@ -23,11 +23,63 @@ func newID() string {
 type Sim struct {
 	priceOf func(symbol string) (float64, bool)
 	costOf  func(notional float64) float64
+	slipOf  SlippageFunc
 
 	mu        sync.Mutex
 	cash      float64
 	positions map[string]*Position
 	seq       int
+}
+
+// SlippageFunc moves a reference price adversely for the given side, modelling
+// the bid-ask spread and slippage a market order really pays. buy is true for a
+// buy fill.
+//
+// It takes the symbol because friction is not one number across a book: a
+// megacap trades inside a basis point where a thin ETF listing costs twenty
+// times that, and charging both the same flatters one and libels the other.
+// Callers with a single global spread can ignore the argument.
+type SlippageFunc func(symbol string, buy bool, price float64) float64
+
+// SetPriceOracle replaces the price source used to fill orders.
+//
+// It exists so a caller that builds the Sim before it has the richer oracle
+// available can install it afterwards — cmd/bot constructs the paper broker
+// before the engine that knows how to price a symbol from its bar history. A
+// nil oracle is ignored rather than leaving the Sim unable to fill anything.
+func (s *Sim) SetPriceOracle(f func(symbol string) (float64, bool)) {
+	if f == nil {
+		return
+	}
+
+	s.mu.Lock()
+
+	s.priceOf = f
+	s.mu.Unlock()
+}
+
+// SetSlippage installs the adverse fill-price model applied to every simulated
+// market fill. Without it, fills happen at the exact reference price — free
+// liquidity that does not exist in any real market. Passing nil restores that
+// frictionless behaviour.
+func (s *Sim) SetSlippage(f SlippageFunc) {
+	s.mu.Lock()
+
+	s.slipOf = f
+	s.mu.Unlock()
+}
+
+// fillPrice applies the configured slippage model to a reference price.
+func (s *Sim) fillPrice(symbol string, side Side, px float64) float64 {
+	if s.slipOf == nil {
+		return px
+	}
+
+	if adj := s.slipOf(symbol, side == Buy, px); adj > 0 {
+		return adj
+	}
+
+	return px
 }
 
 // NewSim creates a simulated broker seeded with starting cash. priceOf returns
@@ -50,6 +102,27 @@ func NewSim(
 	}
 }
 
+// SeedPositions replaces the simulated book's cash and holdings wholesale —
+// used by internal/engine's test mode when it starts, so the simulation
+// continues realistically from wherever the real account currently stands
+// rather than a flat book. Only Symbol/Qty/AvgPrice matter: Current/
+// MarketValue/UnrealizedPL are recomputed live from priceOf on every
+// GetPositions call regardless of what's passed in here, and there is no
+// real fill history to reconstruct realized P&L from — a position closed
+// during test mode prices only against this seeded average cost.
+func (s *Sim) SeedPositions(cash float64, positions []Position) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cash = cash
+	s.positions = make(map[string]*Position, len(positions))
+
+	for _, p := range positions {
+		cp := p
+		s.positions[p.Symbol] = &cp
+	}
+}
+
 // Name identifies the broker adapter.
 func (*Sim) Name() string { return "sim" }
 
@@ -63,7 +136,8 @@ func (s *Sim) SubmitOrder(_ context.Context, o Order) (OrderResult, error) {
 		return OrderResult{}, fmt.Errorf("sim: no price for %s", o.Symbol)
 	}
 
-	if o.Type == Limit && o.LimitPx > 0 {
+	limit := o.Type == Limit && o.LimitPx > 0
+	if limit {
 		// Only fill a limit order if marketable against the current price.
 		if (o.Side == Buy && px > o.LimitPx) || (o.Side == Sell && px < o.LimitPx) {
 			return OrderResult{
@@ -77,6 +151,12 @@ func (s *Sim) SubmitOrder(_ context.Context, o Order) (OrderResult, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Market orders cross the spread and suffer slippage; a limit order fills at
+	// its own price (that is the point of one), so it is left alone.
+	if !limit {
+		px = s.fillPrice(o.Symbol, o.Side, px)
+	}
 
 	notional := px * o.Qty
 	commission := s.costOf(notional)
@@ -139,6 +219,7 @@ func (s *Sim) SubmitOrder(_ context.Context, o Order) (OrderResult, error) {
 		FilledPx:    px,
 		Status:      "filled",
 		SubmittedAt: time.Now(),
+		Terminal:    true, // Sim fills instantly and deterministically
 	}, nil
 }
 

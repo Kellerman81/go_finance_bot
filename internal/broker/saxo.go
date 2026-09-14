@@ -42,6 +42,9 @@ type Saxo struct {
 	accountKey string
 	clientKey  string
 
+	preferCcy string // preferred reporting currency (e.g. EUR); empty = don't convert
+	fx        *fxConverter
+
 	mu  sync.Mutex
 	uic map[string]instrument // symbol -> resolved instrument (cached)
 
@@ -85,22 +88,30 @@ func (s *Saxo) pace(ctx context.Context) error {
 type instrument struct {
 	Uic       int
 	AssetType string
+	Currency  string // native trading currency, if the search response reported one
 }
 
 // NewSaxo constructs a Saxo broker and resolves the account/client keys. If
-// accountKey is empty, the first account from /port/v1/accounts/me is used. The
-// TokenSource supplies a (possibly auto-refreshing) bearer token per request.
-func NewSaxo(baseURL string, tokens TokenSource, accountKey, assetTypes string) (*Saxo, error) {
+// accountKey is empty, the first account from /port/v1/accounts/me is used.
+// The TokenSource supplies a (possibly auto-refreshing) bearer token per
+// request. preferCcy, if set, converts position values reported in a foreign
+// listing currency (e.g. a US stock trading in USD) and account balances into
+// this currency (empty means "don't convert").
+func NewSaxo(baseURL string, tokens TokenSource, accountKey, assetTypes, preferCcy string) (*Saxo, error) {
 	if assetTypes == "" {
 		assetTypes = "Stock,Etf"
 	}
+
+	httpClient := &http.Client{Timeout: 20 * time.Second}
 
 	s := &Saxo{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		tokens:     tokens,
 		assetTypes: assetTypes,
-		http:       &http.Client{Timeout: 20 * time.Second},
+		http:       httpClient,
 		accountKey: accountKey,
+		preferCcy:  strings.ToUpper(preferCcy),
+		fx:         newFXConverter(httpClient),
 		uic:        make(map[string]instrument),
 	}
 	if err := s.resolveAccount(context.Background()); err != nil {
@@ -119,11 +130,14 @@ func NewSaxoHistory(baseURL string, tokens TokenSource, assetTypes string) *Saxo
 		assetTypes = "Stock,Etf"
 	}
 
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+
 	return &Saxo{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		tokens:     tokens,
 		assetTypes: assetTypes,
-		http:       &http.Client{Timeout: 20 * time.Second},
+		http:       httpClient,
+		fx:         newFXConverter(httpClient),
 		uic:        make(map[string]instrument),
 	}
 }
@@ -131,11 +145,57 @@ func NewSaxoHistory(baseURL string, tokens TokenSource, assetTypes string) *Saxo
 // Name identifies the broker adapter.
 func (*Saxo) Name() string { return "saxo" }
 
+// saxoIdentifierParams are the query parameters several Saxo endpoints carry
+// (ClientKey/AccountKey identify the account, not a credential) that do
+// blank on being logged: an operator can freely quote a client/account key,
+// but a full request path (with these attached, as orderWorking/GetAccount
+// and others build it) landing verbatim in the UI-visible errlog ring is
+// more than the error itself needs to say. See CODE_REVIEW_FINDINGS.md's
+// Saxo-request-path-logging finding.
+var saxoIdentifierParams = []string{"ClientKey", "AccountKey"}
+
+// redactSaxoPath blanks saxoIdentifierParams' values out of path's query
+// string, for use in error messages/logs. The real path (with the real
+// values) is still what the actual HTTP request uses — only what reaches
+// errlog is redacted.
+func redactSaxoPath(path string) string {
+	base, query, hasQuery := strings.Cut(path, "?")
+	if !hasQuery {
+		return path
+	}
+
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		return base + "?<redacted>"
+	}
+
+	redacted := false
+
+	for _, p := range saxoIdentifierParams {
+		if q.Has(p) {
+			q.Set(p, "REDACTED")
+			redacted = true
+		}
+	}
+
+	if !redacted {
+		return path
+	}
+
+	return base + "?" + q.Encode()
+}
+
 // do performs an authenticated Saxo OpenAPI call, recording failures in the
 // error log and decoding the JSON response into out.
 //
 //nolint:cyclop // linear request/response handling; splitting hurts readability
 func (s *Saxo) do(ctx context.Context, method, path string, body, out any) (err error) {
+	// path itself (used below to build the actual request) may carry
+	// ClientKey/AccountKey in its query string; every error message built
+	// from it here uses this redacted copy instead, so those identifiers
+	// never reach the UI-visible errlog ring. See redactSaxoPath.
+	safePath := redactSaxoPath(path)
+
 	defer func() {
 		if err != nil {
 			errlog.Record("saxo", err.Error())
@@ -182,18 +242,18 @@ func (s *Saxo) do(ctx context.Context, method, path string, body, out any) (err 
 			"saxo %s %s: 401 unauthorized — token expired/invalid, or token/gateway environment mismatch "+
 				"(SIM tokens only work on .../sim/openapi, live tokens only on .../openapi); base_url=%s",
 			method,
-			path,
+			safePath,
 			s.baseURL,
 		)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("saxo %s %s: status %d: %s", method, path, resp.StatusCode, string(data))
+		return fmt.Errorf("saxo %s %s: status %d: %s", method, safePath, resp.StatusCode, string(data))
 	}
 
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("saxo decode %s: %w", path, err)
+			return fmt.Errorf("saxo decode %s: %w", safePath, err)
 		}
 	}
 
@@ -242,10 +302,11 @@ func (s *Saxo) resolveAccount(ctx context.Context) error {
 
 // saxoInstrumentHit is one entry of the instrument-search response.
 type saxoInstrumentHit struct {
-	Identifier  int    `json:"Identifier"`
-	AssetType   string `json:"AssetType"`
-	Symbol      string `json:"Symbol"`
-	Description string `json:"Description"`
+	Identifier   int    `json:"Identifier"`
+	AssetType    string `json:"AssetType"`
+	Symbol       string `json:"Symbol"`
+	Description  string `json:"Description"`
+	CurrencyCode string `json:"CurrencyCode"`
 }
 
 // resolveInstrument maps a ticker to a Saxo Uic and asset type, with caching.
@@ -285,7 +346,10 @@ func (s *Saxo) resolveInstrument(ctx context.Context, symbol string) (instrument
 		}
 	}
 
-	inst := instrument{Uic: pick.Identifier, AssetType: pick.AssetType}
+	inst := instrument{
+		Uic: pick.Identifier, AssetType: pick.AssetType,
+		Currency: strings.ToUpper(pick.CurrencyCode),
+	}
 
 	s.mu.Lock()
 
@@ -293,6 +357,81 @@ func (s *Saxo) resolveInstrument(ctx context.Context, symbol string) (instrument
 	s.mu.Unlock()
 
 	return inst, nil
+}
+
+// fxRateForCurrency returns the multiplier to convert 1 unit of ccy into
+// preferCcy (1 if they're the same, ccy is unknown, no preferCcy is
+// configured, or the rate can't be fetched — logged in that last case).
+func (s *Saxo) fxRateForCurrency(ctx context.Context, ccy string) float64 {
+	rate, _ := s.fxRateForCurrencyResolved(ctx, ccy)
+	return rate
+}
+
+// fxRateForCurrencyResolved is fxRateForCurrency plus whether the rate is a
+// genuine fact (same currency, or a successful fetch) rather than a 1:1
+// fallback after a failed one. A caller pricing an order can use
+// fxRateForCurrency's plain form — 1:1 is an acceptable stopgap there, the
+// order still goes out. A caller reporting a position's FXRate (GetPositions)
+// must use this form and leave FXRate at its zero value on !resolved, rather
+// than reporting the fallback 1 as if it were real: the engine treats any
+// nonzero FXRate as authoritative and caches it (see Engine.syncPortfolio),
+// so a fallback value there would silently overwrite a previously-correct
+// cached rate. See CODE_REVIEW_FINDINGS.md's FX-fallback finding.
+func (s *Saxo) fxRateForCurrencyResolved(ctx context.Context, ccy string) (rate float64, resolved bool) {
+	if s.preferCcy == "" || ccy == "" || ccy == s.preferCcy {
+		return 1, true
+	}
+
+	rate, err := s.fx.Rate(ctx, ccy, s.preferCcy)
+	if err != nil {
+		errlog.Recordf("saxo", "fx rate %s->%s: %s (using 1:1)", ccy, s.preferCcy, err)
+		return 1, false
+	}
+
+	return rate, true
+}
+
+// InstrumentCurrency implements CurrencyResolver.
+//
+// Unlike fxRateForCurrency (used for order pricing, where falling back to
+// 1:1 on a transient FX failure is an acceptable degraded mode — the order
+// still goes out), this propagates a rate-fetch failure as a real error
+// rather than silently returning 1. The engine's FX rate cache (see
+// Engine.resolveFXRates/refreshFXRates) relies on that distinction to skip
+// caching on failure instead of overwriting a previously-correct rate with
+// 1 — see CODE_REVIEW_FINDINGS.md's FX-fallback finding.
+func (s *Saxo) InstrumentCurrency(ctx context.Context, symbol string) (string, float64, error) {
+	inst, err := s.resolveInstrument(ctx, symbol)
+	if err != nil {
+		return "", 1, err
+	}
+
+	rate, resolved := s.fxRateForCurrencyResolved(ctx, inst.Currency)
+	if !resolved {
+		return inst.Currency, 1, fmt.Errorf("fx rate %s->%s: fetch failed", inst.Currency, s.preferCcy)
+	}
+
+	return inst.Currency, rate, nil
+}
+
+// AssetClass reports symbol's Saxo AssetType ("Stock", "Etf", "Bond",
+// "ContractFutures", ...), implementing AssetClassifier so the portfolio
+// allocation caps can bucket a position the data provider could not classify.
+//
+// Note that the search is scoped to the configured saxo.asset_types, so an
+// instrument outside that scope is not resolvable here at all — which is
+// correct: the bot cannot trade it either.
+func (s *Saxo) AssetClass(ctx context.Context, symbol string) (string, error) {
+	inst, err := s.resolveInstrument(ctx, symbol)
+	if err != nil {
+		return "", err
+	}
+
+	if inst.AssetType == "" {
+		return "", fmt.Errorf("saxo: no asset type for %q", symbol)
+	}
+
+	return inst.AssetType, nil
 }
 
 // SubmitOrder resolves the instrument, floors the quantity to whole shares,
@@ -353,7 +492,24 @@ func (s *Saxo) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 		"OrderDuration": map[string]any{"DurationType": "DayOrder"},
 	}
 	if o.Type == Limit {
-		body["OrderPrice"] = o.LimitPx
+		// o.LimitPx arrives in preferCcy (like everything else this adapter
+		// reports); Saxo expects OrderPrice in the instrument's own currency.
+		//
+		// Using fxRateForCurrency's plain fallback-to-1 form here (as this
+		// used to) silently sends an unconverted price when the rate fetch
+		// fails — a €150 stop-loss transmitted as OrderPrice: 150 in USD on
+		// a $163 stock is off by ~9%, not just mislabeled. Refuse the order
+		// instead: a failed submission is loud and retried next cycle; a
+		// mispriced protective order is neither. See
+		// CODE_REVIEW_FINDINGS.md's Alpaca/Saxo order-pricing FX finding.
+		rate, resolved := s.fxRateForCurrencyResolved(ctx, inst.Currency)
+		if !resolved {
+			return OrderResult{}, fmt.Errorf(
+				"saxo: cannot price limit order for %s: fx rate %s->%s unavailable",
+				o.Symbol, inst.Currency, s.preferCcy)
+		}
+
+		body["OrderPrice"] = o.LimitPx / rate
 	}
 
 	var resp struct {
@@ -394,9 +550,17 @@ const (
 // working-order list. Saxo's placement response carries no fill data, and the
 // portfolio sync never feeds realized P&L — so the disappearance of an order
 // we did not cancel (day-order expiry only happens at end of day) is taken as
-// the fill, and the submitted amount is reported filled. The fill price is
-// left 0; callers fall back to their confirmed reference price. An order still
-// working at the deadline is returned unchanged with its honest zero fill.
+// the fill, and the submitted amount is reported filled with Terminal: true —
+// this is the only signal Saxo gives us, so unlike Trading 212 and Alpaca
+// there is no separate "unconfirmed" outcome to fall back to here. An order
+// still working at the deadline, or one whose check errored, is returned
+// unchanged with Terminal left false — its honest zero fill is not confirmed.
+//
+// The first check waits one poll interval rather than firing immediately
+// after the POST returns: /port/v1/orders/me is a separate portfolio-service
+// read of an order the trade service has just accepted, and checking before
+// it has had a chance to propagate risks reading "not yet listed" as "already
+// filled".
 func (s *Saxo) confirmFill(ctx context.Context, res OrderResult) OrderResult {
 	if res.ID == "" {
 		return res
@@ -404,6 +568,12 @@ func (s *Saxo) confirmFill(ctx context.Context, res OrderResult) OrderResult {
 
 	deadline := time.Now().Add(saxoFillWait)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return res
+		case <-time.After(saxoPollInterval):
+		}
+
 		working, err := s.orderWorking(ctx, res.ID)
 		if err != nil {
 			return res
@@ -412,13 +582,9 @@ func (s *Saxo) confirmFill(ctx context.Context, res OrderResult) OrderResult {
 		if !working {
 			res.FilledQty = res.Qty
 			res.Status = "filled"
-			return res
-		}
+			res.Terminal = true
 
-		select {
-		case <-ctx.Done():
 			return res
-		case <-time.After(saxoPollInterval):
 		}
 	}
 
@@ -451,7 +617,8 @@ func (s *Saxo) orderWorking(ctx context.Context, orderID string) (bool, error) {
 	return false, nil
 }
 
-// GetAccount returns the account's balances from /port/v1/balances.
+// GetAccount returns the account's balances from /port/v1/balances, converted
+// to preferCcy if it differs from the account's own base currency.
 func (s *Saxo) GetAccount(ctx context.Context) (Account, error) {
 	q := url.Values{}
 	q.Set("ClientKey", s.clientKey)
@@ -473,12 +640,18 @@ func (s *Saxo) GetAccount(ctx context.Context) (Account, error) {
 		bp = resp.CashBalance
 	}
 
-	return Account{
-		Cash:        resp.CashBalance,
-		Equity:      resp.TotalValue,
-		BuyingPower: bp,
-		Currency:    resp.Currency,
-	}, nil
+	cash, equity, ccy := resp.CashBalance, resp.TotalValue, resp.Currency
+
+	if s.preferCcy != "" && ccy != "" && ccy != s.preferCcy {
+		if rate, err := s.fx.Rate(ctx, ccy, s.preferCcy); err != nil {
+			errlog.Recordf("saxo", "fx rate %s->%s: %s (using 1:1, balances will be wrong)", ccy, s.preferCcy, err)
+		} else {
+			cash, equity, bp = cash*rate, equity*rate, bp*rate
+			ccy = s.preferCcy
+		}
+	}
+
+	return Account{Cash: cash, Equity: equity, BuyingPower: bp, Currency: ccy}, nil
 }
 
 // saxoChartBar is one OHLCV sample from the chart endpoint.
@@ -583,6 +756,10 @@ type saxoNetPosition struct {
 }
 
 // GetPositions returns the account's net positions mapped to plain symbols.
+// AverageOpenPrice/CurrentPrice/MarketValue/ProfitLossOnTrade are reported by
+// Saxo in the instrument's own listing currency (e.g. USD for a US stock),
+// not the account's base currency; when preferCcy is set they're converted
+// into it, matching Trading 212's adapter.
 func (s *Saxo) GetPositions(ctx context.Context) ([]Position, error) {
 	q := url.Values{}
 	q.Set("ClientKey", s.clientKey)
@@ -606,14 +783,26 @@ func (s *Saxo) GetPositions(ctx context.Context) ([]Position, error) {
 	out := make([]Position, 0, len(resp.Data))
 	for _, d := range resp.Data {
 		sym := strings.Split(d.DisplayAndFormat.Symbol, ":")[0]
+		ccy := strings.ToUpper(d.DisplayAndFormat.Currency)
+		rate, resolved := s.fxRateForCurrencyResolved(ctx, ccy)
+
+		// A failed fetch still uses rate (1, a stopgap) to convert THIS
+		// position's prices, but must not claim FXRate as fact — see
+		// fxRateForCurrencyResolved's doc comment.
+		reportedRate := rate
+		if !resolved {
+			reportedRate = 0
+		}
 
 		out = append(out, Position{
 			Symbol:       sym,
 			Qty:          d.NetPositionBase.Amount,
-			AvgPrice:     d.NetPositionView.AverageOpenPrice,
-			Current:      d.NetPositionView.CurrentPrice,
-			MarketValue:  d.NetPositionView.MarketValue,
-			UnrealizedPL: d.NetPositionView.ProfitLossOnTrade,
+			AvgPrice:     d.NetPositionView.AverageOpenPrice * rate,
+			Current:      d.NetPositionView.CurrentPrice * rate,
+			MarketValue:  d.NetPositionView.MarketValue * rate,
+			UnrealizedPL: d.NetPositionView.ProfitLossOnTrade * rate,
+			Currency:     ccy,
+			FXRate:       reportedRate,
 		})
 	}
 

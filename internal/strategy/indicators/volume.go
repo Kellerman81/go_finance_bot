@@ -65,18 +65,53 @@ func RVOLLast(volume []float64, period int) (float64, bool) {
 		return 0, false
 	}
 
-	var sum float64
-
-	for j := n - 1 - period; j < n-1; j++ {
-		sum += volume[j]
-	}
-
-	avg := sum / float64(period)
-	if avg <= 0 {
+	avg, ok := activeMean(volume[n-1-period : n-1])
+	if !ok {
 		return 0, false
 	}
 
 	return volume[n-1] / avg, true
+}
+
+// activeMean averages the bars that actually traded, ignoring empty intervals.
+//
+// The baseline has to exclude them or the indicator inverts its own meaning. A
+// thinly-traded instrument spends most intervals at zero volume; averaging those
+// in drags the baseline toward zero, so ANY bar that traded reads as a surge —
+// on real numbers, 3 traded bars out of 20 gives every one of them an RVOL near
+// 6.7 against a default threshold of 1.5. The detector would fire on every
+// traded minute, which is noise dressed as signal.
+//
+// "Unusually active compared with a typical ACTIVE bar" is the question RVOL is
+// for, and it is also what the live engine computed before quiet intervals
+// started producing flat bars. Provider history for illiquid instruments carries
+// zero-volume bars too, so this keeps live and backtest reading the same.
+//
+// ok is false when nothing in the window traded: there is no baseline, so there
+// is no answer, and the caller holds.
+func activeMean(volume []float64) (float64, bool) {
+	var (
+		sum    float64
+		traded int
+	)
+
+	for _, v := range volume {
+		if v > 0 {
+			sum += v
+			traded++
+		}
+	}
+
+	if traded == 0 {
+		return 0, false
+	}
+
+	avg := sum / float64(traded)
+	if avg <= 0 {
+		return 0, false
+	}
+
+	return avg, true
 }
 
 // RVOL returns Relative Volume: each bar's volume divided by the average volume
@@ -90,14 +125,8 @@ func RVOL(volume []float64, period int) []float64 {
 	}
 
 	for i := period; i < n; i++ {
-		var sum float64
-
-		for j := i - period; j < i; j++ {
-			sum += volume[j]
-		}
-
-		avg := sum / float64(period)
-		if avg > 0 {
+		// Same baseline as RVOLLast: bars that traded. See activeMean.
+		if avg, ok := activeMean(volume[i-period : i]); ok {
 			out[i] = volume[i] / avg
 		}
 	}

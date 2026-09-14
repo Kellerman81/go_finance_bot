@@ -1,0 +1,132 @@
+{{define "dashboard"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "dash.engine"}} <span class="sub">{{call $t "dash.engineSub"}}</span></h2>
+  <div class="tiles">
+    {{template "tile" dict "label" (call $t "dash.tile.equity") "value" (money .Positions.Equity)}}
+    {{template "tile" dict "label" (call $t "dash.tile.cash") "value" (money .Positions.Cash)}}
+    {{template "tile" dict "label" (call $t "dash.tile.positions") "value" (int .Positions.OpenPositions)}}
+    {{template "tile" dict "label" (call $t "dash.tile.spent") "value" (money .Status.SpentToday)}}
+    {{template "tile" dict "label" (call $t "dash.tile.symbols") "value" (int .Status.Symbols)}}
+    {{template "tile" dict "label" (call $t "dash.tile.evals") "value" (int .Metrics.EvalCycles)}}
+    {{template "tile" dict "label" (call $t "dash.tile.orders") "value" (int .Metrics.OrdersSubmitted)}}
+    {{template "tile" dict "label" (call $t "dash.tile.lastEval") "value" (ago .Status.LastEval)}}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>{{call $t "dash.open"}} <span class="sub">{{call $t "dash.openSub"}}</span></h2>
+  {{if .Open}}
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th>
+        <th class="num">{{call $t "col.qty"}}</th>
+        <th class="num">{{call $t "col.entry"}}</th>
+        <th class="num">{{call $t "col.peak"}}</th>
+        <th></th>
+      </tr></thead>
+      <tbody>
+      {{range .Open}}
+        <tr>
+          <td>{{.Symbol}}</td>
+          <td class="num">{{num4 .Qty}}</td>
+          <td class="num">{{num .EntryPrice}}</td>
+          <td class="num">{{num .Peak}}</td>
+          <td class="num">
+            <button class="sell small" type="button"
+                    data-post="/api/orders"
+                    data-body='{"symbol":"{{.Symbol}}","side":"sell","qty":{{num4 .Qty}}}'
+                    data-confirm="{{call $t "confirm.sell" "qty" (num4 .Qty) "symbol" .Symbol}}"
+              >{{call $t "action.sell"}}</button>
+            <button class="danger small" type="button"
+                    data-delete="/api/open/{{.Symbol}}"
+                    title="{{call $t "action.forgetHelp"}}"
+                    data-confirm="{{call $t "confirm.forget" "symbol" .Symbol}}"
+              >{{call $t "action.forget"}}</button>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "dash.noOpen"}}</div>{{end}}
+  <div class="panel-actions">
+    <button class="ghost small" type="button"
+            data-post="/api/trading" data-body='{"enabled":{{not .Status.TradingEnabled}}}'
+            {{if not .Status.TradingEnabled}}data-confirm="{{call $t "confirm.enableTrading"}}"{{end}}
+      >{{call $t "dash.toggleTrading"}}</button>
+    {{if .Status.TestModeActive}}
+      <button class="ghost small" type="button"
+              data-post="/api/testmode/stop"
+              data-confirm="{{call $t "confirm.disableTestMode"}}"
+        >{{call $t "dash.stopTestMode"}}</button>
+    {{else}}
+      <button class="ghost small" type="button"
+              data-post="/api/testmode/start"
+        >{{call $t "dash.startTestMode"}}</button>
+    {{end}}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>{{call $t "dash.signals"}}</h2>
+  {{if .Signals}}
+    <div class="scroll tall"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th>
+        <th>{{call $t "col.action"}}</th>
+        <th class="num">{{call $t "col.strength"}}</th>
+        <th class="num">{{call $t "col.price"}}</th>
+      </tr></thead>
+      <tbody>
+      {{range .Signals}}
+        <tr title="{{.Reason}}">
+          <td>{{.Symbol}}</td>
+          <td class="{{actionClass .Action}}">{{.Action}}</td>
+          <td class="num">{{num .Strength}}</td>
+          <td class="num">{{num .Price}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "dash.noSignals"}}</div>{{end}}
+</section>
+
+<section class="panel wide" data-fetch="/v2/f/activity" data-target="self" data-poll="5000">
+  {{template "activity" .}}
+</section>
+{{end}}
+
+{{define "tile"}}
+<div class="tile"><span class="label">{{.label}}</span><span class="value">{{.value}}</span></div>
+{{end}}
+
+{{define "activity"}}
+{{$t := .T}}
+<h2>{{call $t "dash.activity"}} <span class="sub">{{call $t "dash.activitySub"}}</span></h2>
+{{if .Trades}}
+  <div class="scroll tall"><table>
+    <thead><tr>
+      <th>{{call $t "col.time"}}</th>
+      <th>{{call $t "col.symbol"}}</th>
+      <th>{{call $t "col.side"}}</th>
+      <th class="num">{{call $t "col.qty"}}</th>
+      <th class="num">{{call $t "col.price"}}</th>
+      <th>{{call $t "col.status"}}</th>
+      <th>{{call $t "col.reason"}}</th>
+    </tr></thead>
+    <tbody>
+    {{range .Trades}}
+      <tr>
+        <td>{{time .Time}}</td>
+        <td>{{.Symbol}}</td>
+        <td class="{{if eq (printf "%s" .Side) "buy"}}act-BUY{{else}}act-SELL{{end}}">{{.Side}}</td>
+        <td class="num">{{num4 .Qty}}</td>
+        <td class="num">{{num .Price}}</td>
+        <td>{{.Status}}</td>
+        <td>{{if .Err}}{{.Err}}{{else}}{{.Reason}}{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+{{else}}<div class="empty">{{call $t "dash.noActivity"}}</div>{{end}}
+{{end}}

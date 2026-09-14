@@ -1,0 +1,410 @@
+/*
+ * The whole stylesheet. It is one file on purpose: a strict CSP forbids inline
+ * style, so anything that would have been a style="" attribute has to be a class
+ * here, and having them in one place is what keeps that manageable.
+ *
+ * Colours come from custom properties on :root, switched by [data-theme] on the
+ * document element, so a theme is a variable block rather than a second sheet.
+ */
+
+:root[data-theme="dark"] {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1d2129;
+  --line: #262b36;
+  --fg: #e6e8ec;
+  --mut: #8b94a7;
+  --faint: #69707f;
+  --acc: #4c8bf5;
+  --buy: #2ecc71;
+  --sell: #e74c3c;
+  --hold: #7f8c8d;
+  --warn: #e0b34c;
+  --danger-bg: #3a1518;
+  --danger-line: #6e2228;
+  --danger-fg: #f0c0c4;
+  --input-bg: #0e1016;
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --panel-2: #f0f2f5;
+  --line: #d8dce3;
+  --fg: #1b1f27;
+  --mut: #5b6473;
+  --faint: #7a8290;
+  --acc: #1f5fd0;
+  --buy: #148f4b;
+  --sell: #c0392b;
+  --hold: #6b7280;
+  --warn: #8a6100;
+  --danger-bg: #fdecee;
+  --danger-line: #e6a3aa;
+  --danger-fg: #7a1b24;
+  --input-bg: #ffffff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Keyboard-only skip link. */
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--acc);
+  color: #fff;
+  padding: 8px 14px;
+  z-index: 100;
+}
+.skip:focus { left: 0; }
+
+/* ---- top bar ---- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  flex-wrap: wrap;
+}
+.brand { font-size: 15px; margin: 0; letter-spacing: .2px; }
+.pills { display: flex; gap: 6px; flex-wrap: wrap; margin-right: auto; }
+/* The polled fragment is a wrapper element, but its pills must sit in the same
+   flex row as the client-owned one beside it. */
+.pills-group { display: contents; }
+.topbar-actions { display: flex; gap: 6px; align-items: center; }
+
+.pill {
+  padding: 2px 9px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: var(--panel-2);
+  color: var(--mut);
+  white-space: nowrap;
+}
+.pill.on { background: color-mix(in srgb, var(--buy) 18%, transparent); color: var(--buy); }
+.pill.off { background: color-mix(in srgb, var(--sell) 18%, transparent); color: var(--sell); }
+.pill.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+
+/* Marks a watchlist row the screener supplied, which a later pass may drop.
+   Deliberately quiet: it is a provenance note beside the symbol, not a status. */
+.tag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  letter-spacing: .02em;
+  background: var(--panel-2);
+  color: var(--mut);
+  vertical-align: middle;
+}
+/* The broker will not trade this instrument at all — worth noticing, since the
+   bot has stopped trying and will not remove it for you. */
+.tag.bad { background: color-mix(in srgb, var(--sell) 18%, transparent); color: var(--sell); }
+/* The broker can trade this listing — the one an operator should pick out of a
+   company's seven venues. */
+.tag.good { background: color-mix(in srgb, var(--buy) 18%, transparent); color: var(--buy); }
+/* Still addable, still readable, just not where the eye should land. */
+.dim { opacity: .55; }
+
+/* A watchlist / search row carries the ticker and the company name. The ticker
+   is what the bot trades so it leads and stays monospaced-ish; the name is what
+   a human recognises, so it is present but never competes for attention. */
+.sym { font-weight: 600; }
+.sub-name {
+  display: block;
+  font-size: 11px;
+  color: var(--mut);
+  white-space: normal;
+  max-width: 46ch;
+}
+
+/* ---- controls ---- */
+button {
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 11px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+}
+button:hover { border-color: var(--acc); }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 1px;
+}
+button[disabled] { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+button.danger { color: var(--sell); border-color: color-mix(in srgb, var(--sell) 45%, var(--line)); }
+button.sell { background: var(--sell); border-color: var(--sell); color: #fff; }
+button.ghost { background: transparent; }
+button.small { padding: 2px 8px; font-size: 12px; }
+
+input, select, textarea {
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 7px;
+  width: 100%;
+  font: inherit;
+}
+select.compact, input.compact { width: auto; min-width: 90px; }
+textarea { min-height: 64px; resize: vertical; }
+
+/* ---- tabs ---- */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  position: sticky;
+  top: 49px;
+  z-index: 4;
+}
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 9px 13px;
+  color: var(--mut);
+  white-space: nowrap;
+}
+.tab:hover { border-color: transparent; color: var(--fg); }
+.tab[aria-current="page"] { color: var(--fg); border-bottom-color: var(--acc); }
+
+/* ---- layout ---- */
+.main { padding: 14px; outline: none; }
+/*
+ * Panels flow into rows and share out whatever width the row has left.
+ *
+ * This is a wrapping flexbox rather than the obvious
+ * `grid-template-columns: repeat(auto-fit, minmax(340px, 1fr))` because
+ * auto-fit only collapses tracks that are EMPTY, and every view here has at
+ * least one `.wide` panel spanning the whole row. That panel occupies every
+ * track, so no track ever collapses and each narrow panel is pinned to one
+ * track's width: on a 2000px window the watchlist and the quotes list sat in
+ * two 380px cards with half the window blank beside them. Flex items have no
+ * tracks to be pinned to — they grow into the space instead.
+ */
+.view { display: flex; flex-wrap: wrap; gap: 14px; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  /* 340px is the wrap threshold, not a width: panels grow past it to fill the
+     row and only drop to the next line when they cannot hold it. */
+  flex: 1 1 340px;
+  min-width: 0;
+}
+.panel.wide { flex-basis: 100%; }
+/* Two shares of the leftover width instead of one, for the panel that carries
+   its row — a dense list of symbols, tags and buttons does more with the space
+   than the two columns of numbers beside it. */
+.panel.lead { flex-grow: 2; }
+.panel h2 { margin: 0 0 4px; font-size: 14px; display: flex; align-items: baseline; gap: 8px; }
+.panel h2 .sub { font-size: 12px; color: var(--mut); font-weight: 400; }
+.panel-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+
+/* ---- tables ---- */
+.scroll { overflow-x: auto; }
+/* A capped scroller so one long list cannot push the rest of the view off the
+   screen. It scales with the window: a flat 340px showed six of a hundred
+   watchlist rows on a screen with room for fifteen. The floor keeps a laptop
+   where it was, the ceiling stops a tall monitor from turning the cap off. */
+.scroll.tall { max-height: clamp(320px, 45vh, 620px); overflow-y: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 5px 7px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--mut); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--panel-2); }
+.act-BUY { color: var(--buy); }
+.act-SELL { color: var(--sell); }
+.act-HOLD { color: var(--hold); }
+.win { color: var(--buy); }
+.loss { color: var(--sell); }
+
+/* ---- tiles ---- */
+.tiles { display: flex; flex-wrap: wrap; gap: 18px; }
+.tile .label { display: block; font-size: 12px; color: var(--mut); }
+.tile .value { font-size: 18px; font-variant-numeric: tabular-nums; }
+
+/* ---- forms ---- */
+/*
+ * Fields flow into as many columns as the panel is wide enough for. A settings
+ * block is 6 to 39 fields; one column of those is a page nobody reads to the
+ * end of, and it left half the row empty on any screen wider than a phone.
+ *
+ * align-items:start stops a field with two lines of help from stretching its
+ * neighbours to match.
+ */
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 2px 18px;
+  align-items: start;
+}
+.field { margin-bottom: 9px; min-width: 0; }
+.field label { display: block; font-size: 12px; color: var(--mut); margin-bottom: 2px; }
+.field .help { font-size: 11px; color: var(--faint); margin-top: 2px; }
+.field.invalid input, .field.invalid select { border-color: var(--sell); }
+.field .err { font-size: 11px; color: var(--sell); margin-top: 2px; }
+.fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 0 0 10px; }
+.fieldset > legend { font-size: 12px; color: var(--mut); padding: 0 5px; }
+
+.muted { color: var(--mut); }
+.small { font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.right { margin-left: auto; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1 1 auto; min-width: 120px; }
+.empty { color: var(--mut); font-size: 13px; padding: 10px 2px; }
+
+/* ---- banners ---- */
+.banners:empty { display: none; }
+.banner {
+  position: relative;
+  background: var(--danger-bg);
+  border-bottom: 1px solid var(--danger-line);
+  color: var(--danger-fg);
+  padding: 10px 44px 10px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.banner strong { color: inherit; font-weight: 700; }
+.banner .close {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 7px;
+}
+
+/* ---- toasts ---- */
+.toasts {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 50;
+  max-width: min(420px, 92vw);
+}
+.toast {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .28);
+  overflow-wrap: anywhere;
+}
+.toast.ok { border-left-color: var(--buy); }
+.toast.err { border-left-color: var(--sell); }
+.toast.info { border-left-color: var(--acc); }
+
+/* ---- login ---- */
+.login { max-width: 380px; margin: 8vh auto; }
+.login .panel { padding: 18px; }
+
+/* ---- misc ---- */
+/* ---- the server-rendered SVG chart ---- */
+/* ---- chart axes ---- */
+.chart { position: relative; margin-top: 8px; }
+.chart svg { width: 100%; height: 320px; display: block; overflow: visible; }
+.chart-y { position: absolute; inset: 0; pointer-events: none; }
+.chart-y span {
+  position: absolute;
+  left: 4px;
+  font-size: 11px;
+  color: var(--mut);
+  font-variant-numeric: tabular-nums;
+}
+.chart-x { position: relative; height: 16px; }
+.chart-x span {
+  position: absolute;
+  font-size: 11px;
+  color: var(--mut);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* Grid-line positions. The SVG box is 320px tall and its viewBox is 320
+ * units tall, so vertical units are pixels; only x is stretched, which is
+ * why the horizontal labels are placed as percentages. */
+.chart-y .y0 { top: 6.0px; }
+.chart-y .y1 { top: 64.6px; }
+.chart-y .y2 { top: 123.3px; }
+.chart-y .y3 { top: 181.9px; }
+.chart-y .y4 { top: 240.5px; }
+.chart-x .x0 { left: 5.80%; transform: none; }
+.chart-x .x1 { left: 29.05%; transform: translateX(-50%); }
+.chart-x .x2 { left: 52.30%; transform: translateX(-50%); }
+.chart-x .x3 { left: 75.55%; transform: translateX(-50%); }
+.chart-x .x4 { left: 98.80%; transform: translateX(-100%); }
+
+.chart svg .grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart svg .vol { opacity: .22; }
+.chart svg .vol.up, .chart svg .candle.up rect { fill: var(--buy); }
+.chart svg .vol.down, .chart svg .candle.down rect { fill: var(--sell); }
+.chart svg .candle.up line { stroke: var(--buy); }
+.chart svg .candle.down line { stroke: var(--sell); }
+.chart svg .candle line { stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart svg .candle:hover rect { stroke: var(--fg); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart svg .line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.chart svg .line.up { stroke: var(--buy); }
+.chart svg .line.down { stroke: var(--sell); }
+.chart svg .mark { vector-effect: non-scaling-stroke; }
+.chart svg .mark.up.filled { fill: var(--buy); }
+.chart svg .mark.down.filled { fill: var(--sell); }
+.chart svg .mark.pending { fill: none; stroke-width: 1.5; }
+.chart svg .mark.up.pending { stroke: var(--buy); }
+.chart svg .mark.down.pending { stroke: var(--sell); }
+
+/* ---- collapsible settings blocks ---- */
+details.panel > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 2px 0;
+  font-size: 14px;
+}
+details.panel > summary::-webkit-details-marker { display: none; }
+/*
+ * The disclosure triangles are literal characters, not CSS escapes. A
+ * "\25b8" here was mangled on the way into the file into a raw control byte
+ * followed by the text "b8" — which is what every settings block displayed.
+ * The file is UTF-8 and the page declares it, so an escape buys nothing.
+ */
+details.panel > summary::before { content: "▸ "; color: var(--mut); }
+details.panel[open] > summary::before { content: "▾ "; }
+.noscript { padding: 16px; }
+.loading { color: var(--mut); font-size: 13px; padding: 14px 2px; }
+code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: .92em; }
+
+@media (max-width: 560px) {
+  .tabs { top: 0; position: static; }
+  .main { padding: 10px; }
+}

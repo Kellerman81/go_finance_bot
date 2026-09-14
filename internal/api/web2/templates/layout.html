@@ -1,0 +1,79 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="{{.Lang}}" data-theme="dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="referrer" content="no-referrer"/>
+<title>go_finance_bot</title>
+<link rel="stylesheet" href="/v2/static/app.css"/>
+</head>
+<body>
+<!--
+  The shell. Everything below #view is rendered by the server and swapped in by
+  about 180 lines of JavaScript whose entire vocabulary is "fetch this, put it
+  there". There is no inline script and no inline style, which is what lets the
+  server send a Content-Security-Policy with no 'unsafe-inline'.
+-->
+<a class="skip" href="#main">{{call .T "common.skip"}}</a>
+
+<header class="topbar">
+  <h1 class="brand">go_finance_bot</h1>
+  <div class="pills">
+    <span class="pills-group" id="pills"
+          data-fetch="/v2/f/pills" data-target="#pills" data-poll="5000"></span>
+    {{/* The connection pill is client state and lives OUTSIDE the polled
+         fragment: inside it, the 5-second refresh replaced the element and
+         threw away whatever the stream handler had just set. Both labels ride
+         along as data attributes because the client has no access to the
+         translation catalogs. */}}
+    <span class="pill warn" id="live-pill"
+          data-up="{{call .T "pill.live"}}"
+          data-down="{{call .T "pill.liveDown"}}"
+          data-help="{{call .T "pill.liveHelp"}}"
+          title="{{call .T "pill.liveHelp"}}">{{call .T "pill.liveDown"}}</span>
+  </div>
+  <div class="topbar-actions">
+    <select id="lang" aria-label="Language">
+      {{$lang := .Lang}}
+      {{range .Languages}}
+        <option value="{{.Code}}" {{if eq .Code $lang}}selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+    <button id="theme" class="ghost" type="button">{{call .T "chrome.theme"}}</button>
+    <button class="ghost" type="button" data-refresh>{{call .T "chrome.refresh"}}</button>
+    <button id="lock" class="ghost" type="button" hidden
+            title="{{call .T "chrome.lockHelp"}}">{{call .T "chrome.lock"}}</button>
+  </div>
+</header>
+
+<div id="banners" class="banners"></div>
+
+<nav class="tabs" id="tabs" aria-label="{{call .T "common.sections"}}">
+  {{range .Tabs}}
+    <button class="tab" type="button" data-nav="{{.}}">{{call $.T (printf "nav.%s" .)}}</button>
+  {{end}}
+</nav>
+
+<main id="main" class="main" tabindex="-1">
+  <div id="view" class="view"></div>
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<template id="banner-noauth">
+  <div class="banner" role="alert">
+    <strong>{{call .T "banner.noAuth.title"}}</strong> {{call .T "banner.noAuth.body"}}
+  </div>
+</template>
+<template id="banner-risk">
+  <div class="banner">
+    <button class="close" type="button" data-dismiss
+            aria-label="{{call .T "common.dismiss"}}">&times;</button>
+    <strong>{{call .T "banner.risk.title"}}</strong> {{call .T "banner.risk.body"}}
+  </div>
+</template>
+
+<script type="module" src="/v2/static/app.js"></script>
+<noscript><p class="noscript">{{call .T "common.noscript"}}</p></noscript>
+</body>
+</html>{{end}}

@@ -5,27 +5,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
+	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
 	"github.com/Kellerman81/go_finance_bot/internal/risk"
 	"github.com/Kellerman81/go_finance_bot/internal/strategy"
 )
 
-func TestBuyNotionalMinPositions(t *testing.T) {
-	rm := risk.New(config.Limits{MaxTotalInvested: 400}, config.CostsConfig{})
+// min_positions no longer produces a separate engine-side order size — it is
+// the coarse tier of the position-slot rule inside risk.Manager, so what it
+// caps a buy at is now visible through BuyHeadroom. Same arithmetic as before
+// (the investable pot split N ways), reached through the one place that now
+// owns it.
+func TestMinPositionsSplitsTheInvestableBook(t *testing.T) {
+	snap := portfolio.Snapshot{Cash: 400, Holdings: map[string]portfolio.Holding{}}
+	snap.Equity = snap.Cash
+
 	cases := []struct {
-		size float64
 		min  int
 		want float64
 	}{
-		{250, 0, 250}, // fixed order size when min_positions = 0
-		{250, 4, 100}, // capped at 400/4 = 100 so the budget holds >= 4 positions
-		{50, 4, 50},   // order size smaller than the slice -> even more positions
-		{250, 8, 50},  // 400/8
+		{0, 400}, // no split: only the other limits bound the order
+		{4, 100}, // 400/4, so the budget holds at least 4 positions
+		{8, 50},  // 400/8
 	}
+
 	for _, c := range cases {
-		e := &Engine{cfg: config.EngineConfig{OrderSizeUSD: c.size, MinPositions: c.min}, rm: rm}
-		if got := e.buyNotional(); got != c.want {
-			t.Errorf("size=%v min=%d: got %v, want %v", c.size, c.min, got, c.want)
+		rm := risk.New(config.Limits{MaxTotalInvested: 400}, config.CostsConfig{})
+		rm.SetMinPositions(c.min)
+
+		got := rm.BuyHeadroom(broker.Order{Symbol: "X", Side: broker.Buy}, 10, snap)
+		if got != c.want {
+			t.Errorf("min_positions=%d: headroom %v, want %v", c.min, got, c.want)
 		}
 	}
 }

@@ -42,9 +42,16 @@ func NewReplay(data map[string][]Candle, interval time.Duration) *Replay {
 		r.data = make(map[string][]Candle)
 	}
 
-	if interval > 0 {
-		go r.run()
-	}
+	// Always started, even for interval <= 0 (history-only mode): run is the
+	// only place that closes r.out, and it used to only be spawned when
+	// interval > 0 — so a history-only Replay's Close() set r.closed and
+	// closed r.done, but nothing was listening on r.done to close r.out in
+	// response. Any caller ranging over Quotes() (the idiomatic way to drain
+	// a channel until its producer is done) hung forever. run's own
+	// interval <= 0 branch below just waits for done and returns — it does
+	// no ticking, only owns closing r.out on shutdown either way. See
+	// CODE_REVIEW_FINDINGS.md's Replay-history-only-hang finding.
+	go r.run()
 
 	return r
 }
@@ -125,16 +132,24 @@ func (r *Replay) Close() error {
 }
 
 // run advances each subscribed symbol's cursor once per interval, emitting the
-// candle's close as a tick until that symbol's data is exhausted.
+// candle's close as a tick until that symbol's data is exhausted. It owns
+// r.out's whole lifecycle — the single close, on the way out, whether it did
+// any ticking or (interval <= 0) just waited for Close.
 func (r *Replay) run() {
+	defer close(r.out)
+
+	if r.interval <= 0 {
+		<-r.done // history-only mode: nothing to stream, just wait to be closed
+
+		return
+	}
+
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
 
 	for {
 		select {
 		case <-r.done:
-			close(r.out)
-
 			return
 
 		case <-t.C:
@@ -165,10 +180,7 @@ func (r *Replay) run() {
 				select {
 				case r.out <- q:
 				case <-r.done:
-					close(r.out)
-
 					return
-
 				default:
 				}
 			}

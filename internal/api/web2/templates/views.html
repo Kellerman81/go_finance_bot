@@ -1,0 +1,782 @@
+{{/* The remaining views. One template each, all fed by fragments.go. */}}
+
+{{define "pills"}}
+{{$t := .T}}
+<span class="pill">{{call $t "pill.broker" "broker" .Status.Broker}}</span>
+<span class="pill">{{call $t "pill.equity" "cash" (money .Positions.Cash) "equity" (money .Positions.Equity)}}</span>
+<span class="pill {{if .Status.TradingEnabled}}on{{else}}off{{end}}">
+  {{if .Status.TradingEnabled}}{{call $t "pill.tradingOn"}}{{else}}{{call $t "pill.tradingOff"}}{{end}}
+</span>
+{{if .Status.TestModeActive}}
+  <span class="pill warn" title="{{dateTime .Status.TestModeDeadline}}">{{call $t "pill.testMode"}}</span>
+{{end}}
+{{if .Protections.Halted}}
+  <span class="pill off" title="{{.Protections.HaltReason}}">{{call $t "pill.halted"}}</span>
+  <button class="ghost small" type="button" data-post="/api/protections/resume"
+          data-confirm="{{call $t "confirm.resume"}}" data-done="{{call $t "diag.resume"}}"
+          >{{call $t "diag.resume"}}</button>
+{{end}}
+{{end}}
+
+{{define "login"}}
+{{$t := .T}}
+<div class="login"><section class="panel">
+  <h2>{{call $t "auth.title"}}</h2>
+  {{if .Rejected}}<p class="banner" role="alert">{{call $t "auth.rejected"}}</p>{{end}}
+  <p class="small muted">{{call $t "auth.intro"}}</p>
+  <div class="field">
+    <label for="token">{{call $t "auth.token"}}</label>
+    <input id="token" type="password" autocomplete="current-password" spellcheck="false"/>
+  </div>
+  <div class="row">
+    <input id="persist" type="checkbox" class="compact"/>
+    <label for="persist" class="small muted">{{call $t "auth.remember"}}</label>
+  </div>
+  <div class="help">{{call $t "auth.rememberHelp"}}</div>
+  <div class="panel-actions">
+    <button class="primary" type="button" id="unlock">{{call $t "auth.unlock"}}</button>
+  </div>
+</section></div>
+{{end}}
+
+{{define "chart"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "chart.title"}} <span class="sub">{{call $t "chart.sub"}}</span></h2>
+  <form class="row" data-inline-get="/v2/f/chart" data-target="closest-panel">
+    <select name="symbol">
+      {{$sym := .Symbol}}
+      {{range .Symbols}}<option value="{{.}}" {{if eq . $sym}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <select name="res">
+      {{$res := .Res}}
+      {{range .Resolutions}}<option value="{{.Value}}" {{if eq .Value $res}}selected{{end}}>{{.Label}}</option>{{end}}
+    </select>
+    <select name="bars">
+      {{$bars := .Bars}}
+      {{range .BarChoices}}<option value="{{.}}" {{if eq . $bars}}selected{{end}}>{{.}} {{call $t "chart.bars"}}</option>{{end}}
+    </select>
+    <button class="ghost small" type="submit">{{call $t "chrome.refresh"}}</button>
+  </form>
+  {{if .SVG}}
+    <div class="chart">
+      {{.SVG}}
+      {{/* Axis labels are HTML, not SVG text: the plot is stretched to the
+           panel width and would stretch its own text with it. */}}
+      <div class="chart-y">
+        {{range $i, $v := .PriceTicks}}<span class="y{{$i}}">{{$v}}</span>{{end}}
+      </div>
+      <div class="chart-x">
+        {{range $i, $v := .TimeTicks}}<span class="x{{$i}}">{{$v}}</span>{{end}}
+      </div>
+    </div>
+  {{else}}<div class="empty">{{call $t "chart.notEnough" "symbol" .Symbol}}</div>{{end}}
+  <div class="help">{{.Caption}}</div>
+</section>
+{{end}}
+
+{{define "positions"}}
+{{$t := .T}}
+{{if .Allocation}}
+<section class="panel">
+  <h2>{{call $t "alloc.title"}} <span class="sub">{{call $t "alloc.sub"}}</span></h2>
+  <div class="scroll"><table>
+    <thead><tr>
+      <th>{{call $t "col.assetClass"}}</th><th class="num">{{call $t "col.positions"}}</th>
+      <th class="num">{{call $t "col.value"}}</th><th class="num">{{call $t "col.shareOfEquity"}}</th>
+      <th class="num">{{call $t "col.cap"}}</th><th class="num">{{call $t "col.headroom"}}</th>
+    </tr></thead>
+    <tbody>
+    {{range .Allocation}}
+      <tr>
+        <td>{{if .Class}}{{.Class}}{{else}}<span class="muted">{{call $t "alloc.unclassified"}}</span>{{end}}</td>
+        <td class="num">{{.Positions}}</td>
+        <td class="num">{{money .Value}}</td>
+        <td class="num">{{pct .PctEquity}}</td>
+        <td class="num">{{if .Capped}}{{pct .CapPct}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="num">
+          {{if .Capped}}
+            {{if .AtCap}}<span class="loss">{{call $t "alloc.atCap"}}</span>
+            {{else}}{{pct .HeadroomPct}}{{end}}
+          {{else}}<span class="muted">—</span>{{end}}
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+  <p class="small muted">{{call $t "alloc.note"}}</p>
+</section>
+{{end}}
+
+<section class="panel wide">
+  <h2>{{call $t "pos.holdings"}} <span class="sub">{{call $t "pos.holdingsSub"}}</span></h2>
+  {{if .Holdings}}
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th><th class="num">{{call $t "col.qty"}}</th>
+        <th class="num">{{call $t "col.avgPrice"}}</th><th class="num">{{call $t "col.lastPrice"}}</th>
+        <th class="num">{{call $t "col.value"}}</th><th class="num">{{call $t "col.unrealised"}}</th><th></th>
+      </tr></thead>
+      <tbody>
+      {{range .Holdings}}
+        <tr>
+          <td>{{.Symbol}}</td>
+          <td class="num">{{num4 .Qty}}</td>
+          <td class="num">{{num .AvgPrice}}</td>
+          <td class="num">{{num .LastPrice}}</td>
+          <td class="num">{{money .MarketValue}}</td>
+          <td class="num {{signClass .UnrealizedPL}}">{{money .UnrealizedPL}}</td>
+          <td class="num">
+            <button class="sell small" type="button" data-post="/api/orders"
+                    data-body='{"symbol":"{{.Symbol}}","side":"sell","qty":{{num4 .Qty}}}'
+                    data-confirm="{{call $t "confirm.sell" "qty" (num4 .Qty) "symbol" .Symbol}}"
+              >{{call $t "action.sell"}}</button>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "pos.noHoldings"}}</div>{{end}}
+</section>
+
+{{/* `lead`: seven columns per row against a neighbour that is usually the one
+     sentence saying the two sides agree. */}}
+<section class="panel lead">
+  <h2>{{call $t "pos.tracked"}} <span class="sub">{{call $t "pos.trackedSub"}}</span></h2>
+  {{if .Tracked}}
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th><th class="num">{{call $t "col.qty"}}</th>
+        <th class="num">{{call $t "col.entry"}}</th><th class="num">{{call $t "col.peak"}}</th>
+        <th>{{call $t "col.opened"}}</th><th class="num">{{call $t "col.ladder"}}</th>
+        <th class="num">{{call $t "col.adds"}}</th>
+      </tr></thead>
+      <tbody>
+      {{range .Tracked}}
+        <tr>
+          <td>{{.Symbol}}</td><td class="num">{{num4 .Qty}}</td>
+          <td class="num">{{num .EntryPrice}}</td><td class="num">{{num .Peak}}</td>
+          <td>{{ago .EntryTime}}</td>
+          <td class="num">{{if .PartialsTaken}}{{.PartialsTaken}}{{else}}—{{end}}</td>
+          <td class="num">{{if .Adds}}{{.Adds}}{{else}}—{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "pos.noTracked"}}</div>{{end}}
+</section>
+
+<section class="panel">
+  <h2>{{call $t "pos.drift"}} <span class="sub">{{call $t "pos.driftSub"}}</span></h2>
+  {{if .Drift}}
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th><th class="num">{{call $t "col.botQty"}}</th>
+        <th class="num">{{call $t "col.brokerQty"}}</th><th></th>
+      </tr></thead>
+      <tbody>
+      {{range .Drift}}
+        <tr>
+          <td>{{.Symbol}}</td>
+          <td class="num">{{num4 .Bot}}</td>
+          <td class="num">{{num4 .Broker}}</td>
+          <td class="num">
+            {{if gt .Bot 0.0}}
+              <button class="danger small" type="button" data-delete="/api/open/{{.Symbol}}"
+                      title="{{call $t "action.forgetHelp"}}"
+                      data-confirm="{{call $t "confirm.forget" "symbol" .Symbol}}"
+                >{{call $t "action.forget"}}</button>
+            {{else}}
+              <button class="ghost small" type="button" data-post="/api/open/{{.Symbol}}/adopt"
+                      title="{{call $t "action.adoptHelp"}}"
+                      data-confirm="{{call $t "confirm.adopt" "symbol" .Symbol}}"
+                >{{call $t "action.adopt"}}</button>
+            {{end}}
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "pos.noDrift"}}</div>{{end}}
+</section>
+{{end}}
+
+{{define "trades"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "trades.stats"}} <span class="sub">{{call $t "trades.statsSub"}}</span></h2>
+  <form class="row" data-inline-get="/v2/f/trades" data-target="#view">
+    <select name="period">
+      {{$p := .Period}}
+      {{range .Periods}}<option value="{{.}}" {{if eq . $p}}selected{{end}}>{{call $t (printf "trades.period.%s" .)}}</option>{{end}}
+    </select>
+    <input class="compact" name="symbol" value="{{.Symbol}}" placeholder="{{call $t "trades.filterSymbol"}}"/>
+    <select name="status">
+      {{$s := .StatusFilter}}
+      {{range .Statuses}}<option value="{{.}}" {{if eq . $s}}selected{{end}}>{{if eq . ""}}{{call $t "trades.anyStatus"}}{{else}}{{.}}{{end}}</option>{{end}}
+    </select>
+    <button class="ghost small" type="submit">{{call $t "chrome.refresh"}}</button>
+  </form>
+  <div class="tiles">
+    {{template "tile" dict "label" (call $t "trades.tile.trades") "value" (int .Stats.Trades)}}
+    {{template "tile" dict "label" (call $t "trades.tile.wins") "value" (int .Stats.Wins)}}
+    {{template "tile" dict "label" (call $t "trades.tile.losses") "value" (int .Stats.Losses)}}
+    {{template "tile" dict "label" (call $t "trades.tile.winRate") "value" (pctFrac .Stats.WinRate)}}
+    {{template "tile" dict "label" (call $t "trades.tile.total") "value" (money .Stats.TotalPnL)}}
+    {{template "tile" dict "label" (call $t "trades.tile.avg") "value" (money .Stats.AvgPnL)}}
+  </div>
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "trades.log"}} <span class="sub">{{call $t "trades.logSub"}}</span></h2>
+  {{if .Trades}}
+    <div class="scroll tall"><table>
+      <thead><tr>
+        <th>{{call $t "col.time"}}</th><th>{{call $t "col.symbol"}}</th><th>{{call $t "col.side"}}</th>
+        <th class="num">{{call $t "col.qty"}}</th><th class="num">{{call $t "col.price"}}</th>
+        <th class="num">{{call $t "col.value"}}</th><th>{{call $t "col.status"}}</th>
+        <th class="num">{{call $t "col.pnl"}}</th><th>{{call $t "col.reason"}}</th>
+      </tr></thead>
+      <tbody>
+      {{range .Trades}}
+        <tr>
+          <td>{{dateTime .Time}}</td><td>{{.Symbol}}</td>
+          <td class="{{if eq (printf "%s" .Side) "buy"}}act-BUY{{else}}act-SELL{{end}}">{{.Side}}</td>
+          <td class="num">{{num4 .Qty}}</td><td class="num">{{num .Price}}</td>
+          <td class="num">{{money .Value}}</td><td>{{.Status}}</td>
+          <td class="num {{signClass (deref .PnL)}}">{{if .PnL}}{{money (deref .PnL)}}{{else}}—{{end}}</td>
+          <td>{{if .Err}}{{.Err}}{{else}}{{.Reason}}{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "trades.none"}}</div>{{end}}
+</section>
+{{end}}
+
+{{define "watchlist"}}
+{{$t := .T}}
+{{/* `lead`: this panel and the quotes list share a row, and this one carries
+     it — a symbol, its tags, its name and three buttons per row against two
+     columns of numbers next door. */}}
+<section class="panel lead">
+  <h2>{{call $t "watch.title"}} <span class="sub">{{call $t "watch.sub"}}</span></h2>
+  {{if .CanSearch}}
+    {{/* Search by company name. Nobody remembers that Lanxess is LXS.DE, and
+         guessing wrong is how you end up tracking an ADR you did not want. The
+         results render server-side into the panel below. */}}
+    <form class="row" data-inline-get="/v2/f/search" data-target="#search-results">
+      <input class="grow" name="q" placeholder="{{call $t "watch.searchPlaceholder"}}"
+             spellcheck="false" autocomplete="off"/>
+      <button class="primary" type="submit">{{call $t "action.search"}}</button>
+    </form>
+    <div id="search-results"></div>
+  {{end}}
+  <form class="row" data-form action="/v2/form/watchlist" method="post">
+    <input class="grow" name="symbols" placeholder="{{call $t "watch.addPlaceholder"}}" spellcheck="false"/>
+    <button class="{{if .CanSearch}}ghost{{else}}primary{{end}}" type="submit">{{call $t "action.add"}}</button>
+    <span class="small muted" data-form-status></span>
+  </form>
+  {{if .RunOnlyActive}}
+    <div class="banner">{{call $t "watch.runOnlyActive" "symbols" (csv .RunOnlySymbols)}}</div>
+  {{end}}
+  {{if .Symbols}}
+    <div class="scroll tall"><table><tbody>
+      {{range .Symbols}}
+        <tr>
+          <td>
+            <span class="sym">{{.Symbol}}</span>
+            {{if .Auto}}<span class="tag" title="{{call $t "watch.autoHint"}}">{{call $t "watch.auto"}}</span>{{end}}
+            {{if .Refused}}<span class="tag bad" title="{{.Refused}}">{{call $t "watch.refused"}}</span>{{end}}
+            {{if .AutotuneExcluded}}<span class="tag" title="{{call $t "watch.autotuneExcludedHint"}}">{{call $t "watch.autotuneExcludedTag"}}</span>{{end}}
+            {{if .AutotuneRunOnly}}<span class="tag" title="{{call $t "watch.autotuneRunOnlyHint"}}">{{call $t "watch.autotuneRunOnlyTag"}}</span>{{end}}
+            {{if .AssetClass}}<span class="tag" title="{{call $t "watch.classHint"}}">{{.AssetClass}}</span>{{end}}
+            {{if .Sector}}<span class="tag" title="{{call $t "watch.sectorHint"}}">{{.Sector}}</span>{{end}}
+            {{if and .LossStreakOf .LossStreak}}
+              <span class="tag bad" title="{{call $t "watch.lossStreakHint" "of" .LossStreakOf}}"
+                >{{call $t "watch.lossStreakTag" "n" .LossStreak "of" .LossStreakOf}}</span>
+            {{end}}
+            {{if .Name}}<span class="sub-name">{{.Name}}</span>{{end}}
+          </td>
+          <td class="num">
+            <button class="ghost small" type="button"
+                data-post="/api/autotune/exclude/{{.Symbol}}" data-body='{"excluded":{{not .AutotuneExcluded}}}'
+              >{{if .AutotuneExcluded}}{{call $t "watch.includeAutotune"}}{{else}}{{call $t "watch.excludeAutotune"}}{{end}}</button>
+            <button class="ghost small" type="button"
+                data-post="/api/autotune/run-only/{{.Symbol}}" data-body='{"included":{{not .AutotuneRunOnly}}}'
+                {{if not .AutotuneRunOnly}}data-confirm="{{call $t "confirm.restrictAutotune" "symbol" .Symbol}}"{{end}}
+              >{{if .AutotuneRunOnly}}{{call $t "watch.unrestrictAutotune"}}{{else}}{{call $t "watch.restrictAutotune"}}{{end}}</button>
+            <button class="danger small" type="button"
+                data-delete="/api/watchlist/{{.Symbol}}"
+                data-confirm="{{call $t "confirm.removeSymbol" "symbol" .Symbol}}"
+              >{{call $t "action.remove"}}</button>
+          </td>
+        </tr>
+      {{end}}
+    </tbody></table></div>
+  {{else}}<div class="empty">{{call $t "watch.empty"}}</div>{{end}}
+</section>
+
+
+<section class="panel">
+  <h2>{{call $t "watch.quotes"}} <span class="sub">{{call $t "watch.quotesSub"}}</span></h2>
+  {{if .Quotes}}
+    <div class="scroll tall"><table>
+      <thead><tr><th>{{call $t "col.symbol"}}</th><th class="num">{{call $t "col.price"}}</th></tr></thead>
+      <tbody>{{range .Quotes}}<tr><td>{{.Symbol}}</td><td class="num">{{num .Price}}</td></tr>{{end}}</tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "watch.noQuotes"}}</div>{{end}}
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "watch.screener"}} <span class="sub">{{call $t "watch.screenerSub"}}</span></h2>
+  <div class="panel-actions">
+    <button class="ghost small" type="button" data-post="/api/screener/rescreen"
+      >{{call $t "watch.rescreen"}}</button>
+  </div>
+  {{if .Verdicts}}
+    <div class="small muted">{{call $t "watch.screenedAt" "at" (dateTime .ScreenedAt)}}</div>
+    <div class="scroll tall"><table>
+      <thead><tr>
+        <th>{{call $t "col.symbol"}}</th><th>{{call $t "col.verdict"}}</th>
+        <th>{{call $t "col.assetClass"}}</th><th>{{call $t "col.sector"}}</th>
+        <th>{{call $t "col.judgedOn"}}</th>
+        <th class="num">{{call $t "col.price"}}</th><th class="num">{{call $t "col.volume"}}</th>
+        <th class="num">{{call $t "col.atr"}}</th><th class="num">{{call $t "col.spread"}}</th>
+        <th class="num">{{call $t "col.trendR2"}}</th><th class="num">{{call $t "col.ownDrawdown"}}</th>
+        <th class="num">{{call $t "col.costMultiple"}}</th>
+        <th>{{call $t "col.probe"}}</th>
+        <th>{{call $t "col.reason"}}</th>
+      </tr></thead>
+      <tbody>
+      {{range .Verdicts}}
+        <tr>
+          <td>{{.Symbol}}</td>
+          <td class="{{if .Passed}}win{{else}}loss{{end}}">
+            {{if .Passed}}{{call $t "watch.kept"}}{{else}}{{call $t "watch.dropped"}}{{end}}</td>
+          <td class="small">{{if .AssetClass}}{{.AssetClass}}{{else}}—{{end}}</td>
+          <td class="small">{{if .Sector}}{{.Sector}}{{else}}—{{end}}</td>
+          <td class="small muted">{{if .Resolution}}{{.Resolution}}{{else}}—{{end}}</td>
+          <td class="num">{{num .Price}}</td><td class="num">{{int .AvgVol}}</td>
+          <td class="num">{{pct .ATRPct}}</td>
+          <td class="num">{{if .SpreadPct}}{{pctFrac .SpreadPct}}{{else}}—{{end}}</td>
+          <td class="num">{{if .TrendR2}}{{num .TrendR2}}{{else}}—{{end}}</td>
+          <td class="num">{{if .MaxDrawdownPct}}{{pctFrac .MaxDrawdownPct}}{{else}}—{{end}}</td>
+          <td class="num">{{if .CostMultiple}}{{num .CostMultiple}}×{{else}}—{{end}}</td>
+          <td class="small">
+            {{if .Probe}}
+              <span class="{{signClass .Probe.ExpectancyPct}}">{{pct .Probe.ReturnPct}}</span>
+              <span class="muted">{{call $t "watch.probeDetail"
+                "source" .Probe.Source "win" (pct .Probe.WinRatePct)
+                "exp" (pctFrac .Probe.ExpectancyPct) "trades" .Probe.Trades}}</span>
+            {{else}}—{{end}}
+          </td>
+          <td>{{.Reason}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "watch.noScreen"}}</div>{{end}}
+</section>
+{{end}}
+
+{{define "strategy"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "strategy.title"}} <span class="sub">{{call $t "strategy.sub"}}</span></h2>
+  <p class="small muted">{{call $t "strategy.available" "list" .Available}}</p>
+  {{template "form" dict "T" .T "Action" "strategy" "Prefix" "strategy" "Fields" .Fields "Values" .Values}}
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "strategy.overrides"}} <span class="sub">{{call $t "strategy.overridesSub"}}</span></h2>
+  {{if .Overrides}}
+    <div class="scroll tall"><table>
+      <thead><tr><th>{{call $t "col.symbol"}}</th><th>{{call $t "strategy.overridesDiff"}}</th></tr></thead>
+      <tbody>
+      {{range .Overrides}}
+        <tr><td>{{.Symbol}}</td><td>
+          {{range .Diff}}<span class="tag">{{.}}</span> {{end}}
+        </td></tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "strategy.noOverrides"}}</div>{{end}}
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "strategy.health"}} <span class="sub">{{call $t "strategy.healthSub"}}</span></h2>
+  {{if .Health}}
+    <div class="scroll tall"><table>
+      <thead><tr><th>{{call $t "col.symbol"}}</th><th>{{call $t "opt.trades"}}</th>
+        <th>{{call $t "opt.win"}}</th><th class="num">{{call $t "col.pnl"}}</th>
+        <th>{{call $t "strategy.healthStopLosses"}}</th>
+        <th>{{call $t "diag.lockReason"}}</th><th></th></tr></thead>
+      <tbody>
+      {{range .Health}}
+        <tr>
+          <td>{{.Symbol}}</td>
+          <td>{{.Trades}}</td>
+          <td>{{pct .WinRatePct}}</td>
+          <td class="num {{signClass .TotalPnL}}">{{money .TotalPnL}}</td>
+          <td>{{.StopLosses}}</td>
+          <td>
+            {{if .Locked}}
+              <span class="tag bad" title="{{.LockUntil}}">{{.LockReason}}</span>
+              <button class="ghost small" type="button"
+                      data-delete="/api/protections/lock/{{.Symbol}}">{{call $t "diag.unlock"}}</button>
+            {{end}}
+          </td>
+          <td class="num">
+            <form class="row" data-inline-get="/v2/f/symbolOptimize" data-target="#symopt-panel">
+              <input type="hidden" name="symbol" value="{{.Symbol}}">
+              <button class="ghost small" type="submit">{{call $t "strategy.healthOptimize"}}</button>
+            </form>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "strategy.noHealth"}}</div>{{end}}
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "opt.symbolTitle"}} <span class="sub">{{call $t "opt.symbolSub"}}</span></h2>
+  <p class="small muted">{{call $t "opt.symbolIntro"}}</p>
+  <div id="symopt-panel" data-fetch="/v2/f/symbolOptimize" data-target="#symopt-panel"></div>
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "opt.title"}} <span class="sub">{{call $t "opt.sub"}}</span></h2>
+  <p class="small muted">{{call $t "opt.intro"}}</p>
+  <div id="opt-panel" data-fetch="/v2/f/optimizeField" data-target="#opt-panel"></div>
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "strategy.detectors"}} <span class="sub">{{call $t "strategy.detectorsSub"}}</span></h2>
+  {{if .Matrix}}
+    <div class="scroll tall"><table>
+      <thead><tr><th>{{call $t "col.symbol"}}</th>
+        {{range .Names}}<th>{{.}}</th>{{end}}</tr></thead>
+      <tbody>
+      {{range .Matrix}}
+        <tr><td>{{.Symbol}}</td>
+          {{range .Cells}}
+            <td class="{{actionClass .Action}}" title="{{.Reason}}">
+              {{.Action}}{{if .Enabled}} •{{end}}</td>
+          {{end}}
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "strategy.noDetectors"}}</div>{{end}}
+</section>
+{{end}}
+
+{{define "optimizeField"}}
+{{$t := .T}}
+<form class="row" data-inline-get="/v2/f/optimizeField" data-target="#opt-panel">
+  <select name="symbol">
+    {{$sym := .Symbol}}
+    {{range .Symbols}}<option value="{{.}}" {{if eq . $sym}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <select name="field">
+    <option value="">{{call $t "common.unset"}}</option>
+    {{$fld := .Field}}
+    {{range .Fields}}
+      <option value="{{.Key}}" {{if eq .Key $fld}}selected{{end}}>
+        {{call $t (tkey .LabelPrefix .LabelName "label")}}</option>
+    {{end}}
+  </select>
+  <button class="ghost small" type="submit">{{call $t "opt.run"}}</button>
+</form>
+
+{{if .Error}}<p class="small muted">{{.Error}}</p>{{end}}
+
+{{if .Rows}}
+  <p class="small muted">{{call $t "opt.baselineLine"
+      "return" (pct .Baseline.TotalReturnPct) "win" (pct .Baseline.WinRatePct)
+      "trades" .Baseline.NumTrades "bars" .Bars}}</p>
+  <div class="scroll"><table>
+    <thead><tr>
+      <th>{{call $t "opt.value"}}</th>
+      <th>{{call $t "opt.return"}}</th>
+      <th>{{call $t "opt.win"}}</th>
+      <th>{{call $t "opt.trades"}}</th>
+      <th>{{call $t "opt.maxdd"}}</th>
+      <th>{{call $t "opt.sharpe"}}</th>
+      <th></th>
+    </tr></thead>
+    <tbody>
+    {{$applyPrefix := .ApplyPrefix}}
+    {{$applyName := .ApplyName}}
+    {{range .Rows}}
+      <tr>
+        <td>{{.Label}}{{if .Baseline}} <span class="small muted">({{call $t "opt.baseline"}})</span>{{end}}</td>
+        <td>{{pct .Result.TotalReturnPct}}</td>
+        <td>{{pct .Result.WinRatePct}}</td>
+        <td>{{.Result.NumTrades}}</td>
+        <td>{{pct .Result.MaxDrawdownPct}}</td>
+        <td>{{printf "%.2f" .Result.Sharpe}}</td>
+        <td>
+          {{if .Best}}<span class="pill on">{{call $t "opt.best"}}</span>{{end}}
+          {{if $applyPrefix}}
+          <button class="ghost small" type="button"
+                  data-fill="f-{{$applyPrefix}}-{{$applyName}}" data-fill-value="{{.ApplyValue}}"
+                  >{{call $t "opt.apply"}}</button>
+          {{else}}
+          <span class="small muted">{{call $t "opt.applyElsewhere"}}</span>
+          {{end}}
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+{{end}}
+{{end}}
+
+{{define "symbolOptimize"}}
+{{$t := .T}}
+<form class="row" data-inline-get="/v2/f/symbolOptimize" data-target="#symopt-panel">
+  <select name="symbol">
+    <option value="">{{call $t "common.unset"}}</option>
+    {{$sym := .Symbol}}
+    {{range .Symbols}}<option value="{{.}}" {{if eq . $sym}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <label class="small muted" for="opt-objective">{{call $t "opt.objective"}}</label>
+  <select id="opt-objective" name="objective" title="{{call $t "settings.autotune.objective.help"}}">
+    {{$obj := .Objective}}
+    {{range .Objectives}}<option value="{{.}}" {{if eq . $obj}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <label class="small muted" for="opt-min-return">{{call $t "opt.minReturn"}}</label>
+  <input id="opt-min-return" name="min_return_pct" type="number" step="any" inputmode="decimal"
+         value="{{.MinReturnPct}}" title="{{call $t "settings.autotune.min_return_pct.help"}}">
+  <button class="ghost small" type="submit">{{call $t "opt.run"}}</button>
+</form>
+
+{{if .Error}}<p class="small muted">{{.Error}}</p>{{end}}
+
+{{if .Result}}
+  {{$r := .Result}}
+  <p class="small muted">{{call $t "opt.symbolBars" "symbol" $r.Symbol "bars" $r.Bars}}</p>
+  <div class="scroll"><table>
+    <thead><tr>
+      <th></th>
+      <th>{{call $t "opt.win"}}</th>
+      <th>{{call $t "opt.trades"}}</th>
+      <th>{{call $t "opt.expectancy"}}</th>
+      <th>{{call $t "opt.return"}}</th>
+      <th>{{call $t "opt.maxdd"}}</th>
+      <th>{{call $t "opt.sharpe"}}</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td>{{call $t "opt.currentReal"}}</td>
+        {{if $r.HasReal}}
+          <td>{{pct $r.Real.WinRatePct}}</td>
+          <td>{{$r.Real.Trades}}</td>
+          <td>{{pct $r.Real.ExpectancyPct}}</td>
+          <td>—</td><td>—</td><td>—</td>
+        {{else}}
+          <td colspan="6" class="small muted">{{call $t "opt.noRealYet"}}</td>
+        {{end}}
+      </tr>
+      <tr>
+        <td>{{call $t "opt.currentWhatIf"}}</td>
+        <td>{{pct $r.WhatIf.WinRatePct}}</td>
+        <td>{{$r.WhatIf.NumTrades}}</td>
+        <td>{{pct $r.WhatIf.ExpectancyPct}}</td>
+        <td>{{pct $r.WhatIf.TotalReturnPct}}</td>
+        <td>{{pct $r.WhatIf.MaxDrawdownPct}}</td>
+        <td>{{printf "%.2f" $r.WhatIf.Sharpe}}</td>
+      </tr>
+      <tr>
+        <td>{{call $t "opt.proposed"}}{{if $r.Improved}} <span class="pill on">{{call $t "opt.best"}}</span>{{end}}</td>
+        <td>{{pct $r.Best.Result.WinRatePct}}</td>
+        <td>{{$r.Best.Result.NumTrades}}</td>
+        <td>{{pct $r.Best.Result.ExpectancyPct}}</td>
+        <td>{{pct $r.Best.Result.TotalReturnPct}}</td>
+        <td>{{pct $r.Best.Result.MaxDrawdownPct}}</td>
+        <td>{{printf "%.2f" $r.Best.Result.Sharpe}}</td>
+      </tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">{{call $t "opt.improvedHint"}}</p>
+  {{if $r.HasTotal}}
+    <p class="small muted">{{call $t "opt.totalContext"
+        "trades" (int $r.Total.Trades) "win" (pct $r.Total.WinRatePct) "expectancy" (pct $r.Total.ExpectancyPct)}}</p>
+  {{end}}
+
+  {{if $r.Improved}}
+    <h3>{{call $t "opt.proposedConfig"}}</h3>
+    <pre>{{range $r.Proposed}}{{.}}
+{{end}}</pre>
+    <p class="small muted">{{call $t "opt.proposedHint"}}</p>
+
+    {{if $r.NotOverridable}}
+      <p class="small"><span class="tag bad">{{call $t "opt.notOverridable" "fields"
+          (csv $r.NotOverridable)}}</span></p>
+    {{end}}
+
+    <h3>{{call $t "opt.reasoning"}}</h3>
+    <ul class="small muted">
+      {{range $r.Reasoning}}<li>{{.}}</li>{{end}}
+    </ul>
+  {{else if $r.BelowReturnFloor}}
+    <p class="small muted">{{call $t "opt.belowReturnFloor"
+        "return" (pct $r.Best.Result.TotalReturnPct) "floor" (pct $r.MinReturnPct)}}</p>
+  {{else if $r.BelowRecentWin}}
+    <p class="small muted">{{call $t "opt.belowRecentWin"
+        "trades" (int $r.RecentWin.Trades) "win" (pct $r.RecentWin.WinRatePct) "expectancy" (pct $r.RecentWin.ExpectancyPct)}}</p>
+  {{else}}
+    <p class="small muted">{{call $t "opt.noImprovement"}}</p>
+  {{end}}
+{{end}}
+{{end}}
+
+{{define "settings"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "settings.title"}} <span class="sub">{{call $t "settings.sub"}}</span></h2>
+  <p class="small muted">{{call $t "settings.persistence"}}</p>
+</section>
+{{range .Blocks}}
+  <details class="panel wide">
+    <summary><strong>{{call $t (tkey "settings" .Name "title")}}</strong></summary>
+    {{if .Danger}}<div class="banner">{{call $t (tkey "settings" .Name "danger")}}</div>{{end}}
+    <p class="small muted">{{call $t (tkey "settings" .Name "intro")}}</p>
+    {{template "form" dict "T" $.T "Action" .Action "Prefix" (printf "settings.%s" .Name)
+        "Fields" .Fields "Values" .Values}}
+    {{if eq .Name "autotune"}}
+      <div class="panel-actions">
+        <button class="ghost small" type="button" data-post="/api/autotune/run"
+            data-confirm="{{call $t "confirm.runAutotuneNow"}}" data-done="{{call $t "settings.autotune.runStarted"}}"
+          >{{call $t "settings.autotune.runNow"}}</button>
+      </div>
+    {{end}}
+  </details>
+{{end}}
+{{end}}
+
+{{define "diagnostics"}}
+{{$t := .T}}
+<section class="panel wide">
+  <h2>{{call $t "diag.protections"}} <span class="sub">{{call $t "diag.protectionsSub"}}</span></h2>
+  {{/* Also shown while switched off when a halt or a lockout survives: that
+       state is preserved for a re-enable, and the Resume button below is the
+       only way to clear it. */}}
+  {{if or .Protections.Enabled .Protections.Halted .LockedCount}}
+    <div class="tiles">
+      {{template "tile" dict "label" (call $t "diag.tile.state")
+          "value" (if_ .Protections.Enabled
+                      (if_ .Protections.Halted (call $t "diag.halted") (call $t "diag.running"))
+                      (call $t "diag.disabled"))}}
+      {{template "tile" dict "label" (call $t "diag.tile.peak") "value" (money .Protections.PeakEquity)}}
+      {{template "tile" dict "label" (call $t "diag.tile.drawdown") "value" (pct .Protections.DrawdownPct)}}
+      {{template "tile" dict "label" (call $t "diag.tile.locked") "value" (int .LockedCount)}}
+    </div>
+    {{if .Protections.Halted}}
+      <p class="small">{{.Protections.HaltReason}}</p>
+      <div class="panel-actions">
+        <button class="primary" type="button" data-post="/api/protections/resume"
+                data-confirm="{{call $t "confirm.resume"}}">{{call $t "diag.resume"}}</button>
+      </div>
+    {{end}}
+    {{if .Locked}}
+      <div class="scroll"><table>
+        <thead><tr><th>{{call $t "col.symbol"}}</th><th>{{call $t "diag.lockReason"}}</th>
+          <th>{{call $t "col.lockedUntil"}}</th><th></th></tr></thead>
+        <tbody>
+        {{range .Locked}}
+          <tr><td>{{.Symbol}}</td><td>{{.Reason}}</td><td>{{.Until}}</td>
+            <td class="num"><button class="ghost small" type="button"
+                data-delete="/api/protections/lock/{{.Symbol}}">{{call $t "diag.unlock"}}</button></td></tr>
+        {{end}}
+        </tbody>
+      </table></div>
+    {{end}}
+  {{else}}<div class="empty">{{call $t "diag.protectionsOff"}}</div>{{end}}
+</section>
+
+<section class="panel wide">
+  <h2>{{call $t "diag.errors"}} <span class="sub">{{call $t "diag.errorsSub"}}</span></h2>
+  {{if .Errors}}
+    <div class="scroll tall"><table>
+      <thead><tr><th>{{call $t "col.time"}}</th><th>{{call $t "col.source"}}</th>
+        <th>{{call $t "col.message"}}</th></tr></thead>
+      <tbody>{{range .Errors}}
+        <tr><td>{{dateTime .Time}}</td><td>{{.Source}}</td><td>{{.Message}}</td></tr>
+      {{end}}</tbody>
+    </table></div>
+  {{else}}<div class="empty">{{call $t "diag.noErrors"}}</div>{{end}}
+</section>
+
+<section class="panel">
+  <h2>{{call $t "diag.detectors"}} <span class="sub">{{call $t "diag.detectorsSub"}}</span></h2>
+  <div class="scroll"><table><tbody>
+    <tr><td>{{call $t "diag.ai.enabled"}}</td>
+      <td>{{if .AI.Enabled}}{{call $t "common.yes"}}{{else}}{{call $t "common.no"}}{{end}}</td></tr>
+    <tr><td>{{call $t "diag.ai.provider"}}</td><td>{{.AI.Provider}} / {{.AI.Model}}</td></tr>
+    <tr><td>{{call $t "diag.ai.calls"}}</td><td>{{int .AI.Calls}} / {{int .AI.Errors}}</td></tr>
+    <tr><td>{{call $t "diag.ai.cached"}}</td><td>{{int .AI.Cached}}</td></tr>
+    <tr><td>{{call $t "diag.ai.last"}}</td><td>{{if .AI.LastError}}{{.AI.LastError}}{{else}}—{{end}}</td></tr>
+    <tr><td>{{call $t "diag.ml.enabled"}}</td>
+      <td>{{if .ML.Enabled}}{{call $t "common.yes"}}{{else}}{{call $t "common.no"}}{{end}}</td></tr>
+    <tr><td>{{call $t "diag.ml.models"}}</td><td>{{int .ML.Models}}</td></tr>
+    <tr><td>{{call $t "diag.ml.skill"}}</td><td>{{num4 .ML.MeanSkill}}</td></tr>
+  </tbody></table></div>
+</section>
+
+<section class="panel">
+  <h2>{{call $t "diag.notify"}} <span class="sub">{{call $t "diag.notifySub"}}</span></h2>
+  <div class="scroll"><table><tbody>
+    <tr><td>{{call $t "diag.notify.enabled"}}</td>
+      <td>{{if .Notify.Enabled}}{{call $t "common.yes"}}{{else}}{{call $t "common.no"}}{{end}}</td></tr>
+    <tr><td>{{call $t "diag.notify.sinks"}}</td><td>{{csv .Notify.Sinks}}</td></tr>
+    <tr><td>{{call $t "diag.notify.sent"}}</td><td class="num">{{int .Notify.Sent}}</td></tr>
+    <tr><td>{{call $t "diag.notify.failed"}}</td><td class="num">{{int .Notify.Failed}}</td></tr>
+    <tr><td>{{call $t "diag.notify.dropped"}}</td><td class="num">{{int .Notify.Dropped}}</td></tr>
+  </tbody></table></div>
+</section>
+{{end}}
+
+{{define "search"}}
+{{$t := .T}}
+{{if .Error}}
+  <div class="empty">{{.Error}}</div>
+{{else if .Results}}
+  <div class="scroll"><table><tbody>
+    {{range .Results}}
+      <tr{{if and .Known (not .Tradeable)}} class="dim"{{end}}>
+        <td>
+          <span class="sym">{{.Symbol}}</span>
+          {{if .Type}}<span class="tag">{{.Type}}</span>{{end}}
+          {{if .Known}}
+            {{if .Tradeable}}
+              <span class="tag good" title="{{call $t "watch.brokerHasHint"}}">{{call $t "watch.brokerHas"}}</span>
+            {{else}}
+              <span class="tag bad" title="{{call $t "watch.brokerLacksHint"}}">{{call $t "watch.brokerLacks"}}</span>
+            {{end}}
+          {{end}}
+          <span class="sub-name">{{.Name}}{{if .Exchange}} · {{.Exchange}}{{end}}</span>
+        </td>
+        <td class="num">
+          {{/* One symbol per post, with its name, so the row reads properly the
+               moment it appears instead of a refresh later. A listing the broker
+               lacks can still be added — it is useful to track, and the broker
+               may simply not have loaded its metadata — but it is not the
+               button the eye lands on. */}}
+          <form data-form action="/v2/form/watchlist" method="post">
+            <input type="hidden" name="symbols" value="{{.Symbol}}"/>
+            <input type="hidden" name="name" value="{{.Name}}"/>
+            <button class="{{if and .Known (not .Tradeable)}}ghost{{else}}primary{{end}} small"
+                    type="submit">{{call $t "action.add"}}</button>
+          </form>
+        </td>
+      </tr>
+    {{end}}
+  </tbody></table></div>
+{{else if .Searched}}
+  <div class="empty">{{call $t "watch.searchNone" "query" .Query}}</div>
+{{end}}
+{{end}}

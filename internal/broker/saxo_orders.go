@@ -148,6 +148,38 @@ func (s *Saxo) PlaceBracket(ctx context.Context, b BracketOrder) (BracketResult,
 		return BracketResult{}, err
 	}
 
+	// b's prices arrive in preferCcy (like everything else this adapter
+	// reports); Saxo expects OrderPrice in the instrument's own currency.
+	//
+	// The old "rate != 0 && rate != 1" guard treated a FAILED fetch (which
+	// falls back to rate=1) identically to a genuine same-currency 1:1 —
+	// silently skipping conversion and sending entry/stop/take-profit prices
+	// unconverted. For a bracket this is the worst version of the bug: the
+	// stop-loss and take-profit prices are wrong too, and the long/short
+	// sanity checks above run before this conversion so they can't catch it.
+	// Refuse the whole bracket instead. See CODE_REVIEW_FINDINGS.md's
+	// Alpaca/Saxo order-pricing FX finding.
+	rate, resolved := s.fxRateForCurrencyResolved(ctx, inst.Currency)
+	if !resolved {
+		return BracketResult{}, fmt.Errorf(
+			"saxo: cannot price bracket for %s: fx rate %s->%s unavailable",
+			b.Symbol, inst.Currency, s.preferCcy)
+	}
+
+	if rate != 1 {
+		if b.EntryType == Limit {
+			b.EntryPrice /= rate
+		}
+
+		if b.StopLoss > 0 {
+			b.StopLoss /= rate
+		}
+
+		if b.TakeProfit > 0 {
+			b.TakeProfit /= rate
+		}
+	}
+
 	body := buildBracketBody(s.accountKey, inst, b, amount)
 
 	var resp saxoPlaceResponse
@@ -290,9 +322,11 @@ type saxoDuration struct {
 	DurationType string `json:"DurationType"`
 }
 
-// saxoDisplayFormat carries display metadata (exchange-qualified symbol).
+// saxoDisplayFormat carries display metadata (exchange-qualified symbol and
+// the instrument's own trading currency).
 type saxoDisplayFormat struct {
-	Symbol string `json:"Symbol"`
+	Symbol   string `json:"Symbol"`
+	Currency string `json:"Currency"`
 }
 
 // saxoWorkingOrder is one entry of the working-orders list.

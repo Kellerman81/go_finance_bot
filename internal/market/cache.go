@@ -28,9 +28,31 @@ type CachingHistory struct {
 	src HistoryFetcher
 	ttl time.Duration
 
-	mu      sync.Mutex
-	entries map[string]cacheEntry
+	mu        sync.Mutex
+	entries   map[string]cacheEntry
+	lastSweep time.Time
 }
+
+// cacheSweepMultiple bounds how long an entry survives after it was last
+// queried, as a multiple of ttl. Without a sweep, a symbol the screener drops
+// (a churning universe adds and drops symbols over a long-running process)
+// left its candle data in entries forever — nothing ever removes a key,
+// only Candles overwriting it on a later query for the same symbol, which
+// never happens once the symbol stops being tracked. A steady memory leak
+// over the bot's lifetime. See CODE_REVIEW_FINDINGS.md's CachingHistory
+// finding.
+const cacheSweepMultiple = 20
+
+// Unwrap returns the wrapped source, so a caller probing for an optional
+// capability can see through the decorator.
+//
+// Without it the symbol picker vanished in production while passing every test:
+// main.go wraps the Yahoo provider in this cache, and a plain
+// `historySource().(Searcher)` assertion then finds a *CachingHistory and gives
+// up. Delegating Search here instead would be worse — the cache would satisfy
+// Searcher even when wrapping a source that cannot search, so the UI would offer
+// a picker that always finds nothing.
+func (c *CachingHistory) Unwrap() HistoryFetcher { return c.src }
 
 type cacheEntry struct {
 	candles   []Candle
@@ -53,6 +75,26 @@ func (*CachingHistory) key(symbol string, res Resolution) string {
 	return string(res) + "\x00" + symbol
 }
 
+// sweepLocked removes entries not queried in a while, bounding the cache to
+// roughly the symbols in active use rather than every symbol ever seen —
+// see cacheSweepMultiple. Throttled to once per ttl so it doesn't add an
+// O(len(entries)) scan to every single call. Caller holds c.mu.
+func (c *CachingHistory) sweepLocked() {
+	now := time.Now()
+	if now.Sub(c.lastSweep) < c.ttl {
+		return
+	}
+
+	c.lastSweep = now
+	cutoff := now.Add(-cacheSweepMultiple * c.ttl)
+
+	for k, e := range c.entries {
+		if e.fetchedAt.Before(cutoff) {
+			delete(c.entries, k)
+		}
+	}
+}
+
 // Candles serves from cache when a fresh entry covers the requested window,
 // otherwise fetches from the underlying source and stores the result.
 func (c *CachingHistory) Candles(
@@ -64,13 +106,25 @@ func (c *CachingHistory) Candles(
 	key := c.key(symbol, res)
 
 	c.mu.Lock()
+	c.sweepLocked()
 
 	e, ok := c.entries[key]
-	fresh := ok && time.Since(e.fetchedAt) < c.ttl && !from.Before(e.from)
+	// Both bounds must be covered, not just from: a cached entry fetched for
+	// an earlier, narrower [from,to] would otherwise be served to a caller
+	// asking for data reaching further forward than what's actually
+	// cached — silently truncated results instead of a fresh fetch. See
+	// CODE_REVIEW_FINDINGS.md's CachingHistory finding.
+	fresh := ok && time.Since(e.fetchedAt) < c.ttl && !from.Before(e.from) && !to.After(e.to)
 	c.mu.Unlock()
 
 	if fresh {
-		return sliceByTime(e.candles, from, to), nil
+		// A copy, not the cached backing array: sliceByTime's result shares
+		// memory with the cached entry, and a caller that mutates its
+		// candles in place (the engine's FX-conversion loop in warmup does
+		// exactly this) would otherwise silently corrupt what every other
+		// caller reads from this cache within the TTL — see
+		// CODE_REVIEW_FINDINGS.md's CachingHistory finding.
+		return cloneCandles(sliceByTime(e.candles, from, to)), nil
 	}
 
 	candles, err := c.src.Candles(ctx, symbol, res, from, to)
@@ -83,7 +137,23 @@ func (c *CachingHistory) Candles(
 	c.entries[key] = cacheEntry{candles: candles, from: from, to: to, fetchedAt: time.Now()}
 	c.mu.Unlock()
 
-	return candles, nil
+	// Same reasoning as the cache-hit path: candles is now also the cache's
+	// own copy (stored above), so the caller must get its own.
+	return cloneCandles(candles), nil
+}
+
+// cloneCandles returns an independent copy of candles, so a caller that
+// mutates the result in place cannot corrupt a cache entry (or another
+// caller's slice of the same backing array).
+func cloneCandles(candles []Candle) []Candle {
+	if candles == nil {
+		return nil
+	}
+
+	out := make([]Candle, len(candles))
+	copy(out, candles)
+
+	return out
 }
 
 // Invalidate drops any cached entry for the symbol/resolution, forcing the next

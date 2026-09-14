@@ -56,8 +56,10 @@
   <span class="pill" id="cashPill">cash —</span>
   <span class="pill" id="tradingPill">trading —</span>
   <span class="pill" id="livePill" title="live event stream">live —</span>
+  <span class="pill" id="aiPill" title="LLM advisor (the 'ai' detector)" hidden>ai —</span>
   <button id="tradeToggle">Toggle trading</button>
   <button onclick="refreshAll()">↻ Refresh</button>
+  <a class="gh" href="https://github.com/Kellerman81/go_finance_bot" target="_blank" rel="noopener noreferrer" title="View on GitHub">GitHub ↗</a>
 </header>
 
 <div class="riskbanner" id="riskBanner">
@@ -95,6 +97,26 @@
     <div id="metricsTiles" class="tiles"></div>
     <div class="small muted">Equity (rolling)</div>
     <canvas id="equitySpark" height="56" style="width:100%;height:56px" title="equity over recent samples"></canvas>
+  </section>
+
+  <!-- Price chart with the bot's own executions marked -->
+  <section class="panel wide">
+    <h2>Price &amp; trades
+      <span class="small muted">(candles with this bot's fills marked)</span>
+      <span style="float:right">
+        <select id="chartSymbol" onchange="loadChart()" class="small"></select>
+        <select id="chartRes" onchange="loadChart()" class="small">
+          <option value="1">1m</option>
+          <option value="5">5m</option>
+          <option value="15">15m</option>
+          <option value="60">1h</option>
+          <option value="D">1d</option>
+        </select>
+        <button class="small" style="padding:2px 8px" onclick="loadChart()">↻</button>
+      </span>
+    </h2>
+    <canvas id="priceChart" height="220" style="width:100%;height:220px"></canvas>
+    <div class="help" id="chartMsg">Green triangles are buys, red are sells; hollow markers are dry-run or blocked decisions.</div>
   </section>
 
   <!-- Live activity feed (SSE) -->
@@ -208,10 +230,87 @@
 
   <!-- Exits editor -->
   <section class="panel">
-    <h2>Protective exits</h2>
-    <div id="exitForm"></div>
-    <button class="primary" onclick="saveExits()">Apply exits</button>
-    <span class="small muted" id="exitMsg"></span>
+    <h2>Protective exits <span class="small muted">(stops, targets, ladders, time barrier)</span></h2>
+    <div id="exitsForm"></div>
+    <button class="primary" onclick="saveSection('exits')">Apply exits</button>
+    <span class="small muted" id="exitsMsg"></span>
+    <div class="help">Order of precedence: stop-loss → trailing stop → take-profit/ROI →
+      max hold. A downside rule always beats a target in the same move, and the
+      scale-out ladder only runs when none of them fired.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Entries <span class="small muted">(pyramiding, scale-in, slot policy)</span></h2>
+    <div id="entriesForm"></div>
+    <button class="primary" onclick="saveSection('entries')">Apply entry rules</button>
+    <span class="small muted" id="entriesMsg"></span>
+    <div class="help">⚠️ <strong>Scale-in is averaging down.</strong> It improves the entry
+      price of every trade that recovers and increases the size of every trade that
+      does not. Keep <code>max_adds</code> small, keep the stop-loss on, and prove it
+      in a backtest before trusting it with money.</div>
+  </section>
+
+  <!-- Live-editable settings sections. Each applies on its own so a rejected
+       block cannot partially apply its neighbours. -->
+  <section class="panel">
+    <h2>Trading costs <span class="small muted">(commission, spread, slippage)</span></h2>
+    <div id="costsForm"></div>
+    <button class="primary" onclick="saveSection('costs')">Apply costs</button>
+    <span class="small muted" id="costsMsg"></span>
+  </section>
+
+  <section class="panel">
+    <h2>Protections <span class="small muted">(cooldowns, stop guard, halts)</span></h2>
+    <div id="protectionsForm"></div>
+    <button class="primary" onclick="saveSection('protections')">Apply protections</button>
+    <span class="small muted" id="protectionsMsg"></span>
+    <div class="help">Editing thresholds never clears an active halt — use the Resume
+      button for that. Protections gate entries only; exits always fire.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Portfolio limits <span class="small muted">(concentration)</span></h2>
+    <div id="portfolioForm"></div>
+    <button class="primary" onclick="saveSection('portfolio')">Apply portfolio limits</button>
+    <span class="small muted" id="portfolioMsg"></span>
+  </section>
+
+  <section class="panel">
+    <h2>Screener <span class="small muted">(automatic watchlist)</span></h2>
+    <div id="screenerForm"></div>
+    <button class="primary" onclick="saveSection('screener')">Apply screener</button>
+    <button onclick="rescreenNow()">Re-screen now</button>
+    <span class="small muted" id="screenerMsg"></span>
+    <div class="help">⚠️ With an empty universe this <em>filters your watchlist</em> and can
+      remove symbols. Held positions are never dropped. Check the reasons at
+      <code>/api/screener</code> after the next pass.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Notifications <span class="small muted">(webhook / Discord / Telegram / Pushover / Apprise)</span></h2>
+    <div id="notifyForm"></div>
+    <button class="primary" onclick="saveSection('notify')">Apply notifications</button>
+    <span class="small muted" id="notifyMsg"></span>
+    <div class="help">Stored secrets show as <code>********</code>; leave them alone to keep
+      them, or type a new value to replace one.</div>
+  </section>
+
+  <section class="panel">
+    <h2>AI advisor <span class="small muted">(the "ai" detector)</span></h2>
+    <div id="aiForm"></div>
+    <button class="primary" onclick="saveSection('ai')">Apply AI settings</button>
+    <span class="small muted" id="aiMsg"></span>
+    <div class="help">Does nothing unless <code>ai</code> is in the detector list above.</div>
+  </section>
+
+  <section class="panel">
+    <h2>ML detector <span class="small muted">(learned classifier)</span></h2>
+    <div id="mlForm"></div>
+    <button class="primary" onclick="saveSection('ml')">Apply ML settings</button>
+    <span class="small muted" id="mlMsg"></span>
+    <div class="help">Applying discards every trained model — a changed horizon or
+      threshold makes the old ones answers to a different question. Does nothing
+      unless <code>ml</code> is in the detector list.</div>
   </section>
 
   <!-- Detector signals -->
@@ -248,10 +347,18 @@ const api = (p,opt) => fetch('/api'+p, authOpts(opt)).then(async r => {
   if(r.status===401){ const tok=prompt('API token required:'); if(tok){ AUTH=tok; localStorage.setItem('authToken',tok); } throw (j&&j.error)||'unauthorized'; }
   if(!r.ok) throw (j&&j.error)||t||r.status; return j; });
 const fmt = (n,d=2) => (n==null||isNaN(n))?'—':Number(n).toLocaleString(undefined,{maximumFractionDigits:d});
+// esc HTML-escapes untrusted text before it goes into an innerHTML template
+// literal. Several tables below (activity feed, errors, symbol lists) embed
+// strings that ultimately originate outside this process — most notably a
+// detector's `reason`, which can be raw text from an LLM when only the `ai`
+// detector is configured and its endpoint is pointed at something other than
+// a trusted local Ollama. Without this, that text renders as live HTML/JS in
+// this page, which holds the API auth token as a JS global.
+const esc = s => String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ---- field metadata with end-user explanations ----
 const STRAT_FIELDS = [
-  ['Detectors','Buy detectors (comma list)','text','Indicators for BUY decisions. Available: ema_cross, rsi, macd, bollinger, vwap, atr, rvol, volume_profile, trend, adx, stochastic, supertrend, donchian.'],
+  ['Detectors','Buy detectors (comma list)','text','Indicators for BUY decisions. Available: ema_cross, rsi, macd, bollinger, vwap, atr, rvol, volume_profile, trend, adx, stochastic, supertrend, donchian, ai. The ai detector asks an LLM (Ollama by default) about the same readings — it only votes when configured under ai: in config.yaml, otherwise it holds.'],
   ['DetectorsSell','Sell detectors (comma list)','text','Indicators for SELL decisions. Leave empty to reuse the buy detectors. Lets you exit on different signals than you enter.'],
   ['Weights','Detector weights','text','Optional per-detector strength multipliers, as name:weight pairs (e.g. trend:2, rsi:0.5). Missing detectors default to 1. Scales the reported strength and, in weighted mode, the vote.'],
   ['Combine','Combine mode (BUY)','select:majority,unanimous,weighted','How to merge detectors for BUY. majority = act on the side with more votes; unanimous = all must agree; weighted = act on the net strength-weighted score.'],
@@ -290,32 +397,172 @@ const STRAT_FIELDS = [
   ['SupertrendMult','Supertrend multiplier','num','ATR multiple for the Supertrend band (e.g. 3). Larger = fewer flips.'],
   ['DonchianPeriod','Donchian period','int','Lookback for the Donchian breakout channel (highest high / lowest low, e.g. 20).'],
 ];
-const EXIT_FIELDS = [
-  ['Enabled','Exits enabled','bool','Turn protective exits on/off. They run before strategy signals.'],
-  ['StopLossPct','Stop-loss','num','Sell if price falls this fraction below entry (0.05 = 5%). 0 disables.'],
-  ['TrailingStopPct','Trailing stop','num','Sell if price falls this fraction below the peak since entry. 0 disables.'],
-  ['TakeProfitPct','Take-profit','num','Sell if price rises this fraction above entry (0.20 = 20%). 0 disables.'],
-];
 
+// Live-editable settings sections. Each entry is [jsonKey, label, type, help];
+// the type drives both rendering and how readForm parses the value back.
+// 'dur' is a Go duration string (2h, 30m, 0s), 'csv' a comma-separated list,
+// 'kv' a comma-separated name:value map.
+const SECTION_FIELDS = {
+  exits: [
+    ['enabled','Exits enabled','bool','Turn protective exits on/off. They run before strategy signals.'],
+    ['stop_loss_pct','Stop-loss','num','Sell if price falls this fraction below entry (0.05 = 5%). 0 disables.'],
+    ['trailing_stop_pct','Trailing stop','num','Sell if price falls this fraction below the peak since entry. 0 disables.'],
+    ['take_profit_pct','Take-profit','num','Sell if price rises this fraction above entry (0.20 = 20%). 0 disables.'],
+    ['atr_period','ATR period','int','Lookback for the volatility-adaptive stops below. 0 = 14.'],
+    ['atr_stop_mult','ATR stop multiple','num','Stop this many ATRs below entry instead of a fixed %. The wider of the two wins, so the % acts as a floor. 0 = percentage only.'],
+    ['atr_trail_mult','ATR trail multiple','num','Same idea for the trailing stop. 0 = percentage only.'],
+    ['trailing_offset_pct','Trail: tighten above','num','Profit at which the trail switches to the tight distance (0.03 = +3%). One distance cannot be both loose enough early and tight enough late — so it is two. 0 disables the second stage.'],
+    ['trailing_tight_pct','Trail: tight distance','num','The trailing distance used once the offset is reached. Should be SMALLER than the ordinary trailing stop — that is the point.'],
+    ['trailing_only_after_offset','Trail only after offset','bool','Suppress trailing entirely below the offset, leaving only the stop-loss. Use when the trail is meant to protect a gain, not cap a loss.'],
+    ['max_hold','Max hold (time barrier)','dur','Close unconditionally after this long, at whatever the market offers (4h, 3d, 0s = off). The ROI ladder can only exit at breakeven or better; nothing else closes a position that is simply dead money at a small loss.'],
+    ['roi','ROI ladder','kv','Time-decaying profit target as duration:fraction pairs, e.g. 0s:0.10, 30m:0.05, 2h:0.02, 6h:0. Demands a lot early, settles for less as the trade goes stale.'],
+    ['partial_take_profit','Scale-out ladder','rungs','Sell part of the position at successive gains, as profit:fraction pairs, e.g. 0.05:0.33, 0.10:0.33. Each rung fires once; fractions are of the ORIGINAL size and must sum to ≤ 1. Trades expectancy for variance — check it in a backtest.'],
+  ],
+  entries: [
+    ['allow_pyramiding','Allow pyramiding','bool','Let repeated BUY signals add to a position already open. Off = at most one entry per symbol until it is exited.'],
+    ['skip_full_slots','Skip full slots','bool','When max_open_positions is reached, stop evaluating symbols that cannot be bought. Held symbols are still evaluated and their exits always run. Saves LLM/ML calls spent forming opinions the risk manager will refuse.'],
+    ['scale_in.enabled','Scale-in enabled','bool','Average down on an explicit, capped schedule. Read the warning below first.'],
+    ['scale_in.step_pct','Scale-in step','num','How far below the AVERAGE entry price before the next add (0.03 = 3% underwater). Each add pulls the average down, so every further add needs a further fall.'],
+    ['scale_in.max_adds','Scale-in max adds','int','Hard cap on adds per position. Required — an uncapped ladder is a martingale.'],
+    ['scale_in.size_pct','Scale-in size','num','Each add as a fraction of a normal order (1.0 = a full extra order). Above 1 is martingale sizing and is rejected.'],
+    ['scale_in.require_signal','Scale-in needs a BUY','bool','Only add while the strategy still says BUY. Without it, the ladder buys purely because the price fell — a mean-reversion bet the strategy never made.'],
+  ],
+  costs: [
+    ['commission_pct','Commission %','num','Fraction of notional, e.g. 0.001 = 0.1%.'],
+    ['commission_flat','Commission flat','num','Flat fee added per order.'],
+    ['commission_min','Commission minimum','num','Minimum commission per order.'],
+    ['spread_pct','Bid-ask spread','num','FULL spread as a fraction of price (0.0005 = 5 bps). Half is paid on every fill. Affects backtests and the simulated broker — a live venue charges what it charges.'],
+    ['slippage_pct','Slippage','num','Extra adverse move per fill, as a fraction of price. The cost of size, latency and a moving market.'],
+    ['measure_spread','Measure spread per symbol','bool','Estimate each instrument’s spread from its own bars (Corwin–Schultz) instead of applying one number to everything. The spread above stays a FLOOR — an estimate says the real cost is at least that much, never less. Measured values come from the screener and show up in /api/screener.'],
+  ],
+  protections: [
+    ['enabled','Enabled','bool','Master switch for the outcome-driven circuit breakers.'],
+    ['cooldown_after_loss','Cooldown after loss','dur','No new entry in a symbol for this long after a losing exit (30m, 2h, 0s = off).'],
+    ['stop_guard_trades','Stop guard: trades','int','How many protective stop-outs of ONE symbol trip the guard. 0 = off.'],
+    ['stop_guard_lookback','Stop guard: window','dur','The window those stop-outs must fall within (24h).'],
+    ['stop_guard_lock','Stop guard: lock','dur','How long the symbol is then locked out (4h).'],
+    ['max_drawdown_pct','Max drawdown','num','Halt ALL automated trading this far below the equity peak (0.20 = 20%). Sticky until resumed.'],
+    ['max_daily_loss_pct','Max daily loss','num','Halt after losing this much of the day’s starting equity (0.08 = 8%).'],
+    ['low_profit_trades','Low-profit: trades','int','How many closed trades in ONE symbol must fall inside the window before its P&L is judged. 0 = off. Catches what the stop guard cannot: a symbol that never trips a stop and never trips a drawdown halt, it just bleeds commission and spread.'],
+    ['low_profit_lookback','Low-profit: window','dur','The window those trades must fall within (7d).'],
+    ['low_profit_lock','Low-profit: lock','dur','How long the symbol is then locked out of new entries (24h).'],
+    ['low_profit_min_pnl','Low-profit: required P&L','num','Realized profit the window must clear, in account currency. 0 = must at least break even.'],
+  ],
+  portfolio: [
+    ['enabled','Enabled','bool','Master switch for the concentration caps.'],
+    ['max_per_sector','Max value per sector','num','Combined market value allowed in one sector label. 0 = no cap.'],
+    ['max_positions_per_sector','Max positions per sector','int','Distinct symbols allowed in one sector. 0 = no cap.'],
+    ['correlation_threshold','Correlation threshold','num','Above this, two symbols count as the same bet (0.8).'],
+    ['max_correlated_positions','Max correlated positions','int','How many held symbols may exceed that threshold. 0 = no cap.'],
+    ['correlation_lookback','Correlation lookback (bars)','int','Bars to measure correlation over. 0 = 200.'],
+    ['sectors','Sector map','kv','name:value pairs, e.g. AAPL:tech, MSFT:tech, XOM:energy. Unmapped symbols skip the sector caps but not the correlation check.'],
+  ],
+  screener: [
+    ['enabled','Enabled','bool','Automatically maintain the watchlist. Off = the watchlist is whatever config and the API say.'],
+    ['universe','Universe','csv','Candidate symbols to screen. EMPTY = filter the current watchlist and never add to it.'],
+    ['interval','Interval','dur','How often to re-screen (6h). Changing this needs a restart.'],
+    ['max_symbols','Max symbols','int','Keep the best N by rank. 0 = all survivors.'],
+    ['rank','Rank by','select:volume,volatility,momentum','How survivors are ordered before the cap is applied.'],
+    ['min_price','Min price','num','Skip anything cheaper. 0 = no bound.'],
+    ['max_price','Max price','num','Skip anything dearer. 0 = no bound.'],
+    ['min_avg_volume','Min average volume','num','Drop thin instruments. European ETF listings often trade far below US-style thresholds.'],
+    ['min_volatility_pct','Min volatility (ATR %)','num','Too quiet is untradeable after costs. 0 = no bound.'],
+    ['max_volatility_pct','Max volatility (ATR %)','num','Too wild is unsurvivable. 0 = no bound.'],
+    ['min_history_bars','Min history (bars)','int','Never trade something the strategy cannot warm up on.'],
+    ['max_spread_pct','Max spread','num','Drop instruments whose estimated bid-ask spread exceeds this fraction of price (0.005 = 50 bps). Paid twice per round trip and invisible on a candle chart — a symbol can look tradeable and still be unable to clear its own cost of entry. 0 = no bound.'],
+    ['filters','Filter chain','csv','Which checks to run, in order: history, price, volume, volatility, spread. Evaluation stops at the first failure, so a verdict names the binding constraint. EMPTY = all of them, default order.'],
+    ['keep_held','Keep held symbols','bool','Never drop a symbol with an open position — doing so strands it with no exits.'],
+  ],
+  notify: [
+    ['enabled','Enabled','bool','Master switch for outbound alerts.'],
+    ['events','Events','csv','Which kinds to send: trade, halt, error, blocked (blocked is noisy).'],
+    ['min_notional','Min notional','num','Suppress fill alerts below this order value. Halts and errors are always sent.'],
+    ['timeout','Timeout','dur','Bounds one delivery attempt (10s).'],
+    ['webhook','Webhook URL','text','Any URL — receives the event as a JSON POST.'],
+    ['discord_webhook','Discord webhook','text','A Discord channel webhook URL.'],
+    ['telegram_token','Telegram bot token','text','From @BotFather.'],
+    ['telegram_chat_id','Telegram chat ID','text','The chat or group to post into.'],
+    ['pushover_token','Pushover app token','text','Application/API token from pushover.net.'],
+    ['pushover_user','Pushover user key','text','Your user or group key.'],
+    ['pushover_device','Pushover device','text','Optional: restrict to one device name.'],
+    ['pushover_priority','Pushover priority','int','-2 silent, -1 quiet, 0 normal, 1 high. Halts and errors go one level higher, capped at 1.'],
+    ['apprise_url','Apprise API URL','text','http://host:8000/notify/key (stored config) or .../notify (stateless).'],
+    ['apprise_services','Apprise services','text','Stateless mode only: comma-separated Apprise service URLs.'],
+    ['apprise_tag','Apprise tag','text','Stored config only: which entries to notify.'],
+  ],
+  ai: [
+    ['enabled','Enabled','bool','Build the advisor. Off = the "ai" detector always votes HOLD.'],
+    ['provider','Provider','select:ollama,openai','ollama = native API; openai = any OpenAI-compatible endpoint.'],
+    ['base_url','Base URL','text','http://localhost:11434 for Ollama.'],
+    ['model','Model','text','e.g. llama3.2 — a small instruct model is plenty.'],
+    ['api_key','API key','text','Bearer token for the openai provider. Ollama needs none.'],
+    ['timeout','Timeout','dur','Per request (20s).'],
+    ['refresh_interval','Refresh interval','dur','Minimum time between calls for one symbol (15m).'],
+    ['max_age','Max verdict age','dur','Verdicts older than this are not used (1h).'],
+    ['blocking','Blocking','bool','Wait for the model instead of using the cache. Backtests only — never live.'],
+    ['temperature','Temperature','num','0 = as reproducible as the model allows.'],
+    ['max_concurrent','Max concurrent','int','In-flight request cap; protects a single local GPU.'],
+    ['min_confidence','Min confidence','num','Below this the model’s own answer becomes HOLD.'],
+    ['max_strength','Max strength','num','Ceiling on the strength it contributes (0..1). Keep it low so the LLM tilts a decision rather than carrying one.'],
+    ['system_prompt','System prompt','text','Overrides the built-in instruction. Empty = the default, which asks for a strict JSON verdict. This field must stay on the form: a save sends the whole block, so a missing field would be saved as empty.'],
+  ],
+  ml: [
+    ['enabled','Enabled','bool','Build the predictor. Off = the "ml" detector always votes HOLD.'],
+    ['horizon','Horizon (bars)','int','How many bars ahead the label looks.'],
+    ['threshold','Label threshold','num','Forward return counting as "up" (0.005 = 0.5%). 0 asks "did price tick up", which after costs is not tradeable.'],
+    ['train_bars','Training window (bars)','int','Rolling window the model is fitted on.'],
+    ['retrain_every','Retrain every (bars)','int','Refit cadence in BARS, so backtest and live agree.'],
+    ['min_samples','Min samples','int','Fewest labelled rows needed to fit at all.'],
+    ['buy_prob','Buy probability','num','Probability at which it votes BUY (0.58).'],
+    ['sell_prob','Sell probability','num','Probability at which it votes SELL (0.42). Must be below buy.'],
+    ['min_skill','Min skill','num','Required accuracy ABOVE the majority-class base rate (0.02 = 2pp) before it may vote. This is the guard against acting on a model that learned nothing.'],
+    ['max_strength','Max strength','num','Ceiling on the strength it contributes (0..1).'],
+    ['epochs','Epochs','int','Fitting passes.'],
+    ['learning_rate','Learning rate','num','Gradient step size.'],
+    ['l2','L2 penalty','num','Ridge penalty — the main brake on overfitting the window.'],
+  ],
+};
+
+// A field key may be a dotted path ("scale_in.max_adds") so one form can edit a
+// nested block without needing its own endpoint.
+function getPath(obj,path){ return path.split('.').reduce((o,k)=> (o==null?undefined:o[k]), obj); }
+function setPath(obj,path,val){
+  const parts=path.split('.'); let cur=obj;
+  for(let i=0;i<parts.length-1;i++){ if(typeof cur[parts[i]]!=='object'||cur[parts[i]]==null) cur[parts[i]]={}; cur=cur[parts[i]]; }
+  cur[parts[parts.length-1]]=val;
+}
+// 'rungs' is a list of {profit_pct, sell_pct} objects, written as profit:fraction
+// pairs (0.05:0.33, 0.10:0.33) — the same shape as a kv map but ordered and typed.
+function rungsToText(v){
+  return Array.isArray(v) ? v.map(r=>r.profit_pct+':'+r.sell_pct).join(', ') : '';
+}
+function textToRungs(v){
+  return v.split(',').map(x=>x.trim()).filter(Boolean).map(pair=>{
+    const c=pair.indexOf(':'); if(c<0) return null;
+    const p=parseFloat(pair.slice(0,c)), q=parseFloat(pair.slice(c+1));
+    return (isNaN(p)||isNaN(q))?null:{profit_pct:p, sell_pct:q};
+  }).filter(Boolean);
+}
 function buildForm(el, fields, vals){
   el.innerHTML='';
   for(const [key,label,type,help] of fields){
     const d=document.createElement('div'); d.className='field';
+    const cur=getPath(vals,key);
     let input;
     if(type.startsWith('select:')){
       input=document.createElement('select');
       for(const o of type.slice(7).split(',')){ const op=document.createElement('option'); op.value=o; op.textContent=o; input.appendChild(op);}
-      input.value=vals[key]??'';
+      input.value=cur??'';
     } else if(type==='bool'){
       input=document.createElement('select');
       for(const o of ['true','false']){ const op=document.createElement('option'); op.value=o; op.textContent=o; input.appendChild(op);}
-      input.value=String(!!vals[key]);
+      input.value=String(!!cur);
     } else {
       input=document.createElement('input');
-      const v=vals[key];
-      input.value = Array.isArray(v) ? v.join(',')
-        : (v && typeof v==='object') ? Object.entries(v).map(([k,x])=>k+':'+x).join(',')
-        : (v??'');
+      input.value = type==='rungs' ? rungsToText(cur)
+        : Array.isArray(cur) ? cur.join(',')
+        : (cur && typeof cur==='object') ? Object.entries(cur).map(([k,x])=>k+':'+x).join(',')
+        : (cur??'');
     }
     input.dataset.key=key; input.dataset.type=type;
     const l=document.createElement('label'); l.textContent=label;
@@ -327,8 +574,23 @@ function readForm(el){
   const o={};
   el.querySelectorAll('[data-key]').forEach(i=>{
     const k=i.dataset.key, t=i.dataset.type, v=i.value.trim();
-    if(k==='Detectors'||k==='DetectorsSell'){ o[k]=v.split(',').map(x=>x.trim()).filter(Boolean); }
+    // Dotted keys rebuild the nested object the endpoint expects.
+    if(k.includes('.')){
+      let val;
+      if(t==='int') val=parseInt(v||'0',10);
+      else if(t==='num') val=parseFloat(v||'0');
+      else if(t==='bool') val=(v==='true');
+      else if(t==='dur') val=(v===''?'0s':v);
+      else val=v;
+      setPath(o,k,val); return;
+    }
+    if(t==='rungs'){ o[k]=textToRungs(v); }
+    else if(k==='Detectors'||k==='DetectorsSell'||t==='csv'){ o[k]=v.split(',').map(x=>x.trim()).filter(Boolean); }
     else if(k==='Weights'){ const m={}; v.split(',').map(x=>x.trim()).filter(Boolean).forEach(pair=>{ const c=pair.indexOf(':'); if(c>0){ const kk=pair.slice(0,c).trim(), f=parseFloat(pair.slice(c+1)); if(kk&&!isNaN(f)) m[kk]=f; } }); o[k]=m; }
+    // 'kv' is a string map (symbol -> sector), unlike Weights which is numeric.
+    else if(t==='kv'){ const m={}; v.split(',').map(x=>x.trim()).filter(Boolean).forEach(pair=>{ const c=pair.indexOf(':'); if(c>0){ const kk=pair.slice(0,c).trim(), vv=pair.slice(c+1).trim(); if(kk&&vv) m[kk]=vv; } }); o[k]=m; }
+    // Go durations travel as strings ("2h", "30m"); the server parses them.
+    else if(t==='dur'){ o[k]= v===''?'0s':v; }
     else if(t==='int'){ o[k]=parseInt(v||'0',10); }
     else if(t==='num'){ o[k]=parseFloat(v||'0'); }
     else if(t==='bool'){ o[k]= v==='true'; }
@@ -369,7 +631,9 @@ function applyPositions(p){
   p.forEach(o=>{
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${o.symbol}</td><td class="num">${fmt(o.qty,4)}</td><td class="num">${fmt(o.entry_price)}</td><td class="num">${fmt(o.peak)}</td>`+
-      `<td class="num"><button class="sell" onclick="sell('${o.symbol}',${o.qty})">Sell</button></td>`;
+      `<td class="num"><button class="sell" onclick="sell('${o.symbol}',${o.qty})">Sell</button>` +
+      ` <button class="danger" title="Already sold this by hand? Drop the bot's record without placing an order." ` +
+      `onclick="forgetPosition('${o.symbol}')">Remove</button></td>`;
     b.appendChild(tr);
   });
 }
@@ -379,7 +643,46 @@ async function loadSizing(){ const z=await api('/sizing'); $('#szOrder').value=z
 async function saveSizing(){ try{ await api('/sizing',{method:'PUT',body:JSON.stringify({order_size_usd:parseFloat($('#szOrder').value||'0'),min_positions:parseInt($('#szMin').value||'0',10)})}); msg('#szMsg','applied ✓'); }catch(e){ msg('#szMsg','error: '+e); } }
 async function loadBehavior(){ const b=await api('/behavior'); $('#bhKeep').value=b.keep_interval; $('#bhBuy').value=b.confirm_buy; $('#bhSell').value=b.confirm_sell; }
 async function saveBehavior(){ try{ await api('/behavior',{method:'PUT',body:JSON.stringify({keep_interval:$('#bhKeep').value.trim(),confirm_buy:parseInt($('#bhBuy').value||'1',10),confirm_sell:parseInt($('#bhSell').value||'1',10)})}); msg('#bhMsg','applied ✓'); }catch(e){ msg('#bhMsg','error: '+e); } }
-async function loadExits(){ const x=await api('/exits'); buildForm($('#exitForm'),EXIT_FIELDS,x); }
+
+// ---- live-editable settings sections ----
+// One GET builds all seven forms. The portfolio form folds in the sibling
+// `sectors` map so the sector labels sit next to the caps that use them.
+async function loadSettings(){
+  let s;
+  try{ s=await api('/settings'); }catch(e){ return; }
+  for(const name of Object.keys(SECTION_FIELDS)){
+    const el=$('#'+name+'Form'); if(!el) continue;
+    const vals = name==='portfolio' ? Object.assign({}, s.portfolio, {sectors:s.sectors})
+                                    : (s[name]||{});
+    buildForm(el, SECTION_FIELDS[name], vals);
+  }
+  // Name the filters the server actually has, rather than a copy in this file
+  // that quietly drifts from it.
+  const f=document.querySelector('#screenerForm [data-key="filters"]');
+  if(f && (s.screener_filters||[]).length){
+    f.nextElementSibling.textContent += ' Available: '+s.screener_filters.join(', ')+'.';
+  }
+}
+async function saveSection(name){
+  const el=$('#'+name+'Form'), sel='#'+name+'Msg';
+  try{
+    const r=await api('/settings/'+name,{method:'PUT',body:JSON.stringify(readForm(el))});
+    msg(sel, r && r.note ? 'applied ✓ — '+r.note : 'applied ✓');
+    // Re-read: the server may normalise values, and secrets come back redacted.
+    loadSettings();
+    if(name==='ai'||name==='ml') loadDetectors();
+  }catch(e){ msg(sel,'error: '+e); }
+}
+// Run a screening pass now rather than waiting out the interval, so an edited
+// filter can be checked immediately. The watchlist may change as a result.
+async function rescreenNow(){
+  msg('#screenerMsg','screening…');
+  try{
+    const r=await api('/screener/rescreen',{method:'POST'});
+    msg('#screenerMsg','screened ✓ — '+((r.watchlist||[]).length)+' symbols kept');
+    loadWatchlist();
+  }catch(e){ msg('#screenerMsg','error: '+e); }
+}
 async function loadDetectors(){
   const d=await api('/detectors'); const syms=Object.keys(d).sort();
   // detector columns from the first symbol
@@ -422,6 +725,18 @@ async function loadClosedTrades(){
       `<td class="num ${cls}">${fmt(x.pnl,2)}</td><td class="num ${cls}">${fmt(x.pnl_pct,1)}%</td>`+
       `<td class="${cls}" title="${(x.entry_indicators||'').replace(/"/g,'')}">${x.win?'WIN':'LOSS'}</td></tr>`;
   });
+}
+// Shows the LLM advisor's model and call/error counts when one is configured;
+// the pill stays hidden otherwise so the header is unchanged without it.
+async function loadAI(){
+  try{
+    const a=await api('/ai'); const p=$('#aiPill');
+    if(!a||!a.enabled){ p.hidden=true; return; }
+    p.hidden=false;
+    p.textContent='ai '+a.model+' · '+(a.calls||0)+' calls'+(a.errors?' · '+a.errors+' err':'');
+    p.className='pill '+(a.errors&&a.last_error?'off':'on');
+    p.title=a.provider+' @ '+a.base_url+(a.last_error?'\nlast error: '+a.last_error:'');
+  }catch(e){ /* advisor status is optional; never break the dashboard over it */ }
 }
 async function loadErrors(){
   const e=await api('/errors'); const b=$('#errBody'); b.innerHTML='';
@@ -471,6 +786,67 @@ function drawSpark(){
   ctx.lineWidth=1.5; ctx.stroke();
 }
 
+// ---- price chart with trade markers (canvas, no deps) ----
+// Candlesticks would be nicer, but a close line plus fill markers answers the
+// question people actually have — "where did it buy, and was that a good place?"
+// — at a fraction of the drawing code.
+async function loadChart(){
+  const sel=$('#chartSymbol');
+  if(!sel.options.length){
+    const w=await api('/watchlist');
+    (w.symbols||[]).forEach(s=>{ const o=document.createElement('option'); o.value=o.textContent=s; sel.appendChild(o); });
+    if(!sel.options.length){ $('#chartMsg').textContent='No symbols on the watchlist yet.'; return; }
+  }
+  const sym=sel.value||sel.options[0].value, res=$('#chartRes').value||'1';
+  try{
+    const d=await api('/chart/'+encodeURIComponent(sym)+'?res='+encodeURIComponent(res));
+    drawChart(d);
+  }catch(e){ $('#chartMsg').textContent='chart error: '+e; }
+}
+function drawChart(d){
+  const c=$('#priceChart'); if(!c) return;
+  const W=c.width=(c.clientWidth||900), H=c.height;
+  const ctx=c.getContext('2d'); ctx.clearRect(0,0,W,H);
+  const candles=d.candles||[];
+  if(candles.length<2){ $('#chartMsg').textContent='Not enough history for '+d.symbol+' yet.'; return; }
+  const cs=getComputedStyle(document.documentElement);
+  const pad={l:52,r:8,t:8,b:16};
+  const lows=candles.map(k=>k.low||k.close), highs=candles.map(k=>k.high||k.close);
+  let min=Math.min(...lows), max=Math.max(...highs);
+  (d.trades||[]).forEach(t=>{ if(t.price<min) min=t.price; if(t.price>max) max=t.price; });
+  const rng=(max-min)||1;
+  const t0=new Date(candles[0].time).getTime(), t1=new Date(candles[candles.length-1].time).getTime();
+  const span=(t1-t0)||1;
+  const X=t=>pad.l+((new Date(t).getTime()-t0)/span)*(W-pad.l-pad.r);
+  const Y=p=>H-pad.b-((p-min)/rng)*(H-pad.t-pad.b);
+  // price axis
+  ctx.strokeStyle='rgba(128,128,128,.25)'; ctx.fillStyle=cs.getPropertyValue('--muted').trim()||'#888';
+  ctx.font='10px system-ui,sans-serif'; ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const p=min+rng*i/4, y=Y(p);
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+    ctx.fillText(p.toFixed(2),4,y+3);
+  }
+  // close line
+  ctx.beginPath();
+  candles.forEach((k,i)=>{ const x=X(k.time), y=Y(k.close); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.strokeStyle=(candles[candles.length-1].close>=candles[0].close?cs.getPropertyValue('--buy'):cs.getPropertyValue('--sell')).trim();
+  ctx.lineWidth=1.5; ctx.stroke();
+  // trade markers: filled = executed, hollow = dry-run/blocked
+  (d.trades||[]).forEach(t=>{
+    const x=X(t.time), y=Y(t.price), buy=(t.side||'').toLowerCase()==='buy';
+    const done=(t.status==='filled');
+    ctx.beginPath();
+    if(buy){ ctx.moveTo(x,y-7); ctx.lineTo(x-5,y+3); ctx.lineTo(x+5,y+3); }
+    else   { ctx.moveTo(x,y+7); ctx.lineTo(x-5,y-3); ctx.lineTo(x+5,y-3); }
+    ctx.closePath();
+    const col=(buy?cs.getPropertyValue('--buy'):cs.getPropertyValue('--sell')).trim();
+    if(done){ ctx.fillStyle=col; ctx.fill(); } else { ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.stroke(); }
+  });
+  const fills=(d.trades||[]).filter(t=>t.status==='filled').length;
+  $('#chartMsg').textContent=d.symbol+': '+candles.length+' bars, '+(d.trades||[]).length+' decisions ('+fills+' filled). Green ▲ buys, red ▼ sells; hollow = dry-run or blocked.';
+}
+
 // ---- live activity feed (Server-Sent Events) ----
 let activityRows=0;
 function setLive(on){ const p=$('#livePill'); p.textContent='live '+(on?'ON':'off'); p.className='pill '+(on?'on':'off'); }
@@ -478,8 +854,8 @@ function addActivity(type, symbol, detail, cls){
   $('#activityEmpty').style.display='none';
   const b=$('#activityBody');
   const tr=document.createElement('tr'); tr.className='flash';
-  tr.innerHTML=`<td class="muted small">${new Date().toLocaleTimeString()}</td><td class="small">${type}</td>`+
-    `<td>${symbol||''}</td><td class="small ${cls||''}">${detail||''}</td>`;
+  tr.innerHTML=`<td class="muted small">${esc(new Date().toLocaleTimeString())}</td><td class="small">${esc(type)}</td>`+
+    `<td>${esc(symbol||'')}</td><td class="small ${esc(cls||'')}">${esc(detail||'')}</td>`;
   b.insertBefore(tr, b.firstChild);
   activityRows++;
   while(activityRows>100 && b.lastChild){ b.removeChild(b.lastChild); activityRows--; }
@@ -508,18 +884,32 @@ async function addSymbol(){ const v=$('#wlInput').value.trim(); if(!v)return;
 async function removeSymbol(s){ try{ await api('/watchlist/'+encodeURIComponent(s),{method:'DELETE'}); loadWatchlist(); }catch(e){ alert(e); } }
 async function sell(sym,qty){ if(!confirm('Market SELL '+fmt(qty,4)+' '+sym+'?'))return;
   try{ const r=await api('/orders',{method:'POST',body:JSON.stringify({symbol:sym,side:'sell',qty:qty})}); alert('Sell '+(r.status||'submitted')); loadPositions(); }catch(e){ alert('Sell failed: '+e); } }
+// Drop the bot's record of a position closed outside the bot. Places no order —
+// and books no P&L, because the manual sale's fill price is unknown here.
+async function forgetPosition(sym){
+  if(!confirm('Remove '+sym+' from the bot\'s open positions?\n\n'+
+    'This places NO order — use it only if you already sold '+sym+' yourself.\n'+
+    'It will not appear in realized P&L or the win/loss stats.\n\n'+
+    'If you still hold it, press Cancel and use Sell instead.'))return;
+  try{ await api('/open/'+encodeURIComponent(sym),{method:'DELETE'}); loadPositions(); }
+  catch(e){ alert('Remove failed: '+e); }
+}
 async function saveStrategy(){ try{ await api('/strategy',{method:'PUT',body:JSON.stringify(readForm($('#stratForm')))}); msg('#stratMsg','applied ✓'); loadDetectors(); }catch(e){ msg('#stratMsg','error: '+e); } }
-async function saveExits(){ try{ await api('/exits',{method:'PUT',body:JSON.stringify(readForm($('#exitForm')))}); msg('#exitMsg','applied ✓'); }catch(e){ msg('#exitMsg','error: '+e); } }
 function msg(sel,t){ const e=$(sel); e.textContent=' '+t; e.classList.add('flash'); setTimeout(()=>e.classList.remove('flash'),600); }
 
 $('#tradeToggle').onclick=async()=>{ const on=$('#tradeToggle').dataset.on==='true';
+  // Enabling live trading requires accepting the risk explicitly.
+  if(!on && !confirm('⚠️ Enable LIVE trading?\n\nThis places REAL orders on the configured broker with real money. By enabling trading you accept ALL risk of financial loss — this software can and does lose money, and the authors accept no responsibility. Prove your strategy on the simulator/paper account first.\n\nClick OK only if you accept these risks.')) return;
   try{ await api('/trading',{method:'POST',body:JSON.stringify({enabled:!on})}); loadStatus(); }catch(e){ alert(e); } };
 $('#statsPeriod').onchange=loadStats;
 
-function refreshAll(){ loadDashboard(); loadWatchlist(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); }
+function refreshAll(){ loadDashboard(); loadWatchlist(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); loadAI(); loadChart(); }
 // initial load: forms once, data on a poll, activity via a live stream
-loadStrategy(); loadExits(); loadSizing(); loadBehavior(); refreshAll(); startEventStream();
-setInterval(()=>{ loadDashboard(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); }, 5000);
+loadStrategy(); loadSizing(); loadBehavior(); loadSettings(); refreshAll(); startEventStream();
+setInterval(()=>{ loadDashboard(); loadDetectors(); loadErrors(); loadStats(); loadClosedTrades(); loadAI(); }, 5000);
+// The chart is heavier and changes slowly; refresh it on its own, calmer clock.
+setInterval(loadChart, 30000);
+window.addEventListener('resize', ()=>{ drawSpark(); loadChart(); });
 window.addEventListener('resize', drawSpark);
 </script>
 </body>

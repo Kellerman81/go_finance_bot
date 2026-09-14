@@ -1,6 +1,8 @@
 package backtest
 
 import (
+	"context"
+
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
 )
@@ -33,7 +35,12 @@ type WalkForward struct {
 // inside it, so the segments should be comfortably longer than the strategy's
 // lookback for the estimate to be meaningful. It returns each fold and the mean
 // out-of-sample score/return.
-func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, grid ParamGrid,
+//
+// ctx is passed through to each fold's Optimize call (see its own doc
+// comment) and also checked once per fold: on cancellation,
+// WalkForwardOptimize returns whatever folds it has already completed. A
+// nil ctx runs to completion exactly as before.
+func WalkForwardOptimize(ctx context.Context, base config.Config, data map[string][]market.Candle, grid ParamGrid,
 	cash float64, minTrades, folds int, score Scorer, respectLimits bool,
 ) WalkForward {
 	if folds < 1 {
@@ -58,6 +65,10 @@ func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, gr
 	var sumScore, sumRet float64
 
 	for k := 1; k <= folds; k++ {
+		if ctx != nil && ctx.Err() != nil {
+			break // report the mean over whatever folds completed, below
+		}
+
 		trainEnd := k * seg
 		testEnd := (k + 1) * seg
 
@@ -68,7 +79,7 @@ func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, gr
 		train := sliceData(data, 0, trainEnd)
 		test := sliceData(data, trainEnd, testEnd)
 
-		trials := Optimize(base, train, grid, cash, minTrades, score, respectLimits)
+		trials := Optimize(ctx, base, train, grid, cash, minTrades, score, respectLimits)
 		if len(trials) == 0 {
 			continue
 		}
@@ -82,6 +93,7 @@ func WalkForwardOptimize(base config.Config, data map[string][]market.Candle, gr
 			best.StopLoss,
 			best.TrailingStop,
 			best.TakeProfit,
+			base.Costs,
 			cash,
 			respectLimits,
 		)

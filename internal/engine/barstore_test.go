@@ -1,10 +1,16 @@
 package engine
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/Kellerman81/go_finance_bot/internal/broker"
+	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
+	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
+	"github.com/Kellerman81/go_finance_bot/internal/risk"
 )
 
 func TestRingFixedCapacityKeepsNewest(t *testing.T) {
@@ -30,11 +36,11 @@ func TestBarStoreIngestAndSeries(t *testing.T) {
 	bs.add("AAPL")
 	base := time.Now().Truncate(time.Minute)
 	// Two ticks in bar 0, then a tick in bar 1 completes bar 0.
-	if bs.ingest("AAPL", 100, base) {
+	if bs.ingest("AAPL", 100, 0, base) {
 		t.Error("first tick should not complete a bar")
 	}
-	bs.ingest("AAPL", 101, base.Add(10*time.Second))
-	if !bs.ingest("AAPL", 102, base.Add(time.Minute)) {
+	bs.ingest("AAPL", 101, 0, base.Add(10*time.Second))
+	if !bs.ingest("AAPL", 102, 0, base.Add(time.Minute)) {
 		t.Error("tick in next bucket should complete the prior bar")
 	}
 	series := bs.series("AAPL")
@@ -83,5 +89,58 @@ func TestBarStoreRemove(t *testing.T) {
 	}
 	if bs.series("X") != nil {
 		t.Error("series of removed symbol should be nil")
+	}
+}
+
+// TestEngineSeriesMatchesTheConfiguredBarInterval reproduces the AT-9 fix:
+// internal/autotune and the Strategy tab's per-symbol optimizer used to call
+// SeriesResampled(symbol, market.Resolution("1")) — a fixed 1-minute
+// resampling that silently diverges from a configured sub-minute
+// BarInterval (nothing in config.Validate forbids one, and this field is
+// documented as configurable: "Larger bars (e.g. 5m) trade on coarser, less
+// noisy candles"). With a 30s BarInterval, two completed 30s bars fold into
+// a single resampled 1-minute bucket, so a caller backtesting against
+// SeriesResampled(..., "1") was tuning indicator periods/exit levels
+// against a bar size the live engine never actually evaluates on. Series
+// must return exactly what evaluateSignals sees — no resampling at all.
+func TestEngineSeriesMatchesTheConfiguredBarInterval(t *testing.T) {
+	provider := market.NewMock(time.Hour)
+	defer provider.Close()
+
+	pf := portfolio.New()
+	pf.SetCash(1000)
+	brk := broker.NewSim(1000, func(string) (float64, bool) { return 0, false }, nil)
+	rm := risk.New(config.Limits{MaxOpenPositions: 10}, config.CostsConfig{})
+	prices := NewPriceCache()
+
+	e := New(
+		config.EngineConfig{EvalInterval: time.Hour, BarInterval: 30 * time.Second},
+		config.ExitsConfig{}, config.SafetyConfig{}, config.StrategyConfig{},
+		provider, brk, rm, pf, prices, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	defer e.Close()
+
+	e.barsStore.add("X")
+
+	base := time.Now().Truncate(time.Minute)
+	e.ingest(market.Quote{Symbol: "X", Price: 100, Time: base})
+	e.ingest(market.Quote{Symbol: "X", Price: 101, Time: base.Add(30 * time.Second)})
+	e.ingest(market.Quote{Symbol: "X", Price: 102, Time: base.Add(60 * time.Second)})
+
+	raw := e.Series("X")
+	if len(raw) != 3 {
+		t.Fatalf("Series len = %d, want 3 (one bar per 30s BarInterval bucket)", len(raw))
+	}
+
+	resampledTo1m := e.SeriesResampled("X", market.Resolution("1"))
+	if len(resampledTo1m) != 2 {
+		t.Fatalf("SeriesResampled(\"1\") len = %d, want 2 (two 30s bars fold into the first 1-minute bucket) — "+
+			"this is exactly the divergence Series must avoid", len(resampledTo1m))
+	}
+
+	if len(raw) == len(resampledTo1m) {
+		t.Fatal("Series and SeriesResampled(\"1\") returned the same length — " +
+			"this BarInterval choice failed to demonstrate the divergence")
 	}
 }

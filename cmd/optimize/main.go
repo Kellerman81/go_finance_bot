@@ -7,11 +7,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	_ "time/tzdata" // bundle the IANA tz database, same as cmd/bot — see CODE_REVIEW_FINDINGS.md's tzdata finding
 
 	"github.com/Kellerman81/go_finance_bot/internal/backtest"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
@@ -31,7 +34,11 @@ func main() {
 	gen := flag.String("generate", "", "comma-separated symbols to synthesise instead of CSV")
 	bars := flag.Int("bars", 500, "synthetic bars when using -generate")
 	cash := flag.Float64("cash", 50000, "starting cash")
-	rank := flag.String("rank", "blend", "ranking: blend | return | winrate | sharpe")
+	rank := flag.String(
+		"rank",
+		"blend",
+		"ranking objective: "+strings.Join(backtest.ScorerNames, " | "),
+	)
 	minTrades := flag.Int("min-trades", 5, "ignore configs with fewer trades than this")
 	top := flag.Int("top", 15, "leaderboard rows to print")
 	respectLimits := flag.Bool(
@@ -45,17 +52,67 @@ func main() {
 		"random-search N samples over the full space INCL. indicator periods (0 = grid search)",
 	)
 	seed := flag.Int64("seed", 1, "random seed (for reproducible -random runs)")
+	generations := flag.Int(
+		"generations",
+		1,
+		"with -random N: run N backtests as G guided generations, each refining the best of the last (1 = plain random search)",
+	)
 	sensitivity := flag.Bool(
 		"sensitivity",
 		false,
 		"one-factor-at-a-time: change each parameter alone and show the result",
 	)
 	deploy := flag.Float64("deploy", 0.25, "baseline capital fraction for -sensitivity")
+	walkForward := flag.Int(
+		"walkforward",
+		0,
+		"walk-forward folds: optimise on past data, score on the NEXT unseen segment (0 = off)",
+	)
+	refine := flag.Bool(
+		"refine",
+		true,
+		"after the main search, sweep the axes the grid cannot afford to cross: the "+
+			"SELL side (detectors_sell/combine_sell/min_strength_sell), confirm/keep "+
+			"behaviour, ATR-adaptive exits and risk sizing",
+	)
 	jsonOut := flag.Bool("json", false, "emit all ranked trials as JSON")
+	checkpoint := flag.String(
+		"checkpoint",
+		"optimize_results.json",
+		"write ranked trials + best config here as JSON once the search finishes or is "+
+			"interrupted (Ctrl+C), before the human-readable report — so a multi-hour run "+
+			"loses nothing already computed to an interrupt or a broken stdout pipe; "+
+			"empty disables",
+	)
 
 	flag.Parse()
 
+	// A typo in -rank used to fall back to the blend scorer silently — the
+	// run's own banner kept printing the (wrong, never-actually-used)
+	// requested name for the rest of the run, with nothing anywhere saying
+	// blend was substituted. Warn once, up front, so the mismatch is
+	// visible before a multi-hour search runs on the wrong objective. See
+	// CODE_REVIEW_FINDINGS.md's "-rank typos silently fall back to the
+	// blend scorer" finding.
+	score, rankOK := backtest.ScorerByName(*rank)
+	if !rankOK {
+		fmt.Fprintf(os.Stderr,
+			"warning: unknown -rank %q; using \"blend\" instead. Valid values: %s\n",
+			*rank, strings.Join(backtest.ScorerNames, ", "))
+	}
+
+	// A single Ctrl+C requests a graceful stop: the search functions check
+	// ctx between trials/combinations/folds and return whatever they have
+	// found so far instead of running to completion, and whatever they
+	// found is exactly what still gets checkpointed and printed below — an
+	// interrupted multi-hour run no longer loses everything it already
+	// computed. See CODE_REVIEW_FINDINGS.md's "cmd/optimize: no
+	// cancellation, no incremental result persistence".
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	cfg := backtest.LoadConfig(*cfgPath, os.Stderr)
+	backtest.ConfigureAI(cfg, os.Stderr)
 
 	var (
 		err  error
@@ -101,11 +158,37 @@ func main() {
 		return
 	}
 
+	if *walkForward > 0 {
+		fmt.Printf(
+			"Walk-forward analysis: %d folds (rank=%s, min-trades=%d, limits=%s)...\n\n",
+			*walkForward, *rank, *minTrades, limMode,
+		)
+
+		wf := backtest.WalkForwardOptimize(ctx, cfg, data, backtest.DefaultGrid(), *cash,
+			*minTrades, *walkForward, score, *respectLimits)
+
+		if *jsonOut {
+			emitJSON(wf)
+
+			return
+		}
+
+		printWalkForward(wf)
+
+		return
+	}
+
 	var trials []backtest.Trial
 
 	if *random > 0 {
+		mode := "Random search"
+		if *generations > 1 {
+			mode = fmt.Sprintf("Guided search (%d generations)", *generations)
+		}
+
 		fmt.Printf(
-			"Random search: %d samples over the full space incl. indicator periods (rank=%s, min-trades=%d, limits=%s, seed=%d)...\n\n",
+			"%s: %d samples over the full space incl. indicator periods (rank=%s, min-trades=%d, limits=%s, seed=%d)...\n\n",
+			mode,
 			*random,
 			*rank,
 			*minTrades,
@@ -113,15 +196,20 @@ func main() {
 			*seed,
 		)
 
-		trials = backtest.OptimizeRandom(
+		trials = backtest.OptimizeGuided(
+			ctx,
 			cfg,
 			data,
 			*cash,
 			*random,
+			*generations,
 			*minTrades,
-			backtest.ScorerByName(*rank),
+			score,
 			*respectLimits,
 			*seed,
+			// No pins: this CLI applies whatever it finds by hand to the shared
+			// config, where every deployment axis is settable.
+			backtest.Pins{},
 		)
 	} else {
 		grid := backtest.DefaultGrid()
@@ -129,12 +217,13 @@ func main() {
 			grid.Combos(), *rank, *minTrades, limMode)
 
 		trials = backtest.Optimize(
+			ctx,
 			cfg,
 			data,
 			grid,
 			*cash,
 			*minTrades,
-			backtest.ScorerByName(*rank),
+			score,
 			*respectLimits,
 		)
 	}
@@ -147,20 +236,158 @@ func main() {
 		return
 	}
 
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
+	best := trials[0]
 
-		if err := enc.Encode(trials); err != nil {
-			fmt.Fprintln(os.Stderr, "encode json:", err)
-			os.Exit(1)
+	var changes []backtest.Refinement
+
+	if *refine {
+		fmt.Fprintln(os.Stderr, "\nRefining the winner over the axes the grid does not cover...")
+
+		best, changes = backtest.Refine(cfg, data, best, *cash, *minTrades,
+			score, *respectLimits, os.Stderr,
+			false) // every axis: this CLI's output is applied to the shared config by hand
+	}
+
+	out := searchOutput{trials, best, changes, []string{confirmCountWarning}}
+
+	// Written before any human-readable printing: if stdout itself then
+	// fails partway (a closed pipe, a full disk on a redirect) the already-
+	// computed result set survives on disk regardless, rather than being
+	// lost along with the print. See CODE_REVIEW_FINDINGS.md's "cmd/optimize:
+	// no cancellation, no incremental result persistence".
+	if *checkpoint != "" {
+		if err := writeCheckpoint(*checkpoint, out); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write checkpoint %s: %v\n", *checkpoint, err)
 		}
+	}
+
+	if *jsonOut {
+		emitJSON(out)
 
 		return
 	}
 
 	printLeaderboard(trials, *top)
-	printBest(trials[0], *cash)
+	printRefinements(changes, trials[0], best)
+	printBest(best, *cash)
+}
+
+// printRefinements reports what the refinement pass changed, and what it left
+// alone. "Left alone" is the useful half: it means the grid's choice survived a
+// direct challenge on that axis.
+func printRefinements(changes []backtest.Refinement, before, after backtest.Trial) {
+	fmt.Println("\n================ REFINEMENT ================")
+
+	if len(changes) == 0 {
+		fmt.Println("No axis improved on the grid winner — the sell side, behaviour," +
+			" adaptive exits, risk sizing and the trend gate were all left at the base settings.")
+
+		return
+	}
+
+	fmt.Printf("%-20s %-24s %-24s %s\n", "axis", "from", "to", "score gain")
+	fmt.Println(strings.Repeat("-", 86))
+
+	for _, c := range changes {
+		fmt.Printf("%-20s %-24s %-24s %+.3f\n", c.Axis, c.From, c.To, c.Improved)
+	}
+
+	fmt.Printf("\nScore %.3f -> %.3f   return %.2f%% -> %.2f%%   trades %d -> %d\n",
+		before.Score, after.Score,
+		before.Result.TotalReturnPct, after.Result.TotalReturnPct,
+		before.Result.NumTrades, after.Result.NumTrades)
+	fmt.Println("Refinement is coordinate descent: it finds a local optimum and cannot " +
+		"discover parameters that only work when changed together.")
+}
+
+// emitJSON writes v as indented JSON on stdout, exiting non-zero if it can't.
+func emitJSON(v any) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	if err := enc.Encode(v); err != nil {
+		fmt.Fprintln(os.Stderr, "encode json:", err)
+		os.Exit(1)
+	}
+}
+
+// searchOutput is the ranked result of a grid/random/guided search, shared
+// between -json's stdout output and -checkpoint's on-disk one so the two
+// can never drift apart.
+type searchOutput struct {
+	Trials      []backtest.Trial      `json:"trials"`
+	Best        backtest.Trial        `json:"best"`
+	Refinements []backtest.Refinement `json:"refinements"`
+	// Warnings carries the caveats printBest's YAML output states as
+	// comments (invisible in -json/-checkpoint output, since both skip
+	// printBest entirely) — a script or a recovered checkpoint file has no
+	// other way to learn them. See CODE_REVIEW_FINDINGS.md's backtest/live
+	// divergence cluster, "confirm_buy/confirm_sell count bars in backtest,
+	// evaluation ticks live".
+	Warnings []string `json:"warnings"`
+}
+
+// writeCheckpoint writes out as indented JSON to path, creating or
+// truncating it. Called once the search finishes (or is interrupted) and
+// before any human-readable printing, so an already-computed result set
+// survives a stdout failure or a process kill during the print — see
+// CODE_REVIEW_FINDINGS.md's "cmd/optimize: no cancellation, no incremental
+// result persistence".
+func writeCheckpoint(path string, out searchOutput) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+
+	return enc.Encode(out)
+}
+
+// printWalkForward reports each fold's out-of-sample result and the averages.
+//
+// This is the number to believe. An ordinary search reports the best result on
+// the data it searched, which is the definition of an in-sample optimum: some
+// combination always fits the noise. Walk-forward picks parameters on past data
+// only and scores them on the *next*, unseen segment — so a strategy that only
+// works when you already know the answer is exposed as one.
+func printWalkForward(wf backtest.WalkForward) {
+	if len(wf.Folds) == 0 {
+		fmt.Println(
+			"Not enough data to split into folds. Use more bars or fewer -walkforward folds.",
+		)
+
+		return
+	}
+
+	fmt.Printf(
+		"%-5s %9s %9s %10s %9s %8s %7s  %s\n",
+		"fold",
+		"trainBars",
+		"testBars",
+		"oosReturn%",
+		"oosScore",
+		"win%",
+		"trades",
+		"in-sample pick",
+	)
+	fmt.Println(strings.Repeat("-", 110))
+
+	for i, f := range wf.Folds {
+		fmt.Printf("%-5d %9d %9d %10.2f %9.3f %8.1f %7d  %s\n",
+			i+1, f.TrainBars, f.TestBars, f.Test.TotalReturnPct, f.TestScore,
+			f.Test.WinRatePct, f.Test.NumTrades, describe(f.Best))
+	}
+
+	fmt.Printf("\nMean out-of-sample return: %.2f%%   mean score: %.3f   over %d folds\n",
+		wf.MeanOOSReturn, wf.MeanOOSScore, len(wf.Folds))
+
+	if wf.MeanOOSReturn <= 0 {
+		fmt.Println("Negative out-of-sample return: the in-sample winners did not generalise. " +
+			"Treat any single-run leaderboard from this dataset as overfitted.")
+	}
 }
 
 // dedupe collapses trials that produced an identical result (e.g. exit params
@@ -266,6 +493,29 @@ func printBest(t backtest.Trial, cash float64) {
 	fmt.Printf("  detectors: [%s]\n", quoteJoin(t.Detectors))
 	fmt.Printf("  combine: %q\n", t.Combine)
 	fmt.Printf("  min_strength: %.2f\n", t.MinStrength)
+
+	// The SELL side. Emitted even when it inherits, so the file states what the
+	// exit rule is rather than leaving it implicit.
+	if len(p.DetectorsSell) > 0 {
+		fmt.Printf("  detectors_sell: [%s]\n", quoteJoin(p.DetectorsSell))
+	} else {
+		fmt.Println("  detectors_sell: []   # inherits the buy detectors")
+	}
+
+	fmt.Printf("  combine_sell: %q", p.CombineSell)
+
+	if p.CombineSell == "" {
+		fmt.Print("   # inherits combine")
+	}
+
+	fmt.Println()
+
+	if p.MinStrengthSell < 0 {
+		fmt.Println("  min_strength_sell: -1   # inherits min_strength")
+	} else {
+		fmt.Printf("  min_strength_sell: %.2f\n", p.MinStrengthSell)
+	}
+
 	fmt.Printf("  fast_ma: %d\n  slow_ma: %d\n", p.FastMA, p.SlowMA)
 	fmt.Printf("  rsi_period: %d\n  rsi_overbought: %.0f\n  rsi_oversold: %.0f\n  rsi_mode: %q\n",
 		p.RSIPeriod, p.RSIOverbought, p.RSIOversold, p.RSIMode)
@@ -291,24 +541,38 @@ func printBest(t backtest.Trial, cash float64) {
 		p.TrendThreshold,
 		p.TrendGate,
 	)
-	fmt.Println("engine:")
+	fmt.Printf("  adx_period: %d\n  adx_threshold: %.1f\n", p.ADXPeriod, p.ADXThreshold)
 	fmt.Printf(
-		"  order_size_usd: %.0f   # = %.0f%% of %.0f cash\n",
-		t.OrderSize,
-		t.CapitalFrac*100,
-		cash,
+		"  stoch_k_period: %d\n  stoch_d_period: %d\n  stoch_overbought: %.1f\n  stoch_oversold: %.1f\n",
+		p.StochKPeriod,
+		p.StochDPeriod,
+		p.StochOverbought,
+		p.StochOversold,
 	)
-	fmt.Println("exits:")
-	fmt.Println("  enabled: true")
-	fmt.Printf("  stop_loss_pct: %.2f\n", t.StopLoss)
-	fmt.Printf("  trailing_stop_pct: %.2f%s\n", t.TrailingStop, disabledNote(t.TrailingStop))
-	fmt.Printf("  take_profit_pct: %.2f%s\n", t.TakeProfit, disabledNote(t.TakeProfit))
+	fmt.Printf(
+		"  supertrend_period: %d\n  supertrend_mult: %.1f\n",
+		p.SupertrendPeriod,
+		p.SupertrendMult,
+	)
+	fmt.Printf("  donchian_period: %d\n", p.DonchianPeriod)
+	printBestEngine(t, cash)
+	printBestExits(t)
+
 	fmt.Println("# To realise this, money limits must allow the deployment, e.g.:")
 	fmt.Printf(
 		"# limits: { max_order_value: %.0f, max_per_position: %.0f, max_total_invested: <your cap> }\n",
 		t.OrderSize*1.05,
 		t.OrderSize*1.05,
 	)
+	fmt.Println("#")
+	fmt.Println("# NOT searched, and not searchable:")
+	fmt.Println("#   costs.*       — spread, slippage and commission are measurements of")
+	fmt.Println("#                   your broker, not choices. An optimiser given them")
+	fmt.Println("#                   would set them to zero and report a better strategy.")
+	fmt.Println("#   protections.* — they can only cost return in-sample, so any")
+	fmt.Println("#                   return-seeking search switches them off. They were")
+	fmt.Println("#                   APPLIED during every backtest instead.")
+
 	fmt.Printf(
 		"\nResult: return %.2f%%  (buy&hold %.2f%%), win %.1f%%, %d trades, maxDD %.2f%%, sharpe %.2f\n",
 		t.Result.TotalReturnPct,
@@ -318,6 +582,60 @@ func printBest(t backtest.Trial, cash float64) {
 		t.Result.MaxDrawdownPct,
 		t.Result.Sharpe,
 	)
+
+	if t.Result.HaltedAt != "" {
+		fmt.Printf("\n⚠️  A protection would have HALTED the live bot during this run:\n    %s\n"+
+			"    The equity curve continues past that point; the live one would not.\n",
+			t.Result.HaltedAt)
+	}
+}
+
+// printBestEngine emits the engine block, including the behaviour and sizing
+// settings refinement tunes.
+func printBestEngine(t backtest.Trial, cash float64) {
+	fmt.Println("engine:")
+	fmt.Printf(
+		"  order_size_usd: %.0f   # = %.0f%% of %.0f cash\n",
+		t.OrderSize,
+		t.CapitalFrac*100,
+		cash,
+	)
+	fmt.Printf("  confirm_buy: %d\n", t.ConfirmBuy)
+	fmt.Printf("  confirm_sell: %d\n", t.ConfirmSell)
+	fmt.Printf("  keep_interval: %s\n", t.KeepInterval)
+
+	// The confirmation cadence differs between live and backtest unless the two
+	// intervals match, and a tuned confirm count is worth nothing if the live
+	// bot applies a different one.
+	fmt.Println("  # NOTE: " + confirmCountWarning)
+}
+
+// confirmCountWarning states the unit mismatch between what confirm_buy/
+// confirm_sell measure in a backtest versus live: the search tunes a bar
+// count, but the live engine counts evaluation ticks against the same
+// field, so the winning value found here means something else entirely once
+// pasted into a running bot (e.g. three days of daily-bar confirmation
+// becomes three 30-second ticks against a 30s eval_interval — about 90
+// seconds). Shared between printBestEngine's YAML comment and the -json
+// warnings field, so a script consuming JSON output learns the same caveat
+// a human reading the paste-ready YAML would see.
+const confirmCountWarning = "confirm_buy/confirm_sell count BARS in the backtest but EVALUATIONS " +
+	"live — set engine.eval_interval == the backtest's bar interval, or the live bot confirms " +
+	"on a completely different timescale than what was tuned here."
+
+// printBestExits emits the exits block, including the ATR-adaptive stops.
+func printBestExits(t backtest.Trial) {
+	fmt.Println("exits:")
+	fmt.Println("  enabled: true")
+	fmt.Printf("  stop_loss_pct: %.2f\n", t.Exits.StopLossPct)
+	fmt.Printf("  trailing_stop_pct: %.2f%s\n",
+		t.Exits.TrailingStopPct, disabledNote(t.Exits.TrailingStopPct))
+	fmt.Printf("  take_profit_pct: %.2f%s\n",
+		t.Exits.TakeProfitPct, disabledNote(t.Exits.TakeProfitPct))
+	fmt.Printf("  atr_stop_mult: %.1f%s\n",
+		t.Exits.ATRStopMult, disabledNote(t.Exits.ATRStopMult))
+	fmt.Printf("  atr_trail_mult: %.1f%s\n",
+		t.Exits.ATRTrailMult, disabledNote(t.Exits.ATRTrailMult))
 }
 
 // disabledNote annotates a zero exit level as disabled in the YAML output.

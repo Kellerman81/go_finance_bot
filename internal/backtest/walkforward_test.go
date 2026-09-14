@@ -1,6 +1,7 @@
 package backtest
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
@@ -18,7 +19,7 @@ func TestWalkForwardProducesOutOfSampleFolds(t *testing.T) {
 		TakeProfit:   []float64{0.2},
 	}
 	const folds = 3
-	wf := WalkForwardOptimize(config.Default(), data, grid, 50000, 1, folds, ScoreReturn, false)
+	wf := WalkForwardOptimize(context.Background(), config.Default(), data, grid, 50000, 1, folds, ScoreReturn, false)
 	if len(wf.Folds) == 0 {
 		t.Fatal("expected walk-forward folds")
 	}
@@ -39,6 +40,33 @@ func TestWalkForwardProducesOutOfSampleFolds(t *testing.T) {
 		if len(f.Best.Params.Detectors) == 0 {
 			t.Errorf("fold %d selected no detectors", i)
 		}
+	}
+}
+
+// TestWalkForwardOptimizeStopsEarlyWhenContextIsCancelled reproduces the
+// "cmd/optimize: no cancellation" finding for walk-forward analysis: an
+// already-cancelled context must stop the fold loop before it starts,
+// rather than running every fold (each itself a full grid search)
+// regardless.
+func TestWalkForwardOptimizeStopsEarlyWhenContextIsCancelled(t *testing.T) {
+	data := Generate([]string{"AAPL", "MSFT"}, 1200)
+	grid := ParamGrid{
+		DetectorSets: [][]string{{"ema_cross", "macd"}, {"rsi", "macd"}},
+		Combine:      []string{"majority", "weighted"},
+		MinStrength:  []float64{0.1, 0.3},
+		CapitalFrac:  []float64{0.1, 0.25},
+		StopLoss:     []float64{0.05},
+		TrailingStop: []float64{0.08},
+		TakeProfit:   []float64{0.2},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the search starts
+
+	wf := WalkForwardOptimize(ctx, config.Default(), data, grid, 50000, 1, 3, ScoreReturn, false)
+
+	if len(wf.Folds) != 0 {
+		t.Errorf("got %d folds with an already-cancelled context, want 0", len(wf.Folds))
 	}
 }
 

@@ -22,6 +22,37 @@ type Store interface {
 	SaveWatchlist(symbols []string) error
 	// LoadWatchlist returns the persisted watchlist.
 	LoadWatchlist() ([]string, error)
+	// SavePinned replaces the persisted set of hand-picked symbols.
+	SavePinned(symbols []string) error
+	// LoadPinned returns the persisted set of hand-picked symbols.
+	LoadPinned() ([]string, error)
+	// SaveNames replaces the persisted symbol -> company name cache.
+	SaveNames(names map[string]string) error
+	// LoadNames returns the persisted symbol -> company name cache.
+	LoadNames() (map[string]string, error)
+	// SaveSectors replaces the persisted symbol -> auto-learned sector cache
+	// (config.yaml's own sectors: block is a separate, always-wins override
+	// layer — this is only what was learned automatically).
+	SaveSectors(sectors map[string]string) error
+	// LoadSectors returns the persisted auto-learned sector cache.
+	LoadSectors() (map[string]string, error)
+	// SaveAssetClasses replaces the persisted symbol -> auto-learned asset
+	// class cache (config.yaml's own asset_classes: block is a separate,
+	// always-wins override layer).
+	SaveAssetClasses(classes map[string]string) error
+	// LoadAssetClasses returns the persisted auto-learned asset class cache.
+	LoadAssetClasses() (map[string]string, error)
+	// SaveLossStreaks replaces the persisted symbol -> consecutive realized
+	// losses counters that drive autotune.on_loss.
+	SaveLossStreaks(streaks map[string]int) error
+	// LoadLossStreaks returns the persisted consecutive-loss counters.
+	LoadLossStreaks() (map[string]int, error)
+	// SaveAutotuneApplies replaces the persisted map of symbol -> the time
+	// the scheduled or manual auto-optimizer last applied a
+	// strategy_overrides change to it.
+	SaveAutotuneApplies(applies map[string]time.Time) error
+	// LoadAutotuneApplies returns the persisted map.
+	LoadAutotuneApplies() (map[string]time.Time, error)
 	// SaveDailySpend upserts the rolling daily-spend counter for day.
 	SaveDailySpend(day string, amount float64) error
 	// LoadDailySpend returns the persisted day and spend amount.
@@ -53,6 +84,42 @@ func (Nop) SaveWatchlist([]string) error { return nil }
 
 // LoadWatchlist is a no-op.
 func (Nop) LoadWatchlist() ([]string, error) { return nil, nil }
+
+// SavePinned is a no-op.
+func (Nop) SavePinned([]string) error { return nil }
+
+// LoadPinned is a no-op.
+func (Nop) LoadPinned() ([]string, error) { return nil, nil }
+
+// SaveNames is a no-op.
+func (Nop) SaveNames(map[string]string) error { return nil }
+
+// LoadNames is a no-op.
+func (Nop) LoadNames() (map[string]string, error) { return nil, nil }
+
+// SaveSectors is a no-op.
+func (Nop) SaveSectors(map[string]string) error { return nil }
+
+// LoadSectors is a no-op.
+func (Nop) LoadSectors() (map[string]string, error) { return nil, nil }
+
+// SaveAssetClasses is a no-op.
+func (Nop) SaveAssetClasses(map[string]string) error { return nil }
+
+// LoadAssetClasses is a no-op.
+func (Nop) LoadAssetClasses() (map[string]string, error) { return nil, nil }
+
+// SaveLossStreaks is a no-op.
+func (Nop) SaveLossStreaks(map[string]int) error { return nil }
+
+// LoadLossStreaks is a no-op.
+func (Nop) LoadLossStreaks() (map[string]int, error) { return nil, nil }
+
+// SaveAutotuneApplies is a no-op.
+func (Nop) SaveAutotuneApplies(map[string]time.Time) error { return nil }
+
+// LoadAutotuneApplies is a no-op.
+func (Nop) LoadAutotuneApplies() (map[string]time.Time, error) { return nil, nil }
 
 // SaveDailySpend is a no-op.
 func (Nop) SaveDailySpend(string, float64) error { return nil }

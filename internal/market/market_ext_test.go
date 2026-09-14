@@ -103,6 +103,66 @@ func TestCachingHistorySlicesToWindow(t *testing.T) {
 	}
 }
 
+// TestCachingHistoryMutationDoesNotCorruptTheCache reproduces the
+// mutable-backing-array finding: a caller that mutates its returned candles
+// in place (the engine's FX-conversion loop in warmup does exactly this)
+// must not corrupt what a later caller reads from the cache within the TTL
+// — on both the fresh-fetch path and the cache-hit path.
+func TestCachingHistoryMutationDoesNotCorruptTheCache(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	src := &countingFetcher{candles: minuteCandles(60, start)}
+	c := NewCachingHistory(src, time.Minute)
+	from, to := start, start.Add(time.Hour)
+
+	// First call: fresh fetch. Mutate the result in place, as an FX
+	// conversion loop would.
+	first, err := c.Candles(context.Background(), "AAPL", Res1Min, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range first {
+		first[i].Close *= 1000 // an obviously-wrong value if it leaked into the cache
+	}
+
+	// Second call: served from cache (same TTL window). Must reflect the
+	// ORIGINAL data, not the first caller's mutation.
+	second, err := c.Candles(context.Background(), "AAPL", Res1Min, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := atomic.LoadInt64(&src.calls); got != 1 {
+		t.Fatalf("expected the second call to be served from cache, got %d upstream calls", got)
+	}
+
+	for i, cd := range second {
+		if want := float64(100 + i); cd.Close != want {
+			t.Fatalf("second caller's candle[%d].Close = %v, want %v — "+
+				"the first caller's in-place mutation leaked into the cache", i, cd.Close, want)
+		}
+	}
+
+	// Mutate the SECOND caller's result too, and confirm a THIRD call still
+	// sees clean data — proving the cache-hit path also returns a copy, not
+	// just the fresh-fetch path.
+	for i := range second {
+		second[i].Close *= 1000
+	}
+
+	third, err := c.Candles(context.Background(), "AAPL", Res1Min, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, cd := range third {
+		if want := float64(100 + i); cd.Close != want {
+			t.Fatalf("third caller's candle[%d].Close = %v, want %v — "+
+				"a cache-hit caller's in-place mutation leaked into the cache", i, cd.Close, want)
+		}
+	}
+}
+
 func TestFallbackHistoryOrder(t *testing.T) {
 	start := time.Now().Add(-time.Hour)
 	primary := &countingFetcher{err: errors.New("primary down")}

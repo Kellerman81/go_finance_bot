@@ -31,10 +31,16 @@ type DetectorResult struct {
 	EnabledSell bool    `json:"enabled_sell"` // in the SELL detector set?
 }
 
-// EvaluateAll runs every available detector against the candles, regardless of
-// the configured detector set, so the UI can show all of them side by side. The
-// Enabled flag marks which detectors are actually in cfg.Detectors.
-func EvaluateAll(cfg config.StrategyConfig, candles []market.Candle) []DetectorResult {
+// EvaluateAll runs every available detector against symbol's candles,
+// regardless of the configured detector set, so the UI can show all of them
+// side by side. The Enabled flag marks which detectors are actually in
+// cfg.Detectors. The symbol is needed by detectors whose read is per-instrument
+// (the AI advisor); pass "" when it is genuinely unknown and those abstain.
+func EvaluateAll(
+	cfg config.StrategyConfig,
+	symbol string,
+	candles []market.Candle,
+) []DetectorResult {
 	enabled := markSet(cfg.Detectors, cfg)
 	enabledSell := enabled
 
@@ -45,7 +51,9 @@ func EvaluateAll(cfg config.StrategyConfig, candles []market.Candle) []DetectorR
 	var s series
 
 	if len(candles) > 0 {
-		s = toSeries(candles)
+		s = acquireSeries(candles)
+
+		defer releaseSeries(s)
 	}
 
 	names := AvailableDetectors()
@@ -66,7 +74,7 @@ func EvaluateAll(cfg config.StrategyConfig, candles []market.Candle) []DetectorR
 		if len(candles) < d.WarmupBars() {
 			r.Reason = fmt.Sprintf("warming up (%d/%d bars)", len(candles), d.WarmupBars())
 		} else {
-			r.Action, r.Strength, r.Reason = d.Detect(s)
+			r.Action, r.Strength, r.Reason = detect(d, symbol, s)
 		}
 
 		out = append(out, r)

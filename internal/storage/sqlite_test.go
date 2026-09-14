@@ -8,7 +8,102 @@ import (
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/engine"
+	"github.com/Kellerman81/go_finance_bot/internal/protect"
 )
+
+// TestProtectionStateRoundTrip reproduces the halt-not-persisted finding at
+// the storage layer: a halt (and the peak it was measured against) must
+// survive being written and read back, exactly as it would across a
+// restart.
+func TestProtectionStateRoundTrip(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, ok, err := db.LoadProtectionState(); err != nil || ok {
+		t.Fatalf("LoadProtectionState before any save: ok=%v err=%v, want ok=false, err=nil", ok, err)
+	}
+
+	haltedAt := time.Now().UTC().Truncate(time.Second)
+	want := protect.State{
+		Halted: true, HaltReason: "max drawdown 25.0% >= 20.0%", HaltedAt: haltedAt,
+		PeakEquity: 12345.67, DayEquity: 11000, Day: "2026-08-23",
+	}
+
+	if err := db.SaveProtectionState(want); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got, ok, err := db.LoadProtectionState()
+	if err != nil || !ok {
+		t.Fatalf("load: ok=%v err=%v", ok, err)
+	}
+
+	if got.Halted != want.Halted || got.HaltReason != want.HaltReason ||
+		!got.HaltedAt.Equal(want.HaltedAt) || got.PeakEquity != want.PeakEquity ||
+		got.DayEquity != want.DayEquity || got.Day != want.Day {
+		t.Errorf("round trip mismatch:\n got  %+v\n want %+v", got, want)
+	}
+}
+
+// TestAutotuneAppliesRoundTrip mirrors TestProtectionStateRoundTrip: the
+// map of symbol -> last-applied timestamp autotune's own recent-outcome
+// gate depends on must survive being written and read back exactly, since
+// it's what lets a later pass judge how the LAST config autotune chose for
+// a symbol has performed in real trading since.
+func TestAutotuneAppliesRoundTrip(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if got, err := db.LoadAutotuneApplies(); err != nil || len(got) != 0 {
+		t.Fatalf("LoadAutotuneApplies before any save: got=%v err=%v, want empty, nil", got, err)
+	}
+
+	want := map[string]time.Time{
+		"AMZN":   time.Now().UTC().Truncate(time.Second),
+		"SAP.DE": time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second),
+	}
+
+	if err := db.SaveAutotuneApplies(want); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got, err := db.LoadAutotuneApplies()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("round trip mismatch: got %d entries, want %d: got=%+v want=%+v", len(got), len(want), got, want)
+	}
+
+	for sym, wantAt := range want {
+		gotAt, ok := got[sym]
+		if !ok || !gotAt.Equal(wantAt) {
+			t.Errorf("%s: got %v (present=%v), want %v", sym, gotAt, ok, wantAt)
+		}
+	}
+
+	// A second save fully REPLACES the map (mirrors SaveSectors/SaveNames),
+	// so a symbol no longer present must not linger.
+	if err := db.SaveAutotuneApplies(map[string]time.Time{"AMZN": want["AMZN"]}); err != nil {
+		t.Fatalf("save (replace): %v", err)
+	}
+
+	got, err = db.LoadAutotuneApplies()
+	if err != nil {
+		t.Fatalf("load (after replace): %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Errorf("after replacing with a smaller map, got %d entries, want 1 (SAP.DE should be gone): %+v", len(got), got)
+	}
+}
 
 func TestOpenPositionRoundTrip(t *testing.T) {
 	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
@@ -74,9 +169,11 @@ func TestTradeRoundTripWithPnL(t *testing.T) {
 	buyInd := `[{"name":"rsi","action":"BUY","strength":0.8}]`
 	sellInd := `[{"name":"rsi","action":"SELL","strength":0.6}]`
 
+	stratCfg := `{"detectors":["rsi","macd"],"combine":"weighted","min_strength":0.3}`
+
 	buy := engine.TradeRecord{
 		Time: base, Symbol: "AAPL", Side: broker.Buy, Qty: 1, Price: 100, Value: 100,
-		Status: "filled", Indicators: buyInd,
+		Status: "filled", Indicators: buyInd, StrategyConfig: stratCfg,
 	}
 	win := engine.TradeRecord{
 		Time: base.Add(
@@ -130,6 +227,10 @@ func TestTradeRoundTripWithPnL(t *testing.T) {
 		t.Errorf("buy indicators mismatch: got %q want %q", gotBuy.Indicators, buyInd)
 	}
 
+	if gotBuy.StrategyConfig != stratCfg {
+		t.Errorf("buy strategy_config mismatch: got %q want %q", gotBuy.StrategyConfig, stratCfg)
+	}
+
 	if gotWin.PnL == nil || *gotWin.PnL != 10 || gotWin.PnLPct == nil || *gotWin.PnLPct != 10 ||
 		gotWin.Win == nil || !*gotWin.Win || gotWin.EntryIndicators != buyInd || gotWin.Indicators != sellInd {
 		t.Errorf("winning sell round-trip mismatch: %+v", gotWin)
@@ -137,6 +238,60 @@ func TestTradeRoundTripWithPnL(t *testing.T) {
 
 	if gotLoss.PnL == nil || *gotLoss.PnL != -5 || gotLoss.Win == nil || *gotLoss.Win {
 		t.Errorf("losing sell round-trip mismatch: %+v", gotLoss)
+	}
+}
+
+// TestSimulatedTradeRoundTripsAndCountsInStats reproduces the test-mode
+// provenance requirement: a trade filled while test mode was active is
+// tagged Simulated on save/load, but TradeStats must still count it — the
+// whole point of test mode is that these feed internal/autotune's own
+// real-track-record gating exactly like a real fill would.
+func TestSimulatedTradeRoundTripsAndCountsInStats(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	base := time.Now().UTC().Truncate(time.Second)
+
+	real := engine.TradeRecord{
+		Time: base, Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 110, Value: 110,
+		Status: "filled", PnL: ptrF(10), PnLPct: ptrF(10), Win: ptrB(true),
+	}
+	sim := engine.TradeRecord{
+		Time: base.Add(time.Minute), Symbol: "MSFT", Side: broker.Sell, Qty: 1, Price: 90, Value: 90,
+		Status: "filled", PnL: ptrF(-5), PnLPct: ptrF(-5), Win: ptrB(false), Simulated: true,
+	}
+
+	for _, tr := range []engine.TradeRecord{real, sim} {
+		if err := db.SaveTrade(tr); err != nil {
+			t.Fatalf("save %+v: %v", tr, err)
+		}
+	}
+
+	got, err := db.RecentTrades(10)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("load: %v len=%d", err, len(got))
+	}
+
+	gotReal, gotSim := got[0], got[1]
+
+	if gotReal.Simulated {
+		t.Error("a real fill round-tripped with Simulated=true")
+	}
+
+	if !gotSim.Simulated {
+		t.Error("a simulated fill round-tripped with Simulated=false")
+	}
+
+	stats, err := db.TradeStats(base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("TradeStats: %v", err)
+	}
+
+	if stats.Trades != 2 {
+		t.Errorf("TradeStats.Trades = %d, want 2 — a simulated trade must count like a real one", stats.Trades)
 	}
 }
 
@@ -158,6 +313,7 @@ func TestTradeStats(t *testing.T) {
 			Price:  110,
 			Status: "filled",
 			PnL:    ptrF(10),
+			PnLPct: ptrF(10), // +10%
 			Win:    ptrB(true),
 		},
 		{
@@ -168,6 +324,7 @@ func TestTradeStats(t *testing.T) {
 			Price:  96,
 			Status: "filled",
 			PnL:    ptrF(-4),
+			PnLPct: ptrF(-4), // -4%
 			Win:    ptrB(false),
 		},
 		// MSFT: 1 win (+20)
@@ -238,8 +395,123 @@ func TestTradeStats(t *testing.T) {
 		abs(s.TotalPnL-6) > 1e-9 {
 		t.Errorf("AAPL stats mismatch: %+v", s)
 	}
+	if s := bySym["AAPL"]; abs(s.ExpectancyPct-3) > 1e-9 { // (10 + -4) / 2
+		t.Errorf("AAPL expectancy = %v, want 3 (mean of +10%%/-4%%)", s.ExpectancyPct)
+	}
 	if s := bySym["MSFT"]; s.Trades != 1 || s.Wins != 1 || abs(s.TotalPnL-20) > 1e-9 {
 		t.Errorf("MSFT stats mismatch: %+v", s)
+	}
+}
+
+// TestTradeStatsExitBreakdown reproduces the per-symbol "why is this symbol
+// losing" question: an aggregate win rate can't distinguish a symbol whose
+// losses come from repeated stop-loss hits (an entry-timing problem) from
+// one whose losses come from strategy exits giving back gains (an exit
+// problem). Each SymbolStats row must classify its realized closes by
+// engine.ClassifyExitKind, keyed off the same "EXIT <kind> ..." reason
+// convention exits.go actually writes.
+func TestTradeStatsExitBreakdown(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	trades := []engine.TradeRecord{
+		{
+			Time: now.Add(-time.Hour), Symbol: "GOOG", Side: broker.Sell, Qty: 1,
+			Price: 90, Status: "filled", Reason: "EXIT stop-loss 90.00<=100.00",
+			PnL: ptrF(-10), Win: ptrB(false),
+		},
+		{
+			Time: now.Add(-2 * time.Hour), Symbol: "GOOG", Side: broker.Sell, Qty: 1,
+			Price: 88, Status: "filled", Reason: "EXIT stop-loss 88.00<=100.00",
+			PnL: ptrF(-12), Win: ptrB(false),
+		},
+		{
+			Time: now.Add(-3 * time.Hour), Symbol: "GOOG", Side: broker.Sell, Qty: 1,
+			Price: 115, Status: "filled",
+			Reason: "ema_cross:SELL(0.4) => SELL by weighted", // a strategy exit
+			PnL:    ptrF(15), Win: ptrB(true),
+		},
+		{
+			Time: now.Add(-time.Hour), Symbol: "MSFT", Side: broker.Sell, Qty: 1,
+			Price: 108, Status: "filled", Reason: "EXIT trailing-stop 108.00<=peak 112.00",
+			PnL: ptrF(8), Win: ptrB(true),
+		},
+	}
+
+	for _, tr := range trades {
+		if err := db.SaveTrade(tr); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+
+	stats, err := db.TradeStats(now.AddDate(0, 0, -30))
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+
+	bySym := map[string]engine.SymbolStats{}
+	for _, s := range stats.BySymbol {
+		bySym[s.Symbol] = s
+	}
+
+	goog := bySym["GOOG"]
+	if goog.ExitBreakdown[engine.ExitKindStopLoss] != 2 {
+		t.Errorf("GOOG stop-loss count = %d, want 2 (breakdown: %v)",
+			goog.ExitBreakdown[engine.ExitKindStopLoss], goog.ExitBreakdown)
+	}
+
+	if goog.ExitBreakdown[engine.ExitKindStrategy] != 1 {
+		t.Errorf("GOOG strategy-exit count = %d, want 1 (breakdown: %v)",
+			goog.ExitBreakdown[engine.ExitKindStrategy], goog.ExitBreakdown)
+	}
+
+	msft := bySym["MSFT"]
+	if msft.ExitBreakdown[engine.ExitKindTrailingStop] != 1 {
+		t.Errorf("MSFT trailing-stop count = %d, want 1 (breakdown: %v)",
+			msft.ExitBreakdown[engine.ExitKindTrailingStop], msft.ExitBreakdown)
+	}
+}
+
+// TestTradeStatsIncludesAFractionalSecondJustPastTheBoundary reproduces the
+// "TradeStats compares RFC3339Nano timestamps as strings" finding: the
+// "ts" column is TEXT, compared with a plain SQL "ts >= ?" string
+// inequality, not a datetime function — so its on-disk representation has
+// to sort identically to chronological order. time.RFC3339Nano trims
+// trailing zero fractional digits, so a trade recorded at exactly
+// since+500ms used to format as "...00.5Z" while a since with zero
+// nanoseconds formats as "...00Z" (no fraction at all) — and "." (0x2E)
+// sorts before "Z" (0x5A), so the trade's timestamp string compared as
+// LESS than since's, silently dropping it from every stats query that
+// should have included it.
+func TestTradeStatsIncludesAFractionalSecondJustPastTheBoundary(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	since := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC) // zero nanoseconds
+
+	if err := db.SaveTrade(engine.TradeRecord{
+		Time:   since.Add(500 * time.Millisecond), // a nonzero fractional second
+		Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 110,
+		Status: "filled", PnL: ptrF(10), Win: ptrB(true),
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	stats, err := db.TradeStats(since)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+
+	if stats.Trades != 1 {
+		t.Errorf("Trades = %d, want 1 — a trade 500ms after the query boundary was dropped "+
+			"by a string-comparison ordering bug", stats.Trades)
 	}
 }
 

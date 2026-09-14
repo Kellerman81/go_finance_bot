@@ -58,6 +58,9 @@ func TestSaxoConfirmFillOrderGoneMeansFilled(t *testing.T) {
 	if res.Status != "filled" {
 		t.Errorf("Status = %q, want filled", res.Status)
 	}
+	if !res.Terminal {
+		t.Errorf("Terminal = false, want true — order-gone is Saxo's confirmed fill signal")
+	}
 }
 
 func TestSaxoConfirmFillImmediatelyGone(t *testing.T) {
@@ -66,6 +69,9 @@ func TestSaxoConfirmFillImmediatelyGone(t *testing.T) {
 	res := s.confirmFill(context.Background(), OrderResult{ID: "42", Qty: 3, Status: "submitted"})
 	if res.FilledQty != 3 || res.Status != "filled" {
 		t.Errorf("want filled/3, got %q/%v", res.Status, res.FilledQty)
+	}
+	if !res.Terminal {
+		t.Errorf("Terminal = false, want true")
 	}
 }
 
@@ -84,6 +90,9 @@ func TestSaxoConfirmFillErrorKeepsSubmittedState(t *testing.T) {
 	res := s.confirmFill(context.Background(), OrderResult{ID: "42", Qty: 3, Status: "submitted"})
 	if res.FilledQty != 0 || res.Status != "submitted" {
 		t.Errorf("want submitted/0 on error, got %q/%v", res.Status, res.FilledQty)
+	}
+	if res.Terminal {
+		t.Errorf("Terminal = true, want false — a failed status check confirms nothing")
 	}
 }
 
@@ -174,6 +183,76 @@ func TestPlaceBracket_Validation(t *testing.T) {
 		BracketOrder{Symbol: "X", Side: "sideways", Qty: 1},
 	); err == nil {
 		t.Error("expected error for invalid side")
+	}
+}
+
+// TestSaxoSubmitOrderRefusesALimitWhenFXFails and
+// TestSaxoPlaceBracketRefusesWhenFXFails reproduce the order-pricing FX
+// finding: a failed rate fetch used to leave entry/stop/take-profit prices
+// unconverted and send them as-is (silently ~9% off, not merely
+// mislabeled) — buildBracketBody's own long/short sanity checks run before
+// the conversion, so they can't catch it. Both must now refuse the order
+// instead.
+func TestSaxoSubmitOrderRefusesALimitWhenFXFails(t *testing.T) {
+	orderPosted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /trade/v2/orders", func(w http.ResponseWriter, r *http.Request) {
+		orderPosted = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"OrderId": "1"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	s := &Saxo{
+		baseURL: srv.URL, tokens: saxoTestToken("tok"), http: srv.Client(),
+		clientKey: "CK", accountKey: "ACC", preferCcy: "EUR",
+		fx:  newFXConverter(srv.Client()),
+		uic: map[string]instrument{"NVDA": {Uic: 1, AssetType: "Stock", Currency: "USD"}},
+	}
+	s.fx.baseURL = "http://127.0.0.1:1" // nothing listens here: fx fetch fails
+
+	_, err := s.SubmitOrder(context.Background(), Order{
+		Symbol: "NVDA", Side: Buy, Qty: 1, Type: Limit, LimitPx: 150,
+	})
+	if err == nil {
+		t.Fatal("want an error: the fx rate needed to price this limit order is unavailable")
+	}
+
+	if orderPosted {
+		t.Error("the order was posted to the broker despite the unpriced limit — " +
+			"it must be refused before submission, not sent unconverted")
+	}
+}
+
+func TestSaxoPlaceBracketRefusesWhenFXFails(t *testing.T) {
+	orderPosted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /trade/v2/orders", func(w http.ResponseWriter, r *http.Request) {
+		orderPosted = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"OrderId": "1"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	s := &Saxo{
+		baseURL: srv.URL, tokens: saxoTestToken("tok"), http: srv.Client(),
+		clientKey: "CK", accountKey: "ACC", preferCcy: "EUR",
+		fx:  newFXConverter(srv.Client()),
+		uic: map[string]instrument{"NVDA": {Uic: 1, AssetType: "Stock", Currency: "USD"}},
+	}
+	s.fx.baseURL = "http://127.0.0.1:1"
+
+	_, err := s.PlaceBracket(context.Background(), BracketOrder{
+		Symbol: "NVDA", Side: Buy, Qty: 1, EntryType: Market,
+		StopLoss: 140, TakeProfit: 170,
+	})
+	if err == nil {
+		t.Fatal("want an error: the fx rate needed to price this bracket is unavailable")
+	}
+
+	if orderPosted {
+		t.Error("the bracket was posted to the broker despite unpriced stop/take-profit legs — " +
+			"it must be refused before submission, not sent unconverted")
 	}
 }
 

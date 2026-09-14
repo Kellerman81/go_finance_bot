@@ -1,0 +1,54 @@
+{{/*
+  One form, rendered from field declarations.
+
+  This is what the browser's 267-line form builder became. The declarations live
+  in formfields.go, the labels and help text in the translation catalogs, and the
+  values arrive already decoded. Adding a setting is still one line and two
+  strings — but nothing about it is written twice any more.
+
+  Posting goes to /v2/form/<Action>, which decodes the fields by their declared
+  type and hands the result to the same API handler the JSON endpoints use. That
+  handler validates; there is no second copy of the rules here.
+*/}}
+{{define "form"}}
+<form data-form action="/v2/form/{{.Action}}" method="post">
+  {{$t := .T}}{{$prefix := .Prefix}}{{$values := .Values}}
+  {{/* A grid, not a stack: the strategy block alone has 39 fields, and one
+       column of those is a page nobody scrolls to the bottom of. */}}
+  <div class="fields">
+  {{range .Fields}}
+    <div class="field">
+      <label for="f-{{$prefix}}-{{.Name}}">{{call $t (tkey $prefix .Name "label")}}</label>
+      {{$value := fieldValue $values .}}
+      {{if eq .Kind "bool"}}
+        <select id="f-{{$prefix}}-{{.Name}}" name="{{.Name}}">
+          <option value="true" {{if eq $value "true"}}selected{{end}}>{{call $t "common.yes"}}</option>
+          <option value="false" {{if ne $value "true"}}selected{{end}}>{{call $t "common.no"}}</option>
+        </select>
+      {{else if eq .Kind "select"}}
+        <select id="f-{{$prefix}}-{{.Name}}" name="{{.Name}}">
+          {{range .Options}}
+            <option value="{{.}}" {{if eq . $value}}selected{{end}}>
+              {{if eq . ""}}{{call $t "common.unset"}}{{else}}{{.}}{{end}}
+            </option>
+          {{end}}
+        </select>
+      {{else if eq .Kind "secret"}}
+        <input id="f-{{$prefix}}-{{.Name}}" name="{{.Name}}" type="password"
+               autocomplete="off" spellcheck="false" value="{{$value}}"/>
+      {{else}}
+        <input id="f-{{$prefix}}-{{.Name}}" name="{{.Name}}" type="text"
+               autocomplete="off" spellcheck="false" value="{{$value}}"
+               {{if or (eq .Kind "num") (eq .Kind "int")}}inputmode="decimal"{{end}}/>
+      {{end}}
+      <div class="help">{{call $t (tkey $prefix .Name "help")}}</div>
+    </div>
+  {{end}}
+  </div>
+  <div class="panel-actions">
+    <button class="primary" type="submit">{{call $t "action.apply"}}</button>
+    {{if .Extra}}{{.Extra}}{{end}}
+    <span class="small muted" data-form-status></span>
+  </div>
+</form>
+{{end}}

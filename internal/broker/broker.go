@@ -4,8 +4,23 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrInstrumentUnavailable reports that the venue will not trade an instrument
+// for this account at all — not now, not in an hour, not on Monday. It is a
+// property of the instrument and the account rather than of the order or the
+// moment, so a caller that retries is guaranteed to fail again.
+//
+// The usual cause on an EU account is a US-domiciled ETF: PRIIPs requires a Key
+// Information Document that US issuers do not produce, so the instrument
+// resolves, prices and charts perfectly well — it simply cannot be bought. The
+// bot would otherwise re-send the order on every evaluation, forever.
+//
+// Brokers wrap their permanent instrument-level refusals in this; callers test
+// with errors.Is.
+var ErrInstrumentUnavailable = errors.New("instrument not tradeable on this account")
 
 // Side is the direction of an order.
 type Side string
@@ -34,6 +49,15 @@ type Order struct {
 }
 
 // OrderResult is the outcome of submitting an order.
+//
+// Terminal reports whether Status/FilledQty are a confirmed, final outcome —
+// genuinely filled (FilledQty > 0), or genuinely rejected/cancelled with a
+// confirmed zero fill — rather than "still working" or "the broker couldn't
+// say either way" (a poll that hit its deadline, an ambiguous status, or a
+// request error mid-poll). Callers must not book a position or realized P&L
+// from a non-Terminal result: FilledQty on a non-Terminal result is whatever
+// was last observed, not a confirmed fact, and a zero there does NOT mean
+// "nothing happened" — it may just mean the broker hasn't said yet.
 type OrderResult struct {
 	ID          string    `json:"id"`
 	Symbol      string    `json:"symbol"`
@@ -43,9 +67,18 @@ type OrderResult struct {
 	FilledPx    float64   `json:"filled_avg_price"`
 	Status      string    `json:"status"`
 	SubmittedAt time.Time `json:"submitted_at"`
+	Terminal    bool      `json:"terminal"`
 }
 
 // Position is a currently held position as reported by the broker.
+//
+// AvgPrice, Current and MarketValue are already converted to the account's
+// preferred currency where the broker adapter knows how (e.g. Trading 212
+// positions in a foreign-listed instrument). Currency and FXRate describe
+// that conversion so a caller re-pricing from a live feed (which quotes in
+// the instrument's native currency) can apply the same rate; FXRate is 1 (or
+// the zero value, which callers should treat as 1) when no conversion was
+// needed or the broker doesn't track it.
 type Position struct {
 	Symbol       string  `json:"symbol"`
 	Qty          float64 `json:"qty"`
@@ -53,6 +86,8 @@ type Position struct {
 	Current      float64 `json:"current_price"`
 	MarketValue  float64 `json:"market_value"`
 	UnrealizedPL float64 `json:"unrealized_pl"`
+	Currency     string  `json:"currency,omitempty"` // instrument's native trading currency, if known
+	FXRate       float64 `json:"fx_rate,omitempty"`  // Currency -> account currency multiplier (0 == 1, no conversion)
 }
 
 // Account is a snapshot of broker account balances.
@@ -167,4 +202,55 @@ type AdvancedBroker interface {
 	OrderCanceller
 	OrderModifier
 	BracketBroker
+}
+
+// MarketScheduler answers, from broker-provided exchange schedules, whether a
+// symbol's venue is in a regular trading session at a given time — more accurate
+// than a suffix-inferred calendar because it reflects the instrument's real
+// exchange, holidays and breaks. Brokers that expose schedules implement it;
+// callers fall back to their own calendar when known is false.
+type MarketScheduler interface {
+	Broker
+	// TradingOpen reports whether symbol's exchange is open for regular trading
+	// at t, allowing preOpen before the session open. known is false when the
+	// broker cannot answer for this symbol (schedule not loaded, symbol unmapped,
+	// or t outside the known window) — the caller should then fall back.
+	TradingOpen(symbol string, t time.Time, preOpen time.Duration) (open, known bool)
+}
+
+// CurrencyResolver reports an instrument's native trading currency and the
+// multiplier to convert 1 unit of it into the broker's preferred currency —
+// the same conversion GetPositions/GetAccount/SubmitOrder already apply
+// internally, exposed so a caller with its own price feed (which quotes in
+// the instrument's native currency, not the account's) can convert prices
+// the same way *before* combining them with broker-reported money values.
+// Brokers whose instruments are always in the account's own currency still
+// implement this; the rate is just always 1.
+type CurrencyResolver interface {
+	Broker
+	// InstrumentCurrency returns symbol's native trading currency and the
+	// FX multiplier to the broker's preferred currency (1 if they're the
+	// same, unknown, or no preferred currency is configured).
+	InstrumentCurrency(ctx context.Context, symbol string) (currency string, fxRate float64, err error)
+}
+
+// AssetClassifier reports what KIND of instrument a symbol is — a share, a
+// tracker fund, a bond, an option — from the broker's own instrument metadata.
+//
+// A broker implements it when its instrument list carries a type at all; the
+// simulator does not, and callers must treat its absence as "unknown", never as
+// a default class. The answer is in the venue's own vocabulary ("Etf",
+// "STOCK", "ContractFutures"); market.NormalizeAssetClass maps it onto the
+// canonical names the portfolio allocation caps are keyed by.
+//
+// This is a fallback behind the data provider's own search: the broker knows
+// the instrument it trades, which is exactly the symbol the provider may have
+// no entry for.
+type AssetClassifier interface {
+	Broker
+	// AssetClass returns symbol's instrument type in the broker's own
+	// vocabulary. An unknown symbol is an error, not an empty string with a
+	// nil error — the caller must be able to tell "not classified" from
+	// "classified as nothing".
+	AssetClass(ctx context.Context, symbol string) (string, error)
 }

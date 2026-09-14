@@ -9,10 +9,13 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/errlog"
@@ -38,29 +41,70 @@ type Trading212 struct {
 	isins     map[string]string // input symbol -> ISIN override (from config)
 	preferCcy string            // preferred listing currency (e.g. EUR)
 
-	mu       sync.Mutex
-	byShort  map[string][]t212Inst // shortName -> listings (multiple exchanges)
-	byISIN   map[string][]t212Inst // ISIN -> listings (multiple currencies)
-	resolved map[string]string     // input symbol -> Trading 212 ticker (cache)
-	reverse  map[string]string     // Trading 212 ticker -> input symbol
-	qtyPrec  map[string]int        // ticker -> accepted quantity decimal places (learned)
-	loaded   bool
-	currency string
+	mu            sync.Mutex
+	byShort       map[string][]t212Inst   // shortName -> listings (multiple exchanges)
+	byISIN        map[string][]t212Inst   // ISIN -> listings (multiple currencies)
+	resolved      map[string]string       // input symbol -> Trading 212 ticker (cache)
+	reverse       map[string]string       // Trading 212 ticker -> input symbol
+	qtyPrec       map[string]int          // ticker -> accepted quantity decimal places (learned)
+	schedByTicker map[string]int          // ticker -> workingScheduleId
+	tickerCcy     map[string]string       // ticker -> instrument's native trading currency
+	tickerType    map[string]string       // ticker -> instrument type (STOCK, ETF, ...)
+	schedules     map[int][]t212TimeEvent // workingScheduleId -> sorted trading-session events
+	loaded        bool
+	metaLoadedAt  time.Time // when instruments+exchanges were last (re)loaded
+	currency      string
 
+	fx *fxConverter // shared currency-conversion cache/client
+
+	metaRefreshing atomic.Bool // guards a single background metadata refresh
+
+	// rlMu guards only the creation of a group's rate limiter below, never the
+	// pacing sleep itself — see pace and t212RateLimiter.
 	rlMu     sync.Mutex
-	lastCall map[string]time.Time
+	limiters map[string]*t212RateLimiter
+
+	// warnedLimit fires the limit-order downgrade notice once per adapter
+	// instance — see SubmitOrder. cmd/bot builds exactly one, so in the live
+	// bot that is once per process. It is a fact about the configuration, not
+	// about any one order, so repeating it per submission would be noise.
+	warnedLimit sync.Once
 }
+
+// t212RateLimiter paces one endpoint group independently of every other
+// group. Each group gets its own mutex/lastCall pair, so a slow group
+// sleeping out its interval (up to ~50s for the widest one) cannot block
+// order submission or any other group's pacing — a single shared mutex held
+// across the sleep, as this used to be, serialized all of Trading 212's
+// traffic behind whichever group happened to be waiting.
+type t212RateLimiter struct {
+	mu       sync.Mutex
+	lastCall time.Time
+}
+
+// t212TimeEvent is one trading-session transition from a working schedule, with
+// the timestamp normalised to UTC (Trading 212 returns RFC3339 with a zone).
+type t212TimeEvent struct {
+	At   time.Time
+	Type string // OPEN | CLOSE | BREAK_START | BREAK_END | PRE_MARKET_OPEN | …
+}
+
+// metaTTL bounds how long instrument/exchange metadata (including trading
+// schedules, which carry holidays) is cached before a background refresh.
+const metaTTL = 12 * time.Hour
 
 // t212Limits are conservative per-endpoint minimum intervals (the Public API
 // throttles aggressively; metadata especially).
 var t212Limits = map[string]time.Duration{
-	"cash":         2 * time.Second,
-	"portfolio":    5 * time.Second,
-	"orders":       2 * time.Second,
-	"order_status": 2 * time.Second, // fill polling (GET /equity/orders/{id})
-	"info":         30 * time.Second,
-	"instruments":  50 * time.Second,
-	"default":      2 * time.Second,
+	"cash":          2 * time.Second,
+	"portfolio":     5 * time.Second,
+	"orders":        2 * time.Second,
+	"order_status":  2 * time.Second,  // fill polling (GET /equity/orders/{id})
+	"order_history": 10 * time.Second, // GET /equity/history/orders (6 req / 1m0s)
+	"info":          30 * time.Second,
+	"instruments":   50 * time.Second,
+	"exchanges":     30 * time.Second, // /equity/metadata/exchanges (1 req / 30s)
+	"default":       2 * time.Second,
 }
 
 // NewTrading212 constructs a Trading 212 broker client. apiKey and secret are
@@ -80,17 +124,24 @@ func NewTrading212(
 		isins = make(map[string]string)
 	}
 
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+
 	return &Trading212{
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		apiKey:    apiKey,
-		secret:    secret,
-		isins:     isins,
-		preferCcy: strings.ToUpper(preferCcy),
-		http:      &http.Client{Timeout: 20 * time.Second},
-		resolved:  make(map[string]string),
-		reverse:   make(map[string]string),
-		qtyPrec:   make(map[string]int),
-		lastCall:  make(map[string]time.Time),
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		apiKey:        apiKey,
+		secret:        secret,
+		isins:         isins,
+		preferCcy:     strings.ToUpper(preferCcy),
+		http:          httpClient,
+		resolved:      make(map[string]string),
+		reverse:       make(map[string]string),
+		qtyPrec:       make(map[string]int),
+		schedByTicker: make(map[string]int),
+		tickerCcy:     make(map[string]string),
+		tickerType:    make(map[string]string),
+		schedules:     make(map[int][]t212TimeEvent),
+		limiters:      make(map[string]*t212RateLimiter),
+		fx:            newFXConverter(httpClient),
 	}
 }
 
@@ -106,17 +157,21 @@ type t212Inst struct {
 func (*Trading212) Name() string { return "trading212" }
 
 // pace blocks until the per-endpoint minimum interval has elapsed, honouring
-// context cancellation, so bursts cannot trip the API rate limiter.
+// context cancellation, so bursts cannot trip the API rate limiter. Only
+// group's own limiter is held for the sleep — every other group paces
+// independently.
 func (t *Trading212) pace(ctx context.Context, group string) error {
-	t.rlMu.Lock()
-	defer t.rlMu.Unlock()
+	rl := t.rateLimiter(group)
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
 
 	limit, ok := t212Limits[group]
 	if !ok {
 		limit = t212Limits["default"]
 	}
 
-	if wait := limit - time.Since(t.lastCall[group]); wait > 0 {
+	if wait := limit - time.Since(rl.lastCall); wait > 0 {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 
@@ -127,26 +182,53 @@ func (t *Trading212) pace(ctx context.Context, group string) error {
 		}
 	}
 
-	t.lastCall[group] = time.Now()
+	rl.lastCall = time.Now()
 
 	return nil
 }
 
-// do performs an authenticated Trading 212 call after pacing its endpoint
-// group, recording failures in the error log and decoding into out.
+// rateLimiter returns group's limiter, creating it on first use. rlMu is
+// held only for this lookup/creation, never across a pacing sleep.
+func (t *Trading212) rateLimiter(group string) *t212RateLimiter {
+	t.rlMu.Lock()
+	defer t.rlMu.Unlock()
+
+	rl, ok := t.limiters[group]
+	if !ok {
+		rl = &t212RateLimiter{}
+		t.limiters[group] = rl
+	}
+
+	return rl
+}
+
+// do performs an authenticated read (GET/DELETE) and records failures in the
+// error log. Order placement, which retries across quantity precisions, uses
+// doRaw directly so intermediate rejections don't flood the log — it logs once
+// on the final outcome.
+func (t *Trading212) do(
+	ctx context.Context,
+	method, path, group string,
+	out any,
+) error {
+	err := t.doRaw(ctx, method, path, group, nil, out)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		errlog.Record("trading212", err.Error())
+	}
+
+	return err
+}
+
+// doRaw is do without the error-log side effect: it paces the endpoint group,
+// makes the authenticated request, maps a non-2xx status to an error and
+// decodes a 2xx body into out.
 //
 //nolint:cyclop // linear request/response handling; splitting hurts readability
-func (t *Trading212) do(
+func (t *Trading212) doRaw(
 	ctx context.Context,
 	method, path, group string,
 	body, out any,
 ) (err error) {
-	defer func() {
-		if err != nil && !errors.Is(err, context.Canceled) {
-			errlog.Record("trading212", err.Error())
-		}
-	}()
-
 	if err := t.pace(ctx, group); err != nil {
 		return err
 	}
@@ -191,6 +273,16 @@ func (t *Trading212) do(
 
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return fmt.Errorf("trading212 %s %s: 429 rate limited", method, path)
+
+	case instrumentUnavailable(resp.StatusCode, data):
+		return fmt.Errorf(
+			"%w: trading212 %s %s: %s",
+			ErrInstrumentUnavailable,
+			method,
+			path,
+			string(data),
+		)
+
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return fmt.Errorf(
 			"trading212 %s %s: status %d: %s",
@@ -233,17 +325,15 @@ func (t *Trading212) resolveTicker(ctx context.Context, symbol string) (string, 
 
 	if tk, ok := t.resolved[symbol]; ok {
 		t.mu.Unlock()
+		t.maybeRefreshMeta() // keep schedules (holidays) fresh over long runs
 
 		return tk, nil
 	}
 
-	loaded := t.loaded
 	t.mu.Unlock()
 
-	if !loaded {
-		if err := t.loadInstruments(ctx); err != nil {
-			return "", err
-		}
+	if err := t.ensureMetadata(ctx); err != nil {
+		return "", err
 	}
 
 	base, suffix := splitSymbol(symbol)
@@ -307,15 +397,39 @@ func (t *Trading212) symbolFor(ticker string) string {
 	return symbolFromTicker(ticker)
 }
 
+// ensureMetadata loads instrument metadata once (and, best-effort, the exchange
+// schedules). A schedule-load failure is non-fatal: symbol resolution and order
+// placement still work, only the broker-schedule market-hours gate falls back.
+func (t *Trading212) ensureMetadata(ctx context.Context) error {
+	t.mu.Lock()
+	loaded := t.loaded
+	t.mu.Unlock()
+
+	if loaded {
+		return nil
+	}
+
+	if err := t.loadInstruments(ctx); err != nil {
+		return err
+	}
+
+	if err := t.loadExchanges(ctx); err != nil {
+		errlog.Record("trading212", err.Error())
+	}
+
+	return nil
+}
+
 // loadInstruments downloads the instrument metadata and indexes it by short
 // name and ISIN for symbol resolution.
 func (t *Trading212) loadInstruments(ctx context.Context) error {
 	var raw []struct {
-		Ticker       string `json:"ticker"`
-		ShortName    string `json:"shortName"`
-		ISIN         string `json:"isin"`
-		CurrencyCode string `json:"currencyCode"`
-		Type         string `json:"type"`
+		Ticker            string `json:"ticker"`
+		ShortName         string `json:"shortName"`
+		ISIN              string `json:"isin"`
+		CurrencyCode      string `json:"currencyCode"`
+		Type              string `json:"type"`
+		WorkingScheduleID int    `json:"workingScheduleId"`
 	}
 
 	if err := t.do(
@@ -323,7 +437,6 @@ func (t *Trading212) loadInstruments(ctx context.Context) error {
 		http.MethodGet,
 		"/equity/metadata/instruments",
 		"instruments",
-		nil,
 		&raw,
 	); err != nil {
 		return fmt.Errorf("load instruments: %w", err)
@@ -331,6 +444,9 @@ func (t *Trading212) loadInstruments(ctx context.Context) error {
 
 	byShort := make(map[string][]t212Inst, len(raw))
 	byISIN := make(map[string][]t212Inst, len(raw))
+	schedByTicker := make(map[string]int, len(raw))
+	tickerCcy := make(map[string]string, len(raw))
+	tickerType := make(map[string]string, len(raw))
 
 	for _, in := range raw {
 		inst := t212Inst{
@@ -351,16 +467,221 @@ func (t *Trading212) loadInstruments(ctx context.Context) error {
 
 			byISIN[isin] = append(byISIN[isin], inst)
 		}
+
+		schedByTicker[in.Ticker] = in.WorkingScheduleID
+		tickerCcy[in.Ticker] = strings.ToUpper(in.CurrencyCode)
+		tickerType[in.Ticker] = in.Type
 	}
 
 	t.mu.Lock()
 
 	t.byShort = byShort
 	t.byISIN = byISIN
+	t.schedByTicker = schedByTicker
+	t.tickerCcy = tickerCcy
+	t.tickerType = tickerType
 	t.loaded = true
+	t.metaLoadedAt = time.Now()
 	t.mu.Unlock()
 
 	return nil
+}
+
+// t212RawTimeEvent, t212RawSchedule and t212RawExchange mirror the JSON shape of
+// the /equity/metadata/exchanges response.
+type t212RawTimeEvent struct {
+	Date string `json:"date"`
+	Type string `json:"type"`
+}
+
+type t212RawSchedule struct {
+	ID         int                `json:"id"`
+	TimeEvents []t212RawTimeEvent `json:"timeEvents"`
+}
+
+type t212RawExchange struct {
+	ID               int               `json:"id"`
+	Name             string            `json:"name"`
+	WorkingSchedules []t212RawSchedule `json:"workingSchedules"`
+}
+
+// loadExchanges downloads the exchange working schedules and indexes each
+// workingScheduleId to its trading-session events (sorted, UTC). Schedules are
+// optional: a failure here leaves symbol resolution and order placement working,
+// only the broker-schedule market-hours gate falls back to the suffix calendar.
+func (t *Trading212) loadExchanges(ctx context.Context) error {
+	var raw []t212RawExchange
+
+	if err := t.do(
+		ctx,
+		http.MethodGet,
+		"/equity/metadata/exchanges",
+		"exchanges",
+		&raw,
+	); err != nil {
+		return fmt.Errorf("load exchanges: %w", err)
+	}
+
+	schedules := make(map[int][]t212TimeEvent)
+
+	for _, ex := range raw {
+		for _, ws := range ex.WorkingSchedules {
+			events := make([]t212TimeEvent, 0, len(ws.TimeEvents))
+
+			for _, te := range ws.TimeEvents {
+				at, err := time.Parse(time.RFC3339, te.Date)
+				if err != nil {
+					continue // skip an unparseable timestamp rather than fail the lot
+				}
+
+				events = append(events, t212TimeEvent{At: at.UTC(), Type: strings.ToUpper(te.Type)})
+			}
+
+			slices.SortFunc(events, func(a, b t212TimeEvent) int { return a.At.Compare(b.At) })
+
+			schedules[ws.ID] = events
+		}
+	}
+
+	t.mu.Lock()
+
+	t.schedules = schedules
+	t.mu.Unlock()
+
+	return nil
+}
+
+// maybeRefreshMeta reloads instrument/exchange metadata in the background when
+// it has aged past metaTTL, so long-running bots pick up schedule changes
+// (holidays) without a restart. At most one refresh runs at a time, and it never
+// blocks the caller.
+func (t *Trading212) maybeRefreshMeta() {
+	t.mu.Lock()
+	stale := !t.metaLoadedAt.IsZero() && time.Since(t.metaLoadedAt) > metaTTL
+	t.mu.Unlock()
+
+	if !stale || !t.metaRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer t.metaRefreshing.Store(false)
+
+		bg := context.Background()
+		if err := t.loadInstruments(bg); err != nil {
+			return
+		}
+
+		_ = t.loadExchanges(bg)
+	}()
+}
+
+// TradingOpen implements broker.MarketScheduler using Trading 212's exchange
+// schedules. It is cache-only (never blocks on I/O): it reports known=false when
+// the symbol isn't resolved yet, has no schedule, or t falls outside the cached
+// window, so the caller falls back to its own calendar.
+func (t *Trading212) TradingOpen(
+	symbol string,
+	at time.Time,
+	preOpen time.Duration,
+) (open, known bool) {
+	t.mu.Lock()
+
+	ticker, ok := t.resolved[symbol]
+	if !ok && strings.Contains(symbol, "_") {
+		ticker, ok = symbol, true // caller passed a Trading 212 ticker directly
+	}
+
+	sid, hasSched := t.schedByTicker[ticker]
+	events := t.schedules[sid]
+	t.mu.Unlock()
+
+	if !ok || !hasSched || len(events) == 0 {
+		return false, false
+	}
+
+	return sessionOpenAt(events, at.UTC(), preOpen)
+}
+
+// sessionOpenAt decides, from a schedule's sorted session events, whether the
+// venue is in a regular trading session at `at` (allowing preOpen before the
+// open). It returns known=false when `at` lies outside the events' covered
+// window, so the caller can fall back rather than trust a guess. Only regular
+// OPEN/CLOSE (and BREAK_START/BREAK_END) drive the decision; pre/after-hours
+// events are ignored so the bot trades only the regular session.
+func sessionOpenAt(events []t212TimeEvent, at time.Time, preOpen time.Duration) (open, known bool) {
+	openCutoff := at.Add(preOpen)
+
+	var lastOpen, lastClose, lastBreakStart, lastBreakEnd time.Time
+
+	first, last := events[0].At, events[len(events)-1].At
+
+	for _, e := range events {
+		// OPEN may be looked at up to preOpen ahead of now; every other event
+		// only counts once it has actually happened.
+		cutoff := at
+		if e.Type == "OPEN" {
+			cutoff = openCutoff
+		}
+
+		if e.At.After(cutoff) {
+			continue
+		}
+
+		switch e.Type {
+		case "OPEN":
+			lastOpen = e.At
+		case "CLOSE":
+			lastClose = e.At
+		case "BREAK_START":
+			lastBreakStart = e.At
+		case "BREAK_END":
+			lastBreakEnd = e.At
+		}
+	}
+
+	// Outside the covered window: can't decide — let the caller fall back. A
+	// generous lower margin still answers "closed" for the quiet hours before the
+	// first known session; only genuinely stale/uncovered times defer.
+	if at.Before(first.Add(-24*time.Hour)) || at.After(last) {
+		return false, false
+	}
+
+	if lastOpen.IsZero() || (!lastClose.IsZero() && lastClose.After(lastOpen)) {
+		return false, true // before the session's open, or after its close
+	}
+
+	// In session — unless currently within a lunch/trading break.
+	if !lastBreakStart.IsZero() && (lastBreakEnd.IsZero() || lastBreakStart.After(lastBreakEnd)) {
+		return false, true
+	}
+
+	return true, true
+}
+
+// instrumentUnavailable reports whether a Trading 212 error names the
+// INSTRUMENT as untradeable rather than something about this particular order.
+//
+// Deliberately narrow. Order-level refusals — insufficient funds, below the
+// minimum order value, selling stock you do not own — are transient and must
+// not land here: treating one as permanent would disable a symbol for the rest
+// of the process over a condition that clears by itself.
+//
+// The observed live case is `/api-errors/instrument-invisible` with
+// "Instrument can not be traded", which Trading 212 returns for a US-domiciled
+// ETF on an EU account.
+func instrumentUnavailable(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusForbidden {
+		return false
+	}
+
+	s := strings.ToLower(string(body))
+
+	return strings.Contains(s, "instrument-invisible") ||
+		strings.Contains(s, "instrumentnotfound") ||
+		strings.Contains(s, "instrument-not-found") ||
+		strings.Contains(s, "can not be traded") ||
+		strings.Contains(s, "cannot be traded")
 }
 
 // splitSymbol splits "LXS.DE" into ("LXS","DE"); "AAPL" into ("AAPL","").
@@ -494,11 +815,34 @@ func pickListing(candidates []t212Inst, country, ccy string) t212Inst {
 // cached from the API's error on the first order for each instrument.
 const defaultT212QtyPrecision = 8
 
-// SubmitOrder resolves the ticker, submits a market order at a quantity
-// precision the instrument accepts (learning it from rejections), and waits
-// for the asynchronous fill confirmation.
+// maxT212QtyAttempts bounds the quantity-precision probing so a rejection can't
+// trigger a barrage of order submissions against the live endpoint. The probe
+// converges fast: the initial precision, the max the API reports, then whole
+// shares as the decisive last attempt.
+const maxT212QtyAttempts = 4
+
+// SubmitOrder resolves the ticker and submits a market order at a quantity
+// precision the instrument accepts, then waits for the asynchronous fill.
 //
-//nolint:cyclop // the precision-retry loop is one cohesive algorithm
+// Always a MARKET order: Trading 212's REST API exposes /equity/orders/market
+// and nothing this adapter can place a resting limit order with. A
+// Limit-typed order (what execution.type: "limit" produces) is therefore sent
+// to market and crosses the spread its limit price was meant to avoid — a
+// real difference in execution, so it is recorded to errlog once per adapter
+// instance rather than absorbed silently.
+//
+// Trading 212 enforces a per-instrument decimal precision and rejects orders
+// that exceed it ("quantity-precision-mismatch" / "must be limited to N decimal
+// spaces"); some instruments accept only whole shares. The precision isn't known
+// up front, so this rounds the quantity DOWN and probes: start at the cached (or
+// 8-dp) precision, and on a precision rejection jump straight to the precision
+// the API reports, then to whole shares — never a slow one-decimal walk. The
+// precision that works is cached, so later orders (and, crucially, BUYs) use it
+// immediately and never open a fractional position the instrument can't later
+// sell. If no precision is accepted, or the quantity rounds to zero shares, the
+// order is abandoned with a single clear error instead of repeated attempts.
+//
+//nolint:cyclop // the precision-probe loop is one cohesive algorithm
 func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 	if o.Side != Buy && o.Side != Sell {
 		return OrderResult{}, fmt.Errorf("trading212: invalid side %q", o.Side)
@@ -508,19 +852,25 @@ func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, err
 		return OrderResult{}, fmt.Errorf("trading212: invalid quantity %v", o.Qty)
 	}
 
+	// This adapter has only /equity/orders/market. A Limit order — what
+	// execution.type: "limit" makes every non-urgent clip — is therefore sent
+	// to market, crossing the spread the limit price existed to avoid. That
+	// is a real difference in what the operator gets, so it is surfaced
+	// rather than silently absorbed; execution.type is broker-agnostic, so it
+	// cannot be rejected at config load.
+	if o.Type == Limit {
+		t.warnedLimit.Do(func() {
+			errlog.Record("trading212", "execution.type is \"limit\" but this adapter has no "+
+				"limit-order endpoint: orders are sent to market and cross the spread "+
+				"(set execution.type: \"market\" to stop this, or use a broker with limit support)")
+		})
+	}
+
 	ticker, err := t.resolveTicker(ctx, o.Symbol)
 	if err != nil {
 		return OrderResult{}, err
 	}
 
-	// Trading 212 enforces two quantity rules and rejects an order that breaks
-	// either: a per-instrument decimal precision ("quantity-precision-mismatch")
-	// and "don't sell more than you own" ("selling-equity-not-owned"). Both are
-	// fixed by sending FEWER decimals: round the quantity DOWN (never above the
-	// owned amount) to a precision the instrument accepts. We don't know that
-	// precision up front, so start at 8 dp (or the value learned earlier for this
-	// ticker) and, on a quantity rejection, reduce precision — guided by the
-	// precision the API reports — and retry, caching what finally works.
 	prec := defaultT212QtyPrecision
 	if p, ok := t.cachedQtyPrecision(ticker); ok {
 		prec = p
@@ -528,59 +878,82 @@ func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, err
 
 	var lastErr error
 
-	for prec >= 0 {
+	for attempt := 0; attempt < maxT212QtyAttempts && prec >= 0; attempt++ {
 		qty := roundDownQty(o.Qty, prec)
 		if qty <= 0 {
-			return OrderResult{}, fmt.Errorf(
-				"trading212: quantity %v too small at precision %d",
-				o.Qty,
+			// The only precision left rounds the order to zero shares — e.g. a
+			// whole-share-only instrument and a sub-1-share order. Placing it is
+			// impossible, so fail fast and clearly rather than looping.
+			msg := fmt.Sprintf(
+				"trading212: %s accepts at most %d decimal place(s), where quantity %v rounds to zero shares — order not placed (increase order size to trade whole shares)",
+				o.Symbol,
 				prec,
+				o.Qty,
 			)
+			errlog.Record("trading212", msg)
+
+			return OrderResult{}, errors.New(msg)
 		}
 
 		res, err := t.postMarketOrder(ctx, ticker, o.Symbol, o.Side, qty)
 		if err == nil {
+			// Cache the accepted precision so subsequent orders — especially
+			// BUYs — round to it up front and never open a position finer than
+			// this instrument can sell.
 			t.rememberQtyPrecision(ticker, prec)
 
 			// Fills are asynchronous: the POST response reports status NEW with
 			// filledQuantity 0. Wait for the real fill so the caller gets a
 			// usable FilledQty/FilledPx (realized P&L depends on them).
-			return t.confirmFill(ctx, o.Symbol, o.Side, qty, res), nil
+			result := t.confirmFill(ctx, ticker, o.Symbol, o.Side, res)
+
+			// FilledPx comes back in the instrument's native currency (same as
+			// GetPositions' averagePrice/currentPrice); convert it so callers can
+			// combine it with account-currency money values (spend limits,
+			// realized PnL) without repeating this conversion themselves.
+			if result.FilledPx > 0 {
+				_, rate, _ := t.currencyAndRate(ctx, ticker)
+				result.FilledPx *= rate
+			}
+
+			return result, nil
 		}
 
 		if !isRetryableQtyErr(err) {
-			return res, err // a different failure (auth, rate limit, …) — don't loop
+			errlog.Record("trading212", err.Error()) // auth, rate limit, 5xx, …
+
+			return res, err
 		}
 
 		lastErr = err
-		// Retry with strictly fewer decimals than we actually sent (the sent
-		// count may be below prec when the value has trailing zeros, so this skips
-		// pointless identical retries). Jump straight to the precision the API
-		// reports if it is lower still.
-		next := decimalPlaces(qty) - 1
-		if n, ok := parseReportedPrecision(err); ok && n < next {
-			next = n
+
+		if prec == 0 {
+			break // whole shares already rejected — no lower precision to try
 		}
 
-		if next >= prec {
-			next = prec - 1 // guarantee progress
+		// Jump straight to the precision the API reports (its stated max), else
+		// straight to whole shares — the decisive test — rather than walking one
+		// decimal at a time and hammering the endpoint.
+		next := 0
+		if n, ok := parseReportedPrecision(err); ok && n >= 0 && n < prec {
+			next = n
 		}
 
 		prec = next
 	}
 
-	return OrderResult{}, lastErr
-}
+	// No precision the instrument accepts: it likely requires whole shares or is
+	// not tradeable via the API. Report once, clearly, instead of leaving a wall
+	// of rejected-attempt errors in the log.
+	msg := fmt.Sprintf(
+		"trading212: %s rejected quantity %v at every quantity precision tried (instrument likely requires whole shares or is not API-tradeable) — order not placed: %v",
+		o.Symbol,
+		o.Qty,
+		lastErr,
+	)
+	errlog.Record("trading212", msg)
 
-// decimalPlaces returns the number of fractional digits in v's shortest exact
-// decimal representation.
-func decimalPlaces(v float64) int {
-	s := strconv.FormatFloat(v, 'f', -1, 64)
-	if i := strings.IndexByte(s, '.'); i >= 0 {
-		return len(s) - i - 1
-	}
-
-	return 0
+	return OrderResult{}, errors.New(msg)
 }
 
 // postMarketOrder submits one market order at the given (already-rounded)
@@ -601,7 +974,9 @@ func (t *Trading212) postMarketOrder(
 
 	var resp t212Order
 
-	if err := t.do(
+	// doRaw (not do): SubmitOrder probes several quantity precisions and logs
+	// once on the final outcome, so intermediate rejections must not be logged.
+	if err := t.doRaw(
 		ctx,
 		http.MethodPost,
 		"/equity/orders/market",
@@ -639,16 +1014,25 @@ func t212WorkingStatus(s string) bool {
 // on FilledQty > 0 on closing sells, so without this every round trip would be
 // recorded as unfilled.
 //
-// A 404 means the order left the working set without us cancelling it — for a
-// day market order that is a fill — so the submitted quantity is assumed (the
-// caller's reference price stands in for the unknown fill price). On timeout,
-// context cancellation or a non-transient error the best-known state is
-// returned unchanged; rejected/cancelled orders keep their honest zero fill.
+// A 404 means the order left the working set without us cancelling it — a
+// liquid instrument's market order routinely does this before the very
+// first poll even runs, so a 404 is the ordinary outcome, not the
+// exception. It is also what a purged rejection or a wrong-account id look
+// like, and this endpoint alone gives no way to tell them apart — so rather
+// than guess, a 404 first falls through to settledFromHistory, which reads
+// the order's actual terminal outcome from the account's order history
+// instead of assuming one. Only when that lookup itself can't resolve it
+// either is the order reported as unconfirmed (Terminal: false, Status:
+// "unknown"), so the caller flags it for reconciliation instead of risking
+// either a phantom position or a phantom loss. Genuinely terminal states
+// (FILLED, or a broker-reported rejection/cancellation) set Terminal: true.
+// On timeout, context cancellation or a non-transient error the best-known,
+// non-terminal state is returned unchanged. See CODE_REVIEW_FINDINGS.md's
+// "Trading212: every order reports unconfirmed" entry.
 func (t *Trading212) confirmFill(
 	ctx context.Context,
-	symbol string,
+	ticker, symbol string,
 	side Side,
-	submittedQty float64,
 	res OrderResult,
 ) OrderResult {
 	if res.ID == "" {
@@ -660,15 +1044,19 @@ func (t *Trading212) confirmFill(
 
 	for ctx.Err() == nil && time.Now().Before(deadline) {
 		o, status, err := t.fetchOrder(ctx, res.ID)
-		switch {
-		case status == http.StatusNotFound:
-			cur.Status = "filled"
-			if cur.FilledQty <= 0 {
-				cur.FilledQty = submittedQty
+
+		if status == http.StatusNotFound {
+			if h, ok := t.settledFromHistory(ctx, ticker, symbol, side, res.ID); ok {
+				return h
 			}
 
-			return cur
+			cur.Status = "unknown"
+			cur.Terminal = false
 
+			return cur
+		}
+
+		switch {
 		case status == http.StatusTooManyRequests:
 			continue // transient; the pacer spaces the next attempt
 		case err != nil:
@@ -680,15 +1068,69 @@ func (t *Trading212) confirmFill(
 
 		if strings.EqualFold(o.Status, "FILLED") {
 			cur.Status = "filled"
+			cur.Terminal = true
+
 			return cur
 		}
 
 		if !t212WorkingStatus(o.Status) {
-			return cur // rejected/cancelled — report the real (zero) fill
+			cur.Terminal = true // rejected/cancelled — a confirmed, real zero fill
+
+			return cur
 		}
 	}
 
 	return cur
+}
+
+// settledFromHistory looks up id in the account's order history, for when
+// confirmFill's poll finds it already gone from the working set (a 404).
+// Trading 212 has no get-by-id form for history, so this lists the most
+// recent orders for ticker — id is always at or near the front of a
+// just-submitted order's page — and searches for a match.
+//
+// ok is false if the lookup itself fails, or id genuinely isn't there:
+// confirmFill's caller falls back to its existing unconfirmed/"unknown"
+// result either way, exactly as it did before this lookup existed. This
+// deliberately does not retry on a miss — a single extra read, not another
+// poll loop — so a genuine failure (network, auth, an account this endpoint
+// can't reach) still surfaces promptly instead of running out the fill-wait
+// deadline for nothing.
+func (t *Trading212) settledFromHistory(
+	ctx context.Context,
+	ticker, symbol string,
+	side Side,
+	id string,
+) (OrderResult, bool) {
+	var page t212HistoryPage
+
+	if err := t.do(
+		ctx,
+		http.MethodGet,
+		"/equity/history/orders?ticker="+url.QueryEscape(ticker)+"&limit=50",
+		"order_history",
+		&page,
+	); err != nil {
+		return OrderResult{}, false
+	}
+
+	for _, item := range page.Items {
+		if item.Order.ID.String() != id || t212WorkingStatus(item.Order.Status) {
+			continue
+		}
+
+		res := item.Order.toResult(symbol, side)
+		res.FilledPx = item.Order.avgFillPrice()
+		res.Terminal = true
+
+		if strings.EqualFold(item.Order.Status, "FILLED") {
+			res.Status = "filled"
+		}
+
+		return res, true
+	}
+
+	return OrderResult{}, false
 }
 
 // fetchOrder GETs a single order for fill polling. Unlike do() it does NOT
@@ -761,10 +1203,13 @@ func (t *Trading212) rememberQtyPrecision(ticker string, p int) {
 	t.mu.Unlock()
 }
 
-var qtyPrecisionRe = regexp.MustCompile(`precision (\d+)`)
+// qtyPrecisionRe captures the decimal-place count in either wording Trading 212
+// uses: "invalid quantity precision 3" and "must be limited to 0 decimal spaces".
+var qtyPrecisionRe = regexp.MustCompile(`(?:precision|limited to)\s+(\d+)`)
 
 // parseReportedPrecision extracts the decimal precision Trading 212 names in a
-// quantity-precision error ("invalid quantity precision 3").
+// quantity-precision error ("invalid quantity precision 3", or "must be limited
+// to 0 decimal spaces").
 func parseReportedPrecision(err error) (int, bool) {
 	if err == nil {
 		return 0, false
@@ -784,8 +1229,9 @@ func parseReportedPrecision(err error) (int, bool) {
 }
 
 // isRetryableQtyErr reports whether a failed order can be retried by sending a
-// quantity with fewer decimals: a precision mismatch, or an over-sell that a
-// rounding artifact pushed just above the owned amount.
+// quantity with fewer decimals: a precision mismatch (in either wording Trading
+// 212 uses), or an over-sell that a rounding artifact pushed just above the
+// owned amount.
 func isRetryableQtyErr(err error) bool {
 	if err == nil {
 		return false
@@ -794,10 +1240,21 @@ func isRetryableQtyErr(err error) bool {
 	s := err.Error()
 
 	return strings.Contains(s, "quantity-precision-mismatch") ||
-		strings.Contains(s, "selling-equity-not-owned")
+		strings.Contains(s, "selling-equity-not-owned") ||
+		strings.Contains(s, "decimal space") // "must be limited to N decimal spaces"
 }
 
 // GetAccount returns the account's free/total cash in the account currency.
+// GetAccount returns the account's cash/equity/buying power, converted to
+// preferCcy if it differs from the account's own currency.
+//
+// Without this conversion, GetAccount reported cash in the account's native
+// currency while GetPositions (below) already converted position values to
+// preferCcy — Engine.syncPortfolio sums the two into one equity figure with
+// no idea they're in different currencies. preferCcy defaults to "EUR" with
+// nothing prompting a user to set it to match their actual account currency,
+// so this was reachable on ordinary defaults, not just an edge case. See
+// CODE_REVIEW_FINDINGS.md's T212 cash/position currency mismatch finding.
 func (t *Trading212) GetAccount(ctx context.Context) (Account, error) {
 	var cash struct {
 		Free     float64 `json:"free"`
@@ -806,15 +1263,27 @@ func (t *Trading212) GetAccount(ctx context.Context) (Account, error) {
 		Blocked  float64 `json:"blocked"`
 	}
 
-	if err := t.do(ctx, http.MethodGet, "/equity/account/cash", "cash", nil, &cash); err != nil {
+	if err := t.do(ctx, http.MethodGet, "/equity/account/cash", "cash", &cash); err != nil {
 		return Account{}, err
 	}
 
+	ccy := t.accountCurrency(ctx)
+	free, total := cash.Free, cash.Total
+
+	if t.preferCcy != "" && ccy != "" && ccy != t.preferCcy {
+		if rate, err := t.fx.Rate(ctx, ccy, t.preferCcy); err != nil {
+			errlog.Recordf("trading212", "fx rate %s->%s: %s (using 1:1, balances will be wrong)", ccy, t.preferCcy, err)
+		} else {
+			free, total = free*rate, total*rate
+			ccy = t.preferCcy
+		}
+	}
+
 	return Account{
-		Cash:        cash.Free,
-		Equity:      cash.Total,
-		BuyingPower: cash.Free,
-		Currency:    t.accountCurrency(ctx),
+		Cash:        free,
+		Equity:      total,
+		BuyingPower: free,
+		Currency:    ccy,
 	}, nil
 }
 
@@ -833,7 +1302,7 @@ func (t *Trading212) accountCurrency(ctx context.Context) string {
 		CurrencyCode string `json:"currencyCode"`
 	}
 
-	if err := t.do(ctx, http.MethodGet, "/equity/account/info", "info", nil, &info); err == nil {
+	if err := t.do(ctx, http.MethodGet, "/equity/account/info", "info", &info); err == nil {
 		t.mu.Lock()
 
 		t.currency = info.CurrencyCode
@@ -846,7 +1315,23 @@ func (t *Trading212) accountCurrency(ctx context.Context) string {
 }
 
 // GetPositions returns the portfolio mapped back to watchlist symbols.
+//
+// Trading 212 reports averagePrice/currentPrice in the instrument's own
+// listing currency (e.g. USD for a US-domiciled stock like NVDA), not the
+// account currency — even when preferCcy is EUR, since preferCcy only picks
+// among multiple listings of the *same* instrument and most US stocks have
+// no EUR listing to pick. Left unconverted, that price gets summed straight
+// into EUR cash elsewhere and inflates equity by roughly the FX rate. ppl,
+// by contrast, is already reported in account currency, so it's passed
+// through as-is.
 func (t *Trading212) GetPositions(ctx context.Context) ([]Position, error) {
+	// tickerCcy (needed to know which positions require FX conversion) is
+	// populated by loadInstruments; ResolveSymbol usually triggers that
+	// first, but GetPositions must not rely on that ordering.
+	if err := t.ensureMetadata(ctx); err != nil {
+		errlog.Recordf("trading212", "positions: metadata unavailable, currency conversion skipped: %s", err)
+	}
+
 	var raw []struct {
 		Ticker       string  `json:"ticker"`
 		Quantity     float64 `json:"quantity"`
@@ -855,23 +1340,120 @@ func (t *Trading212) GetPositions(ctx context.Context) ([]Position, error) {
 		PPL          float64 `json:"ppl"`
 	}
 
-	if err := t.do(ctx, http.MethodGet, "/equity/portfolio", "portfolio", nil, &raw); err != nil {
+	if err := t.do(ctx, http.MethodGet, "/equity/portfolio", "portfolio", &raw); err != nil {
 		return nil, err
 	}
 
 	out := make([]Position, 0, len(raw))
 	for _, p := range raw {
+		ccy, rate, resolved := t.currencyAndRate(ctx, p.Ticker)
+
+		// A failed fetch still uses rate (1, a stopgap) to convert THIS
+		// position's prices — better than reporting native-currency numbers
+		// mislabeled as preferCcy — but must not claim FXRate as a fact: the
+		// engine treats any nonzero FXRate as authoritative and caches it
+		// (see Engine.syncPortfolio), so a fallback value there would
+		// silently overwrite a previously-correct cached rate. See
+		// CODE_REVIEW_FINDINGS.md's FX-fallback finding.
+		reportedRate := rate
+		if !resolved {
+			reportedRate = 0
+		}
+
 		out = append(out, Position{
 			Symbol:       t.symbolFor(p.Ticker),
 			Qty:          p.Quantity,
-			AvgPrice:     p.AveragePrice,
-			Current:      p.CurrentPrice,
-			MarketValue:  p.CurrentPrice * p.Quantity,
+			AvgPrice:     p.AveragePrice * rate,
+			Current:      p.CurrentPrice * rate,
+			MarketValue:  p.CurrentPrice * p.Quantity * rate,
 			UnrealizedPL: p.PPL,
+			Currency:     ccy,
+			FXRate:       reportedRate,
 		})
 	}
 
 	return out, nil
+}
+
+// currencyAndRate returns ticker's native trading currency and the
+// multiplier to convert 1 unit of it into preferCcy (1 if they're the same,
+// unknown, or the rate can't be fetched — logged in that last case so a
+// stuck rate is visible in diagnostics rather than silently mispricing).
+// resolved is false only when a genuine fetch was attempted and failed —
+// callers that report a position's FXRate (as opposed to ones just pricing
+// an order, where 1:1 is an acceptable stopgap) must use it to leave FXRate
+// at its zero value rather than reporting a fallback 1 as if it were a real
+// rate: see GetPositions and CODE_REVIEW_FINDINGS.md's FX-fallback finding.
+func (t *Trading212) currencyAndRate(ctx context.Context, ticker string) (ccy string, rate float64, resolved bool) {
+	t.mu.Lock()
+	ccy = t.tickerCcy[ticker]
+	t.mu.Unlock()
+
+	if ccy == "" || ccy == t.preferCcy {
+		return ccy, 1, true
+	}
+
+	rate, err := t.fx.Rate(ctx, ccy, t.preferCcy)
+	if err != nil {
+		errlog.Recordf("trading212", "fx rate %s->%s: %s (using 1:1)", ccy, t.preferCcy, err)
+		return ccy, 1, false
+	}
+
+	return ccy, rate, true
+}
+
+// InstrumentCurrency implements CurrencyResolver.
+//
+// Unlike currencyAndRate (used for order pricing, where falling back to 1:1
+// on a transient FX failure is an acceptable degraded mode — the order
+// still goes out), this propagates a rate-fetch failure as a real error
+// rather than silently returning 1. The engine's FX rate cache (see
+// Engine.resolveFXRates/refreshFXRates) relies on that distinction to skip
+// caching on failure instead of overwriting a previously-correct rate with
+// 1 — see CODE_REVIEW_FINDINGS.md's FX-fallback finding.
+func (t *Trading212) InstrumentCurrency(ctx context.Context, symbol string) (string, float64, error) {
+	ticker, err := t.resolveTicker(ctx, symbol)
+	if err != nil {
+		return "", 1, err
+	}
+
+	t.mu.Lock()
+	ccy := t.tickerCcy[ticker]
+	t.mu.Unlock()
+
+	if ccy == "" || ccy == t.preferCcy {
+		return ccy, 1, nil
+	}
+
+	rate, err := t.fx.Rate(ctx, ccy, t.preferCcy)
+	if err != nil {
+		return ccy, 1, fmt.Errorf("fx rate %s->%s: %w", ccy, t.preferCcy, err)
+	}
+
+	return ccy, rate, nil
+}
+
+// AssetClass reports symbol's instrument type from Trading 212's own metadata
+// ("STOCK", "ETF", ...), implementing AssetClassifier so the portfolio
+// allocation caps can bucket a position the data provider could not classify.
+//
+// The metadata is already loaded and cached for symbol resolution, so this is
+// normally a map lookup with no network call of its own.
+func (t *Trading212) AssetClass(ctx context.Context, symbol string) (string, error) {
+	ticker, err := t.resolveTicker(ctx, symbol)
+	if err != nil {
+		return "", err
+	}
+
+	t.mu.Lock()
+	class := t.tickerType[ticker]
+	t.mu.Unlock()
+
+	if class == "" {
+		return "", fmt.Errorf("trading212: no instrument type for %q", symbol)
+	}
+
+	return class, nil
 }
 
 // OpenOrders lists the account's working (unfilled) orders.
@@ -886,7 +1468,7 @@ func (t *Trading212) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 		StopPrice  float64     `json:"stopPrice"`
 	}
 
-	if err := t.do(ctx, http.MethodGet, "/equity/orders", "orders", nil, &raw); err != nil {
+	if err := t.do(ctx, http.MethodGet, "/equity/orders", "orders", &raw); err != nil {
 		return nil, err
 	}
 
@@ -930,7 +1512,6 @@ func (t *Trading212) CancelOrders(ctx context.Context, ids ...string) error {
 			"/equity/orders/"+id,
 			"orders",
 			nil,
-			nil,
 		); err != nil {
 			return err
 		}
@@ -956,6 +1537,18 @@ type t212Order struct {
 	FilledQuantity float64     `json:"filledQuantity"`
 	FilledValue    float64     `json:"filledValue"`
 	Status         string      `json:"status"`
+}
+
+// t212HistoryOrder is one entry from GET /equity/history/orders. The "order"
+// side of the response mirrors t212Order's fields exactly, so it's reused
+// here rather than duplicated.
+type t212HistoryOrder struct {
+	Order t212Order `json:"order"`
+}
+
+// t212HistoryPage is one (possibly partial) page of order history.
+type t212HistoryPage struct {
+	Items []t212HistoryOrder `json:"items"`
 }
 
 // avgFillPrice derives the average fill price from filledValue/filledQuantity;

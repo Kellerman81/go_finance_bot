@@ -12,7 +12,7 @@ type metrics struct {
 	ticks        atomic.Int64 // live ticks ingested
 	barsDone     atomic.Int64 // completed bars appended to history
 	evalCycles   atomic.Int64 // evaluate() cycles run
-	ordersSent   atomic.Int64 // orders submitted to the broker
+	ordersSent   atomic.Int64 // orders the broker accepted (rejections excluded)
 	lastEvalNs   atomic.Int64 // duration of the last evaluate() cycle (ns)
 	lastEvalUnix atomic.Int64 // unix-nanos when the last evaluate finished
 	openOrders   atomic.Int64 // working orders seen at the last reconcile
@@ -34,7 +34,9 @@ func (m *metrics) onEval(d time.Duration) {
 	m.lastEvalUnix.Store(time.Now().UnixNano())
 }
 
-// onOrder counts an order submission.
+// onOrder counts an order the broker accepted. Call it only on the success path
+// (after SubmitOrder/PlaceBracket returns nil) so rejected orders don't inflate
+// the count — they remain visible as error trades and in the API error log.
 func (m *metrics) onOrder() { m.ordersSent.Add(1) }
 
 // setOpenOrders records the working-order count from the last reconcile.

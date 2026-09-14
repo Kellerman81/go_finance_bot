@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -143,6 +144,30 @@ func TestWeightedNetStrength(t *testing.T) {
 	sig := c.Evaluate("X", twoBars)
 	if sig.Action != Buy {
 		t.Fatalf("weighted net positive => %s, want BUY", sig.Action)
+	}
+}
+
+// TestNaNStrengthIsGatedToHold reproduces the NaN-strength-bypasses-gate
+// finding: clamp01(NaN) used to return NaN (NaN compares false against every
+// bound), and Signal.Strength < gate is then also false for a NaN strength —
+// so a detector producing NaN (e.g. atrDetector's 0/0 when atr_mult is
+// configured to 0 and the price is exactly unchanged) bypassed min_strength
+// entirely and reached order sizing with an undefined conviction. clamp01
+// must map NaN to 0, which the gate correctly rejects like any other
+// too-weak signal.
+func TestNaNStrengthIsGatedToHold(t *testing.T) {
+	c := &Combined{
+		detectors: []Detector{fakeDetector{"a", Buy, math.NaN()}},
+		mode:      Majority, sellMode: Majority, warmup: 1, minStrength: 0.1, minStrengthSell: 0.1,
+	}
+
+	sig := c.Evaluate("X", twoBars)
+	if sig.Action != Hold {
+		t.Fatalf("NaN-strength detector produced action %s, want HOLD", sig.Action)
+	}
+
+	if sig.Strength != 0 {
+		t.Errorf("Strength = %v, want 0 (not NaN, not carried through to order sizing)", sig.Strength)
 	}
 }
 

@@ -59,3 +59,55 @@ func Resample(candles []Candle, target Resolution) []Candle {
 
 	return out
 }
+
+// ResampleEvery aggregates every n candles into one, counting back from the most
+// recent bar so the newest aggregate is always complete and the partial bucket
+// (if any) falls at the start of the series rather than the end.
+//
+// It groups by bar count rather than by wall-clock time on purpose. A strategy
+// that wants "the trend one timeframe up" should get the same aggregation
+// whether the base bars are 1-minute live ticks or daily candles from a CSV, and
+// whether or not the venue had gaps. Anchoring to the newest bar also means the
+// higher-timeframe reading never flickers as a bucket fills up: the last
+// aggregate is the last n completed bars, not a half-formed one.
+func ResampleEvery(candles []Candle, n int) []Candle {
+	if n <= 1 || len(candles) == 0 {
+		return candles
+	}
+
+	groups := len(candles) / n
+	if groups == 0 {
+		return nil // not even one complete higher-timeframe bar yet
+	}
+
+	// Drop the oldest remainder so every emitted bar aggregates exactly n bars.
+	start := len(candles) - groups*n
+	out := make([]Candle, 0, groups)
+
+	for g := range groups {
+		window := candles[start+g*n : start+(g+1)*n]
+		agg := window[0]
+
+		for _, c := range window[1:] {
+			if c.High > agg.High {
+				agg.High = c.High
+			}
+
+			if c.Low < agg.Low {
+				agg.Low = c.Low
+			}
+
+			agg.Close = c.Close
+
+			agg.Volume += c.Volume
+		}
+
+		// The aggregate is stamped with its last bar's time: it only became
+		// knowable when that bar closed.
+		agg.Time = window[len(window)-1].Time
+
+		out = append(out, agg)
+	}
+
+	return out
+}

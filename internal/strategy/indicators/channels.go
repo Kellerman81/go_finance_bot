@@ -29,7 +29,15 @@ func DonchianLast(high, low []float64, period int) (upper, lower float64, ok boo
 // SupertrendLast returns the final Supertrend direction (+1 up-trend, -1
 // down-trend) and band level over the given ATR period and multiplier. The
 // Supertrend flips when price closes through the opposing band; between flips the
-// band ratchets in the trend's favour. ok is false before ATR is defined.
+// band ratchets in the trend's favour. ok is false before ATR is defined, and
+// also — see below — when the window never saw a real band crossover, or a
+// NaN ATR reading poisoned the ratchet partway through.
+//
+// The ATR is advanced inside the walk rather than materialised first. Both are
+// forward recurrences over the same bars, so one pass computes both — and the
+// two full-length float64 slices the separate ATR() call used to allocate were,
+// on a backtest of any size, the largest single source of garbage in the
+// strategy: one per bar, per symbol, discarded immediately.
 //
 //nolint:cyclop // the band-ratchet walk is one cohesive algorithm
 func SupertrendLast(
@@ -42,30 +50,48 @@ func SupertrendLast(
 		return 0, 0, false
 	}
 
-	atr := ATR(high, low, closes, period)
-	// Walk forward from the first defined ATR bar, carrying the final bands and
-	// direction per the standard Supertrend rules.
-	var finalUpper, finalLower float64
+	// Seed the ATR exactly as ATR() does: the simple mean of the first `period`
+	// true ranges, which is the value it reports at bar `period`.
+	var sum float64
 
-	dir = 1
+	for i := 1; i <= period; i++ {
+		sum += trueRange(high, low, closes, i)
+	}
 
-	started := false
+	atr := sum / float64(period)
+	if math.IsNaN(atr) {
+		return 0, 0, false
+	}
 
-	for i := period; i < n; i++ {
-		if math.IsNaN(atr[i]) {
-			continue
+	// Bar `period` is the first with a defined ATR, so it seeds the bands.
+	mid := (high[period] + low[period]) / 2
+	finalUpper, finalLower := mid+mult*atr, mid-mult*atr
+
+	// dir starts undefined (0), not a default up-trend: without an actual
+	// close through one of the bands, there is no directional signal at
+	// all, and defaulting to "up" produced a confident BUY vote from a
+	// detector on a series that never crossed a band in either direction.
+	// See CODE_REVIEW_FINDINGS.md's supertrendDetector-never-holds finding.
+	dir = 0
+
+	for i := period + 1; i < n; i++ {
+		atr = (atr*float64(period-1) + trueRange(high, low, closes, i)) / float64(period)
+		if math.IsNaN(atr) {
+			// NaN is sticky through this recursion (atr feeds its own next
+			// value), so one bad true-range reading poisons every ATR value
+			// for the rest of the series — silently `continue`-ing here
+			// used to freeze the bands (and dir) at their last valid state
+			// while still reporting ok: true, indistinguishable from a
+			// genuinely current reading. Report undefined instead of a
+			// stale ratchet. See CODE_REVIEW_FINDINGS.md's
+			// SupertrendLast-NaN-freeze finding.
+			return 0, 0, false
 		}
 
-		mid := (high[i] + low[i]) / 2
-		basicUpper := mid + mult*atr[i]
-		basicLower := mid - mult*atr[i]
+		mid = (high[i] + low[i]) / 2
 
-		if !started {
-			finalUpper, finalLower = basicUpper, basicLower
-			dir = 1
-			started = true
-			continue
-		}
+		basicUpper := mid + mult*atr
+		basicLower := mid - mult*atr
 
 		if basicUpper < finalUpper || closes[i-1] > finalUpper {
 			finalUpper = basicUpper
@@ -83,13 +109,14 @@ func SupertrendLast(
 		}
 	}
 
-	if !started {
+	switch {
+	case dir > 0:
+		return 1, finalLower, true
+	case dir < 0:
+		return -1, finalUpper, true
+	default:
+		// Never crossed either band within the window: no directional
+		// signal, not a default up-trend one.
 		return 0, 0, false
 	}
-
-	if dir >= 0 {
-		return 1, finalLower, true
-	}
-
-	return -1, finalUpper, true
 }
