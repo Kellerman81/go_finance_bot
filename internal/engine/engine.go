@@ -202,6 +202,11 @@ type Engine struct {
 	// untradeable are symbols the broker has permanently refused. See
 	// untradeable.go — entries only, never exits.
 	untradeable map[string]string
+	// testModeSpendDay/testModeSpend hold the real rolling daily spend while a
+	// training window is open, so simulated buys can be handed back on exit —
+	// see EnableTestMode.
+	testModeSpendDay string
+	testModeSpend    float64
 	// unsizeable holds the reason a symbol's buy could not be sized, so the
 	// refusal is recorded once rather than every eval_interval — see
 	// noteUnsizeable.

@@ -302,3 +302,39 @@ func TestTestModeConfigRoundTrips(t *testing.T) {
 		t.Errorf("TestModeConfig() = %+v, want %+v", got, cfg)
 	}
 }
+
+// TestTestModeDoesNotSpendTheRealDailyBudget reproduces a production incident.
+//
+// risk.Manager has no idea test mode exists: every filled buy calls RecordBuy
+// and the rolling total is persisted. So a training window spent the real
+// max_daily_spend allowance on orders that never reached a broker — 400.38 of
+// simulated buys against a 500 cap — and every real signal for the rest of
+// that day was refused with "max_daily_spend leaves 99.02, below
+// min_order_size_usd 100.00". The operator's cash was untouched and irrelevant.
+func TestTestModeDoesNotSpendTheRealDailyBudget(t *testing.T) {
+	e, _ := testModeEngine(&fakeRealBroker{cash: 5000})
+	e.rm = risk.New(config.Limits{MaxDailySpend: 500}, config.CostsConfig{})
+
+	// A real buy before the window: this one must survive.
+	e.rm.RecordBuy(60)
+	realSpend := e.rm.SpentToday()
+
+	if err := e.EnableTestMode(context.Background(), time.Hour); err != nil {
+		t.Fatalf("EnableTestMode: %v", err)
+	}
+
+	// Simulated buys during the window.
+	e.rm.RecordBuy(200)
+	e.rm.RecordBuy(200)
+
+	if during := e.rm.SpentToday(); during <= realSpend {
+		t.Fatalf("test setup: simulated buys did not move spentToday (%v)", during)
+	}
+
+	e.EndTestMode("done")
+
+	if got := e.rm.SpentToday(); got != realSpend {
+		t.Errorf("daily spend after the window = %v, want the pre-window %v — "+
+			"simulated orders consumed the real budget", got, realSpend)
+	}
+}

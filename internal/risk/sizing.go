@@ -15,6 +15,11 @@ import (
 // by hand and by comment. Two copies of "how big is this order" is how a
 // backtest quietly stops describing the bot.
 
+// ratioEpsilon is how far below 1 the risk ratio must fall before it counts as
+// a real reduction rather than floating-point residue. A reduction smaller
+// than this is worth less than a cent on any account this bot can trade.
+const ratioEpsilon = 1e-9
+
 // SizingConfig is what risk sizing needs beyond the money limits the Manager
 // already holds.
 type SizingConfig struct {
@@ -76,21 +81,44 @@ func (m *Manager) SizeBuy(
 
 	order := broker.Order{Symbol: symbol, Side: broker.Buy}
 
-	base := m.BuyHeadroom(order, price, snap)
+	base, binding := m.BuyHeadroomBinding(order, price, snap)
 	if base <= 0 {
-		return BuySize{Reason: "no headroom under the money limits"}
+		return BuySize{Reason: refusalNoHeadroom(binding)}
 	}
 
 	notional := base
 	note := ""
+	// Whether risk scaling actually reduced anything, tracked as a FACT rather
+	// than rediscovered later by comparing notional against base. With a
+	// percentage-only stop the ratio is stop_loss_pct/stop_loss_pct, which in
+	// binary floating point is 0.9999999999999991 as often as it is exactly 1
+	// — so a `notional < base` test flips between "risk did this" and "the
+	// limits did this" on identical inputs. That is not just a cosmetic
+	// wrong answer: the refusal reason feeds engine.noteUnsizeable's
+	// announce-once dedupe, which keys on the reason, so an alternating
+	// message defeats the dedupe and records a blocked trade — and fires a
+	// notification — every evaluation. Observed in production doing exactly
+	// that, ~once a minute per symbol.
+	scaled := false
 
 	if frac, ok := stopFraction(cfg.Exits, price, atr); ok {
 		// exits.Compute always picks the WIDER of the percentage and ATR
 		// stops, so frac >= StopLossPct by construction and this ratio is
 		// always in (0, 1] — it can only reduce.
-		notional = base * (cfg.Exits.StopLossPct / frac)
-		note = fmt.Sprintf("risk-sized %.2f of %.2f headroom (stop %.2f%% vs. %.2f%% baseline)",
-			notional, base, frac*100, cfg.Exits.StopLossPct*100)
+		//
+		// The tolerance is what makes this stable. When the percentage stop
+		// is the one in force, frac is stop_loss_pct recomputed through
+		// (price - price*(1-pct))/price, which for most prices lands on
+		// 0.05000000000000004 rather than 0.05 — so a bare `ratio < 1` sees a
+		// reduction of one part in 10^15 and calls it risk scaling, for some
+		// prices and not others. Anything above this threshold is
+		// floating-point noise, not a trading decision.
+		if ratio := cfg.Exits.StopLossPct / frac; ratio < 1-ratioEpsilon {
+			notional = base * ratio
+			scaled = true
+			note = fmt.Sprintf("risk-sized %.2f of %.2f headroom (stop %.2f%% vs. %.2f%% baseline)",
+				notional, base, frac*100, cfg.Exits.StopLossPct*100)
+		}
 	}
 
 	if cfg.MaxRiskSizeUSD > 0 && notional > cfg.MaxRiskSizeUSD {
@@ -104,10 +132,10 @@ func (m *Manager) SizeBuy(
 	if cfg.MinOrderSizeUSD > 0 && notional < cfg.MinOrderSizeUSD {
 		// Name the cause. Risk scaling and a tight money limit both end here,
 		// and they need different fixes: one is "this trade is too volatile
-		// to hold at size right now", the other is "the account has no room
-		// for a worthwhile position at all". Blaming risk for a small slot
-		// would send the operator to the wrong setting.
-		if notional < base {
+		// to hold at size right now", the other is "this limit is what stops
+		// you". Blaming risk for a binding limit sends the operator to the
+		// wrong setting; not naming the limit tells them nothing at all.
+		if scaled {
 			return BuySize{Reason: fmt.Sprintf(
 				"risk-sized to %.2f from %.2f of headroom, below min_order_size_usd %.2f — "+
 					"too risky to place at a size worth trading",
@@ -115,9 +143,9 @@ func (m *Manager) SizeBuy(
 		}
 
 		return BuySize{Reason: fmt.Sprintf(
-			"the money limits leave %.2f, below min_order_size_usd %.2f — "+
+			"%s leaves %.2f, below min_order_size_usd %.2f — "+
 				"no room for a position worth opening",
-			notional, cfg.MinOrderSizeUSD)}
+			limitName(binding), notional, cfg.MinOrderSizeUSD)}
 	}
 
 	return BuySize{Notional: notional, Note: note, OK: true}
@@ -137,4 +165,24 @@ func stopFraction(cfg config.ExitsConfig, price, atr float64) (float64, bool) {
 	}
 
 	return (price - lv.Stop) / price, true
+}
+
+// refusalNoHeadroom explains an outright-zero headroom, naming the limit that
+// produced it so the operator knows which line of config to look at.
+func refusalNoHeadroom(binding string) string {
+	if binding == "" {
+		return "no headroom under the money limits"
+	}
+
+	return "no headroom left under " + binding
+}
+
+// limitName renders a binding cap for an operator-facing reason, falling back
+// to a generic phrase when nothing was binding (no limits configured at all).
+func limitName(binding string) string {
+	if binding == "" {
+		return "the money limits"
+	}
+
+	return binding
 }

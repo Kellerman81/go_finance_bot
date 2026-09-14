@@ -99,11 +99,23 @@ func (e *Engine) EnableTestMode(ctx context.Context, dur time.Duration) error {
 		deadline = time.Now().Add(dur)
 	}
 
+	// Snapshot the rolling daily spend so simulated buys cannot consume the
+	// REAL max_daily_spend budget. risk.Manager has no idea test mode exists
+	// — every filled buy calls RecordBuy, and the total is persisted — so
+	// without this a training window spends the day's allowance on orders
+	// that never reached a broker, and the next real signal is refused for
+	// want of budget. Observed in production: 400.38 of simulated buys left
+	// 99.02 of a 500 daily cap, which then refused live orders for the rest
+	// of the day.
+	spendDay, spendAmount := e.rm.Day(), e.rm.SpentToday()
+
 	e.mu.Lock()
 	e.testModeRealBrk = realBrk
 	e.brk = sim
 	e.testModeActive = true
 	e.testModeDeadline = deadline
+	e.testModeSpendDay = spendDay
+	e.testModeSpend = spendAmount
 	e.mu.Unlock()
 
 	// Reflect the seeded book immediately rather than waiting for SyncInterval.
@@ -134,11 +146,20 @@ func (e *Engine) EndTestMode(reason string) {
 	}
 
 	realBrk := e.testModeRealBrk
+	spendDay, spendAmount := e.testModeSpendDay, e.testModeSpend
+
 	e.brk = realBrk
 	e.testModeActive = false
 	e.testModeDeadline = time.Time{}
 	e.testModeRealBrk = nil
+	e.testModeSpendDay = ""
+	e.testModeSpend = 0
 	e.mu.Unlock()
+
+	// Give the day's allowance back whatever the simulated orders took from
+	// it. Restore itself drops the figure if the window crossed midnight,
+	// which is the right answer there too.
+	e.rm.Restore(spendDay, spendAmount)
 
 	// Restore the dashboard/portfolio to the real broker's actual current
 	// state — untouched by any simulated order, but prices/time have moved

@@ -239,8 +239,51 @@ func TestSizeBuyRefusalNamesTheCause(t *testing.T) {
 		t.Errorf("a headroom refusal blames risk: %q", got.Reason)
 	}
 
-	if !strings.Contains(got.Reason, "money limits") {
-		t.Errorf("reason %q does not point at the money limits", got.Reason)
+	// And it must name WHICH limit. "The money limits leave 99.02" is true and
+	// useless; the operator needs the line of config to go and look at.
+	if !strings.Contains(got.Reason, "max_order_value") {
+		t.Errorf("reason %q does not name the binding limit", got.Reason)
+	}
+}
+
+// The refusal reason feeds engine.noteUnsizeable's announce-once dedupe, which
+// keys on the reason string — so an identical situation must produce a
+// byte-identical reason every time. It did not: the branch picking between
+// "risk did this" and "the limits did this" compared notional against base,
+// and with a percentage-only stop the ratio is stop_loss_pct/stop_loss_pct,
+// which floating point renders as 0.9999999999999991 about as often as 1.
+// The message alternated, the dedupe saw new information each evaluation, and
+// production recorded a blocked trade — and sent a notification — roughly
+// once a minute per symbol.
+func TestSizeBuyRefusalIsStableAcrossPrices(t *testing.T) {
+	t.Parallel()
+
+	// Headroom below the minimum, percentage-only stop: no risk scaling can
+	// apply, so every one of these must produce the same reason.
+	m := sizeBuyManager(50)
+	snap := sizeBuySnapshot()
+	cfg := SizingConfig{Exits: pctExits(0.05), MinOrderSizeUSD: 600}
+
+	seen := map[string]bool{}
+
+	for _, price := range []float64{
+		100, 99.02, 287.60, 159.074, 33.33, 1478.40, 17.39, 0.07,
+	} {
+		got := m.SizeBuy("X", price, snap, cfg, 0)
+		if got.OK {
+			t.Fatalf("price %v was sized: %+v", price, got)
+		}
+
+		seen[got.Reason] = true
+
+		if strings.Contains(got.Reason, "risk-sized") {
+			t.Errorf("price %v blamed risk with no ATR stop configured: %q", price, got.Reason)
+		}
+	}
+
+	if len(seen) != 1 {
+		t.Errorf("the same refusal produced %d different reasons, which defeats the "+
+			"announce-once dedupe: %v", len(seen), seen)
 	}
 }
 

@@ -195,6 +195,20 @@ func (m *Manager) Restore(day string, amount float64) {
 	}
 }
 
+// Day returns the trading day the rolling spend is currently accumulating
+// against, in the same YYYY-MM-DD form Restore expects. Paired with
+// SpentToday it lets a caller snapshot and later restore the accumulator —
+// see Engine.EnableTestMode, which must not let simulated buys consume the
+// real max_daily_spend budget.
+func (m *Manager) Day() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.rollDay()
+
+	return m.day
+}
+
 // SpentToday returns the cumulative buy notional for the current day.
 func (m *Manager) SpentToday() float64 {
 	m.mu.Lock()
@@ -550,14 +564,33 @@ func heldValue(snap portfolio.Snapshot, symbol string) float64 {
 // what Authorize would actually approve, and sizing aimed at a number it
 // could only ever be clamped down from.
 func (m *Manager) BuyHeadroom(o broker.Order, estPrice float64, snap portfolio.Snapshot) float64 {
+	v, _ := m.BuyHeadroomBinding(o, estPrice, snap)
+
+	return v
+}
+
+// BuyHeadroomBinding is BuyHeadroom plus the NAME of the limit that produced
+// the figure — "max_per_position", "cash_reserve" and so on, empty when
+// nothing is set.
+//
+// It exists because a refusal that does not name its cause sends the operator
+// to the wrong setting. "The money limits leave 99.02" is true and useless;
+// "max_total_invested leaves 99.02" is the answer. See Manager.SizeBuy, whose
+// refusal reason carries it.
+func (m *Manager) BuyHeadroomBinding(
+	o broker.Order,
+	estPrice float64,
+	snap portfolio.Snapshot,
+) (float64, string) {
 	if estPrice <= 0 {
-		return 0
+		return 0, ""
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	maxQty := math.MaxFloat64
+	binding := ""
 
 	for _, c := range m.buyCapRules(o, estPrice, snap) {
 		if !c.enabled {
@@ -570,19 +603,20 @@ func (m *Manager) BuyHeadroom(o broker.Order, estPrice float64, snap portfolio.S
 			// did not exist — the fails-open reading, in a package that fails
 			// closed on money. Only reachable through a nonsensical cost model
 			// (commission_pct <= -1), which config has no range check for.
-			return 0
+			return 0, c.name
 		}
 
 		if q := c.maxValue / c.price; q < maxQty {
 			maxQty = q
+			binding = c.name
 		}
 	}
 
 	if maxQty <= 0 || maxQty == math.MaxFloat64 {
-		return 0
+		return 0, binding
 	}
 
-	return maxQty * estPrice
+	return maxQty * estPrice, binding
 }
 
 // Commission returns the modelled commission for a trade of the given notional.
