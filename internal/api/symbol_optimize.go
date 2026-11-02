@@ -74,8 +74,19 @@ func (s *Server) fragSymbolOptimize(c *gin.Context) {
 	}
 	defer autotune.Release()
 
+	// The request's context: closing the tab stops the search rather than
+	// leaving it to burn the run slot for nobody (AT2-8).
 	data["Result"] = autotune.RunSymbolOptimize(
-		s.eng, s.rm, s.pf, symbol, candles, autotune.DefaultMinTrades, objective, minReturnPct)
+		c.Request.Context(),
+		s.eng,
+		s.rm,
+		s.pf,
+		symbol,
+		candles,
+		autotune.DefaultMinTrades,
+		objective,
+		minReturnPct,
+	)
 
 	render(c, "symbolOptimize", data)
 }

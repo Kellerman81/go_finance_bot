@@ -774,23 +774,39 @@ func preferCurrency(listings []t212Inst, ccy string) t212Inst {
 	return listings[0]
 }
 
+// pickUSListing picks a US line from candidates. A US ISIN says where the
+// company is registered, not where the line trades: AAPL_GB_EQ (LSE) carries
+// one too. So a real _US_ ticker wins, and the ISIN match is only the
+// fallback — taking the first of a mixed bucket let the instruments payload's
+// order decide between NASDAQ and London (BR2-8).
+func pickUSListing(candidates []t212Inst) (t212Inst, bool) {
+	var usISIN []t212Inst
+
+	for _, c := range candidates {
+		if strings.Contains(c.Ticker, "_US_") {
+			return c, true // US listings are USD; currency preference doesn't apply
+		}
+
+		if strings.HasPrefix(strings.ToUpper(c.ISIN), "US") {
+			usISIN = append(usISIN, c)
+		}
+	}
+
+	if len(usISIN) == 0 {
+		return t212Inst{}, false
+	}
+
+	return preferCurrency(usISIN, "USD"), true
+}
+
 // pickListing chooses a listing: for a US symbol prefer the US listing; for a
 // suffixed symbol narrow to the country's listings (by ISIN prefix); then prefer
 // the configured currency (e.g. EUR) among what remains.
 func pickListing(candidates []t212Inst, country, ccy string) t212Inst {
 	switch {
 	case country == "US":
-		var us []t212Inst
-
-		for _, c := range candidates {
-			if strings.Contains(c.Ticker, "_US_") ||
-				strings.HasPrefix(strings.ToUpper(c.ISIN), "US") {
-				us = append(us, c)
-			}
-		}
-
-		if len(us) > 0 {
-			return us[0] // US listings are USD; currency preference doesn't apply
+		if inst, ok := pickUSListing(candidates); ok {
+			return inst
 		}
 
 	case country != "":
@@ -842,7 +858,7 @@ const maxT212QtyAttempts = 4
 // sell. If no precision is accepted, or the quantity rounds to zero shares, the
 // order is abandoned with a single clear error instead of repeated attempts.
 //
-//nolint:cyclop // the precision-probe loop is one cohesive algorithm
+//nolint:cyclop,funlen // the precision-probe loop is one cohesive algorithm
 func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 	if o.Side != Buy && o.Side != Sell {
 		return OrderResult{}, fmt.Errorf("trading212: invalid side %q", o.Side)
@@ -876,7 +892,10 @@ func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, err
 		prec = p
 	}
 
-	var lastErr error
+	var (
+		lastErr error
+		capped  bool // the sell was already cut to the holding once
+	)
 
 	for attempt := 0; attempt < maxT212QtyAttempts && prec >= 0; attempt++ {
 		qty := roundDownQty(o.Qty, prec)
@@ -911,12 +930,45 @@ func (t *Trading212) SubmitOrder(ctx context.Context, o Order) (OrderResult, err
 			// GetPositions' averagePrice/currentPrice); convert it so callers can
 			// combine it with account-currency money values (spend limits,
 			// realized PnL) without repeating this conversion themselves.
+			//
+			// An UNRESOLVED rate means the fill price would go out in the
+			// instrument's currency labelled as the account's — a $163 fill
+			// booked as €163 skews entry price, daily spend, realized P&L and
+			// the stop anchors by the exchange rate (BR2-3). The "keep 1:1 so
+			// the order still goes out" reasoning does not apply: the order
+			// has already gone out. Report no price instead; the engine falls
+			// back to its own converted reference price.
 			if result.FilledPx > 0 {
-				_, rate, _ := t.currencyAndRate(ctx, ticker)
-				result.FilledPx *= rate
+				if _, rate, resolved := t.currencyAndRate(ctx, ticker); resolved {
+					result.FilledPx *= rate
+				} else {
+					result.FilledPx = 0
+				}
 			}
 
 			return result, nil
+		}
+
+		// "Selling equity not owned" names no precision and is not a precision
+		// problem: the sell asked for more than the account holds (a float
+		// tail like 1.50000001 against 1.5). It was retried as one, which
+		// jumped straight to whole shares — selling 1 of 1.5 — and cached
+		// precision 0 for the ticker until restart, so the remaining 0.5
+		// "rounds to zero shares" on every later exit (blocked for good,
+		// invariant 1) and every fractional buy was floored (BR2-1). Cut the
+		// sell to the real holding once, at the same precision, instead.
+		if isNotOwnedErr(err) {
+			if o.Side == Sell && !capped {
+				if held, ok := t.heldTickerQty(ctx, ticker); ok && held > 0 && held < o.Qty {
+					o.Qty, capped, lastErr = held, true, err
+
+					continue
+				}
+			}
+
+			errlog.Record("trading212", err.Error())
+
+			return res, err
 		}
 
 		if !isRetryableQtyErr(err) {
@@ -994,13 +1046,20 @@ func (t *Trading212) postMarketOrder(
 // asynchronous market-order fill before returning the best-known state.
 const t212FillWait = 25 * time.Second
 
-// t212WorkingStatus reports whether an order status means "still heading for a
-// fill" (keep polling). Anything unrecognised is treated as terminal so an
-// unexpected status can never poll until the deadline for nothing.
-func t212WorkingStatus(s string) bool {
+// t212FinalStatus reports whether an order status is final: filled,
+// cancelled or rejected. Everything else — the working states, CANCELLING,
+// and any status this code does not know — keeps polling, and an order still
+// in one at the deadline stays UNCONFIRMED.
+//
+// It used to be the other way round: a list of working states, everything
+// else terminal. CANCELLING was not on it, so an order polled mid-cancel was
+// booked as a confirmed fill of whatever had filled so far, usually 0 — the
+// reservation and pendingSell released, the shares landing later untracked,
+// a sale booked as zero leaving a phantom position (BR3-4; Alpaca had the
+// same inversion fixed as BR2-6). Unknown is not zero.
+func t212FinalStatus(s string) bool {
 	switch strings.ToUpper(s) {
-	case "", "LOCAL", "UNCONFIRMED", "CONFIRMED", "NEW", "SUBMITTED",
-		"PROCESSING", "WORKING", "PARTIALLY_FILLED", "REPLACING", "REPLACED":
+	case "FILLED", "CANCELLED", "CANCELED", "REJECTED":
 		return true
 	}
 
@@ -1073,7 +1132,7 @@ func (t *Trading212) confirmFill(
 			return cur
 		}
 
-		if !t212WorkingStatus(o.Status) {
+		if t212FinalStatus(o.Status) {
 			cur.Terminal = true // rejected/cancelled — a confirmed, real zero fill
 
 			return cur
@@ -1115,7 +1174,7 @@ func (t *Trading212) settledFromHistory(
 	}
 
 	for _, item := range page.Items {
-		if item.Order.ID.String() != id || t212WorkingStatus(item.Order.Status) {
+		if item.Order.ID.String() != id || !t212FinalStatus(item.Order.Status) {
 			continue
 		}
 
@@ -1240,8 +1299,40 @@ func isRetryableQtyErr(err error) bool {
 	s := err.Error()
 
 	return strings.Contains(s, "quantity-precision-mismatch") ||
-		strings.Contains(s, "selling-equity-not-owned") ||
 		strings.Contains(s, "decimal space") // "must be limited to N decimal spaces"
+}
+
+// isNotOwnedErr reports Trading 212's "selling equity not owned" rejection,
+// in either spelling it uses.
+func isNotOwnedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	s := err.Error()
+
+	return strings.Contains(s, "selling-equity-not-owned") || strings.Contains(s, "SellingEquityNotOwned")
+}
+
+// heldTickerQty returns how much of ticker the account holds, straight from
+// the portfolio endpoint (no FX — a quantity needs none).
+func (t *Trading212) heldTickerQty(ctx context.Context, ticker string) (float64, bool) {
+	var raw []struct {
+		Ticker   string  `json:"ticker"`
+		Quantity float64 `json:"quantity"`
+	}
+
+	if err := t.do(ctx, http.MethodGet, "/equity/portfolio", "portfolio", &raw); err != nil {
+		return 0, false
+	}
+
+	for _, p := range raw {
+		if p.Ticker == ticker {
+			return p.Quantity, true
+		}
+	}
+
+	return 0, false
 }
 
 // GetAccount returns the account's free/total cash in the account currency.
@@ -1272,7 +1363,7 @@ func (t *Trading212) GetAccount(ctx context.Context) (Account, error) {
 
 	if t.preferCcy != "" && ccy != "" && ccy != t.preferCcy {
 		if rate, err := t.fx.Rate(ctx, ccy, t.preferCcy); err != nil {
-			errlog.Recordf("trading212", "fx rate %s->%s: %s (using 1:1, balances will be wrong)", ccy, t.preferCcy, err)
+			recordFXFailure("trading212", err, "balances shown at 1:1 and will be wrong until the rate resolves")
 		} else {
 			free, total = free*rate, total*rate
 			ccy = t.preferCcy
@@ -1395,7 +1486,7 @@ func (t *Trading212) currencyAndRate(ctx context.Context, ticker string) (ccy st
 
 	rate, err := t.fx.Rate(ctx, ccy, t.preferCcy)
 	if err != nil {
-		errlog.Recordf("trading212", "fx rate %s->%s: %s (using 1:1)", ccy, t.preferCcy, err)
+		recordFXFailure("trading212", err, "rate unresolved: orders that need it are refused, positions stay in their native currency")
 		return ccy, 1, false
 	}
 
@@ -1577,9 +1668,51 @@ func (o t212Order) toResult(symbol string, side Side) OrderResult {
 // roundDownQty truncates a share quantity to dp decimal places. Rounding DOWN
 // (never up) keeps a full-position sell at or below the owned amount, so
 // Trading 212 doesn't reject it as "selling more than owned".
+//
+// Floor goes through floorUnits, which absorbs binary representation error:
+// 0.29*100 is 28.999999999999996, which a bare Floor turned into 0.28 — a
+// full exit that left 0.01 behind, above the dust threshold, for a second
+// order or an adoption to deal with (BR2-5).
 func roundDownQty(q float64, dp int) float64 {
 	p := math.Pow(10, float64(dp))
-	return math.Floor(q*p) / p
+	return floorUnits(q*p) / p
+}
+
+// unitsUlps is how many units in the last place of a scaled value count as
+// representation error. Scaling q by 10^dp costs about one ulp, q's own
+// decimal-to-binary error about one more; eight absorbs both.
+//
+// It was 1e-12 RELATIVE to the scaled value, which at 8 dp is half a unit at
+// q ≈ 5000 and at 9 dp at q ≈ 500: above that "floor" rounded to nearest, so
+// roundDownQty(600.0000000006, 9) came out 600.000000001 — above the holding,
+// an Alpaca sell refused for insufficient quantity and the exit failed
+// (BR3-3). An ulp tracks the representation error at every magnitude.
+const unitsUlps = 8
+
+// unitsTolerance is the representation error allowed around s.
+func unitsTolerance(s float64) float64 {
+	a := math.Abs(s)
+
+	return unitsUlps * (math.Nextafter(a, math.Inf(1)) - a)
+}
+
+// floorUnits is Floor that treats a value within representation error of an
+// integer as that integer.
+func floorUnits(s float64) float64 {
+	if r := math.Round(s); math.Abs(s-r) <= unitsTolerance(s) {
+		return r
+	}
+
+	return math.Floor(s)
+}
+
+// ceilUnits is floorUnits' Ceil counterpart.
+func ceilUnits(s float64) float64 {
+	if r := math.Round(s); math.Abs(s-r) <= unitsTolerance(s) {
+		return r
+	}
+
+	return math.Ceil(s)
 }
 
 // absf returns the absolute value of v.

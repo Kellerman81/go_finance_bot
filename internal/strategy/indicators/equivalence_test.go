@@ -79,12 +79,7 @@ func supertrendReference(
 			finalLower = basicLower
 		}
 
-		switch {
-		case closes[i] > finalUpper:
-			dir = 1
-		case closes[i] < finalLower:
-			dir = -1
-		}
+		dir = supertrendFlipReference(dir, closes[i], finalUpper, finalLower)
 	}
 
 	if !started {
@@ -226,4 +221,20 @@ func BenchmarkSupertrendLast(b *testing.B) {
 	for range b.N {
 		SupertrendLast(high, low, closes, 10, 3)
 	}
+}
+
+// supertrendFlipReference is the textbook transition, written out
+// independently of supertrendFlip so the oracle does not share its code: the
+// oracle used to test "close above the upper band" first in every state, the
+// same bug as the implementation, so the equivalence test could not see it.
+func supertrendFlipReference(dir int, c, upper, lower float64) int {
+	if dir >= 0 && c < lower && (dir == 1 || c <= upper) {
+		return -1
+	}
+
+	if dir <= 0 && c > upper {
+		return 1
+	}
+
+	return dir
 }

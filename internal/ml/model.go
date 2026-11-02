@@ -19,6 +19,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/Kellerman81/go_finance_bot/internal/config"
 )
 
 // Model is a fitted classifier plus the standardisation it was fitted under.
@@ -44,6 +46,19 @@ type Model struct {
 	Accuracy float64 `json:"accuracy"`
 	BaseRate float64 `json:"base_rate"`
 	LogLoss  float64 `json:"log_loss"`
+
+	// Votes, VoteHitRate and VoteChance score the model the way the predictor
+	// USES it, out of sample (ML3-1): a twin fitted on the older part of the
+	// window votes on the newest holdoutFraction of it, at the cutoffs the
+	// predictor trades on (see Cutoffs). Votes is how many holdout rows it
+	// voted on, VoteHitRate the share of those votes that were right, and
+	// VoteChance the share a vote on the same side would get right by chance
+	// — the holdout's positive rate for a BUY, its complement for a SELL.
+	// Accuracy above, scored at 0.5, cannot see a model whose every
+	// probability sits below 0.5, which is every model of a rare-rally label.
+	Votes       int     `json:"votes"`
+	VoteHitRate float64 `json:"vote_hit_rate"`
+	VoteChance  float64 `json:"vote_chance"`
 }
 
 // Sample is one training row: a standardisable feature vector and its label.
@@ -69,16 +84,40 @@ func (m *Model) Predict(x []float64) (float64, bool) {
 	return sigmoid(z), true
 }
 
-// Skill is how far the model's training accuracy exceeds simply always guessing
-// the majority class. At or below zero it has learned nothing worth acting on,
-// which is the common case on noisy financial data and must be visible rather
-// than hidden behind a probability that looks meaningful.
+// minSkillVotes is the fewest training votes a skill is measured on. A model
+// that clears its cutoff on a handful of rows reads a hit rate from luck: 3
+// right out of 4 is a 75% hit rate and says nothing.
+const minSkillVotes = 20
+
+// Skill is how far the model's votes beat a vote cast by chance: VoteHitRate
+// minus VoteChance, on held-out rows, at the cutoffs the predictor actually
+// trades on. At or below zero it has learned nothing worth acting on, which
+// is the common case on noisy financial data and must be visible rather than
+// hidden behind a probability that looks meaningful.
+//
+// Out of sample because the votes are, by construction, the rows the model
+// fits best: scored on its own training rows a model of a pure random walk
+// read a skill of 0.20, ten times the shipped min_skill.
+//
+// It used to be training accuracy at a 0.5 cutoff minus the majority-class
+// rate. With the shipped label (a 0.5% rally, ~6% of rows) no model outputs
+// p > 0.5, so accuracy WAS the base rate, skill was exactly 0 and the shipped
+// min_skill 0.02 held every verdict at HOLD — a model whose BUYs hit 2.9× the
+// base rate included (ML3-1).
 func (m *Model) Skill() float64 {
-	if m == nil {
+	if m == nil || m.Votes < minSkillVotes {
 		return 0
 	}
 
-	return m.Accuracy - m.BaseRate
+	return m.VoteHitRate - m.VoteChance
+}
+
+// Cutoffs returns the BUY and SELL probability lines for a training positive
+// rate of base: buyProb/sellProb are distances from 0.5 applied around base
+// (see Predictor.decide). One function, so the votes Train scores are the
+// votes the predictor casts.
+func Cutoffs(base, buyProb, sellProb float64) (buyAt, sellAt float64) {
+	return base + (buyProb - 0.5), base - (0.5 - sellProb)
 }
 
 // TopFeatures returns the n most influential features by absolute weight, with
@@ -132,7 +171,24 @@ type TrainOpts struct {
 	Epochs       int     // full passes over the training set
 	LearningRate float64 // gradient step size
 	L2           float64 // ridge penalty, the main defence against overfitting
+
+	// BuyProb / SellProb are the predictor's vote thresholds (see Cutoffs),
+	// so Skill is measured on the votes it will cast. 0 = the config
+	// defaults.
+	BuyProb  float64
+	SellProb float64
+	// Embargo is how many rows between the skill twin's fit and its holdout
+	// are dropped: the label horizon, since a row's label reads closes up to
+	// that many rows ahead and would otherwise leak the holdout into the fit.
+	Embargo int
+
+	// holdout is set on the twin's own fit so it does not score itself.
+	holdout bool
 }
+
+// holdoutFraction is the newest share of the window the skill twin is
+// scored on.
+const holdoutFraction = 0.25
 
 // withDefaults fills in unset hyperparameters with values that converge on this
 // problem without tuning.
@@ -147,6 +203,14 @@ func (o TrainOpts) withDefaults() TrainOpts {
 
 	if o.L2 <= 0 {
 		o.L2 = 0.01
+	}
+
+	if o.BuyProb <= 0 {
+		o.BuyProb = config.DefaultMLBuyProb
+	}
+
+	if o.SellProb <= 0 {
+		o.SellProb = config.DefaultMLSellProb
 	}
 
 	return o
@@ -220,6 +284,14 @@ func Train(samples []Sample, names []string, opts TrainOpts) (*Model, error) {
 
 	n := float64(len(samples))
 	gradW := make([]float64, dim)
+	rate := float64(positives) / n
+
+	// Start the intercept at logit(positive rate), where a model with no
+	// weights is already calibrated. From 0 it had to walk to logit(0.05) ≈
+	// -2.9 along a gradient of curvature p(1-p) ≈ 0.05, and 300 epochs at
+	// lr 0.05 stopped near -2.2: p(up) sat about twice the rate decide
+	// centres on, and noise voted BUY ~4× as often as a converged fit (ML3-2).
+	m.B = math.Log(rate / (1 - rate))
 
 	for range opts.Epochs {
 		clear(gradW)
@@ -247,7 +319,93 @@ func Train(samples []Sample, names []string, opts TrainOpts) (*Model, error) {
 	m.Accuracy, m.LogLoss = evaluate(m, xs, samples)
 	m.BaseRate = math.Max(float64(positives), n-float64(positives)) / n
 
+	if !opts.holdout {
+		scoreHoldout(m, samples, names, opts)
+	}
+
 	return m, nil
+}
+
+// scoreHoldout fills m's vote fields from a twin fitted on the older rows and
+// voting on the newest holdoutFraction, the embargo apart. A window too short
+// to hold minSkillVotes rows out, or a one-class older part, leaves them zero:
+// Skill then reads 0 and min_skill holds the model at HOLD, which is the safe
+// answer to "could not measure".
+func scoreHoldout(m *Model, samples []Sample, names []string, opts TrainOpts) {
+	cut := len(samples) - int(float64(len(samples))*holdoutFraction)
+	from := cut + max(opts.Embargo, 0)
+
+	if len(samples)-from < minSkillVotes {
+		return
+	}
+
+	twinOpts := opts
+
+	twinOpts.holdout = true
+
+	twin, err := Train(samples[:cut], names, twinOpts)
+	if err != nil {
+		return
+	}
+
+	held := samples[from:]
+	rate := float64(twin.Positives) / float64(twin.Samples)
+	buyAt, sellAt := Cutoffs(rate, opts.BuyProb, opts.SellProb)
+
+	up := 0
+
+	for _, s := range held {
+		if s.Y > 0.5 {
+			up++
+		}
+	}
+
+	heldRate := float64(up) / float64(len(held))
+
+	var votes, hits int
+
+	chance := 0.0
+
+	for _, s := range held {
+		p, _ := twin.Predict(s.X)
+
+		hit, chanceOfHit, voted := vote(p, s.Y > 0.5, buyAt, sellAt, heldRate)
+		if !voted {
+			continue
+		}
+
+		votes++
+
+		chance += chanceOfHit
+
+		if hit {
+			hits++
+		}
+	}
+
+	m.Votes = votes
+	if votes > 0 {
+		m.VoteHitRate = float64(hits) / float64(votes)
+		m.VoteChance = chance / float64(votes)
+	}
+}
+
+// vote is the predictor's vote on one held-out row at probability p: whether
+// it voted, whether it was right, and the chance a vote on that side is right
+// at the holdout's rally rate.
+func vote(
+	p float64,
+	rallied bool,
+	buyAt, sellAt, rate float64,
+) (hit bool, chance float64, voted bool) {
+	switch {
+	case p >= buyAt && buyAt < 1:
+		return rallied, rate, true
+	case p <= sellAt && sellAt > 0:
+		return !rallied, 1 - rate, true
+	}
+
+	return false, 0, false
 }
 
 // evaluate scores the fitted model on its own training rows.

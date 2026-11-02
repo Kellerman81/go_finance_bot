@@ -78,3 +78,37 @@ func TestSaxoErrorPathDoesNotLeakAccountIdentifiersToErrlog(t *testing.T) {
 		}
 	}
 }
+
+// EL3-3: only the status-code paths used the redacted path. A transport
+// failure — DNS, TCP, TLS, a timeout — is net/http's *url.Error, whose text
+// embeds the whole request URL, ClientKey and AccountKey included, and every
+// sync of an outage wrote them into the UI-served errlog ring.
+func TestASaxoTransportErrorDoesNotLeakAccountIdentifiers(t *testing.T) {
+	errlog.Clear()
+
+	srv := httptest.NewServer(http.NotFoundHandler())
+	base := srv.URL
+	srv.Close() // connection refused from here on
+
+	s := &Saxo{
+		baseURL:    base,
+		tokens:     saxoTestToken("tok"),
+		http:       &http.Client{},
+		clientKey:  "MY-SECRET-CLIENT-KEY",
+		accountKey: "MY-SECRET-ACCOUNT-KEY",
+	}
+
+	if _, err := s.GetAccount(context.Background()); err == nil {
+		t.Fatal("GetAccount succeeded against a closed server")
+	}
+
+	if len(errlog.Recent()) == 0 {
+		t.Fatal("the transport failure was not recorded at all")
+	}
+
+	for _, e := range errlog.Recent() {
+		if strings.Contains(e.Message, "MY-SECRET") {
+			t.Errorf("errlog entry leaked the raw account identifiers: %q", e.Message)
+		}
+	}
+}

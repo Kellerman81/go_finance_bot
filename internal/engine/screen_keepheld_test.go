@@ -1,8 +1,17 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/Kellerman81/go_finance_bot/internal/config"
+	"github.com/Kellerman81/go_finance_bot/internal/market"
+	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
+	"github.com/Kellerman81/go_finance_bot/internal/risk"
+	"github.com/Kellerman81/go_finance_bot/internal/screener"
 )
 
 // TestDiffUniverseNeverDropsAHeldSymbolRegardlessOfSelected reproduces (as a
@@ -46,5 +55,57 @@ func TestDiffUniverseStillDropsAnUnheldSymbolThatFailedFilters(t *testing.T) {
 
 	if !slices.Contains(drop, "JUNK") {
 		t.Errorf("drop = %v, want JUNK dropped — it is not held and no longer selected", drop)
+	}
+}
+
+// TestAProviderOutageDoesNotEmptyTheWatchlist is the regression for SC2-3. A
+// failed (or empty) history fetch got the same verdict as a measured
+// rejection, so in a pass where Yahoo was down or rate-limiting every symbol
+// not held or pinned was dropped — with a notification — and nothing came
+// back until the next pass, six hours later by default. A symbol the
+// screener could not measure must stay where it is.
+func TestAProviderOutageDoesNotEmptyTheWatchlist(t *testing.T) {
+	current := []string{"AAPL", "MSFT"}
+	verdicts := []screener.Verdict{
+		{Symbol: "AAPL", Reason: "history unavailable: 429", Unmeasured: true},
+		{Symbol: "MSFT", Reason: "history unavailable: 429", Unmeasured: true},
+	}
+
+	_, drop := diffUniverse(current, nil, protectedFromDrop(nil, verdicts))
+
+	if len(drop) != 0 {
+		t.Errorf("an outage pass dropped %v, want nothing dropped", drop)
+	}
+}
+
+// failingHistory is a history source in an outage: every fetch fails.
+type failingHistory struct{}
+
+func (failingHistory) Candles(
+	context.Context, string, market.Resolution, time.Time, time.Time,
+) ([]market.Candle, error) {
+	return nil, errors.New("HTTP 429")
+}
+
+// TestRescreenDuringAnOutageKeepsTheWatchlist is the end-to-end half of SC2-3:
+// through rescreen itself, so reverting the wiring (protectedFromDrop not
+// passed to diffUniverse) fails here even though the helper test above passes.
+func TestRescreenDuringAnOutageKeepsTheWatchlist(t *testing.T) {
+	e := pinEngine(&pinStore{})
+	e.pf = portfolio.New()
+	e.prices = NewPriceCache()
+	e.rm = risk.New(config.Limits{}, config.CostsConfig{})
+
+	if err := e.AddScreened("AAPL", "MSFT"); err != nil {
+		t.Fatal(err)
+	}
+
+	e.SetHistorySource(failingHistory{})
+	e.SetScreenerConfig(config.ScreenerConfig{Enabled: true, Filters: []string{"history"}, MinHistoryBars: 10})
+
+	e.rescreen(context.Background())
+
+	if got := e.Watchlist(); len(got) != 2 {
+		t.Errorf("watchlist after a pass where every fetch failed = %v, want both symbols kept", got)
 	}
 }

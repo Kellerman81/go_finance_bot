@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,6 +38,11 @@ type Binance struct {
 	symbols map[string]struct{}
 	last    map[string]Quote
 	quotes  chan Quote
+	// rejected holds subscribed symbols Binance refused on their own (an
+	// unknown, delisted or non-crypto symbol). They are left out of the
+	// batched poll, which Binance answers with one 400 for the WHOLE batch
+	// if any symbol in it is unknown (MK3-1). Cleared by a fresh Subscribe.
+	rejected map[string]bool
 
 	// ctx/cancel bound in-flight requests so Close doesn't wait out a poll's
 	// full HTTP timeout; done/stopped hand the quotes channel's lifecycle
@@ -84,6 +90,7 @@ func newBinance(base string, interval time.Duration) *Binance {
 		hc:       &http.Client{Timeout: 15 * time.Second},
 		interval: interval,
 		symbols:  make(map[string]struct{}),
+		rejected: make(map[string]bool),
 		last:     make(map[string]Quote),
 		quotes:   make(chan Quote, 256),
 		ctx:      ctx,
@@ -106,6 +113,7 @@ func (b *Binance) Subscribe(symbols ...string) error {
 	for _, s := range symbols {
 		if s = normalizePair(s); s != "" {
 			b.symbols[s] = struct{}{}
+			delete(b.rejected, s)
 		}
 	}
 
@@ -119,6 +127,7 @@ func (b *Binance) Unsubscribe(symbols ...string) error {
 
 	for _, s := range symbols {
 		delete(b.symbols, normalizePair(s))
+		delete(b.rejected, normalizePair(s))
 	}
 
 	return nil
@@ -180,7 +189,9 @@ func (b *Binance) pollOnce() {
 
 	symbols := make([]string, 0, len(b.symbols))
 	for s := range b.symbols {
-		symbols = append(symbols, s)
+		if !b.rejected[s] {
+			symbols = append(symbols, s)
+		}
 	}
 
 	b.mu.RUnlock()
@@ -190,6 +201,14 @@ func (b *Binance) pollOnce() {
 	}
 
 	prices, err := b.tickerPrices(b.ctx, symbols)
+	if err != nil && strings.Contains(err.Error(), "http 400") {
+		// One unknown symbol fails the whole batch: a typo, a delisted pair or
+		// a stock the screener added stopped every tick of every symbol, stops
+		// and trails included, every 5 s for as long as it stayed subscribed
+		// (MK3-1). Ask each symbol alone, set the refused ones aside.
+		prices, err = b.pollEach(symbols)
+	}
+
 	if err != nil {
 		errlog.Recordf("binance", "ticker poll: %v", err)
 
@@ -202,6 +221,11 @@ func (b *Binance) pollOnce() {
 		if px <= 0 {
 			continue
 		}
+
+		// Priced by Binance means a crypto pair, whatever its quote — but
+		// only once priced: a subscribed stock Binance refuses must keep its
+		// exchange's hours (MK3-5).
+		markCryptoFeedSymbol(sym)
 
 		q := Quote{Symbol: sym, Price: px, Time: now}
 
@@ -217,6 +241,45 @@ func (b *Binance) pollOnce() {
 		default:
 		}
 	}
+}
+
+// pollEach prices symbols one request each, after the batch was refused.
+// A symbol Binance refuses alone is marked rejected — left out of later
+// batches until it is subscribed again — and announced once. err is set only
+// when no symbol could be priced for another reason (an outage), so the
+// caller reports that as before.
+func (b *Binance) pollEach(symbols []string) (map[string]float64, error) {
+	prices := make(map[string]float64, len(symbols))
+
+	var lastErr error
+
+	for _, sym := range symbols {
+		one, err := b.tickerPrices(b.ctx, []string{sym})
+		if err == nil {
+			maps.Copy(prices, one)
+
+			continue
+		}
+
+		if strings.Contains(err.Error(), "http 400") {
+			b.mu.Lock()
+			b.rejected[sym] = true
+			b.mu.Unlock()
+
+			errlog.RecordOncef("binance", "%s: Binance refuses this symbol (%v); it gets no live "+
+				"ticks from this feed — the other symbols keep polling", sym, err)
+
+			continue
+		}
+
+		lastErr = err
+	}
+
+	if len(prices) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+
+	return prices, nil
 }
 
 // tickerPrices fetches the latest price for the given symbols.
@@ -256,6 +319,8 @@ func (b *Binance) tickerPrices(
 }
 
 // Candles fetches historical klines for indicator warmup and backtests.
+//
+//nolint:cyclop // window capping plus forward paging
 func (b *Binance) Candles(
 	ctx context.Context,
 	symbol string,
@@ -267,6 +332,60 @@ func (b *Binance) Candles(
 		return nil, errors.New("binance: empty symbol")
 	}
 
+	// Binance returns at most `limit` klines per request, the OLDEST ones
+	// from startTime on. One request cut every window to its first 1000 bars
+	// (MK2-4), then — anchored to the end — to its last 1000: a 30-day
+	// one-minute screen judged BTCUSDT on 16 h 39 m and said 30 days (MK3-2).
+	// The window is paged forward in 1000-bar requests, up to
+	// binanceMaxPages; a window wider than that keeps its newest part (the
+	// part a warmup needs) and says so once.
+	step := binanceStep(res)
+
+	if !from.IsZero() && !to.IsZero() {
+		span := time.Duration(binanceMaxKlines*binanceMaxPages) * step
+		if earliest := to.Add(-span); from.Before(earliest) {
+			errlog.RecordOncef("binance", "%s: history capped at %d %s bars (%s); the window asked "+
+				"for %s", sym, binanceMaxKlines*binanceMaxPages, res, span, to.Sub(from).Round(time.Hour))
+
+			from = earliest
+		}
+	}
+
+	var out []Candle
+
+	for range binanceMaxPages {
+		got, err := b.klinePage(ctx, sym, res, from, to)
+		if err != nil {
+			if len(out) > 0 {
+				return out, nil
+			}
+
+			return nil, err
+		}
+
+		out = append(out, got...)
+
+		// A short page is the end of the window; an open-ended request (no
+		// from) is one page by definition.
+		if len(got) < binanceMaxKlines || from.IsZero() || len(got) == 0 {
+			break
+		}
+
+		from = got[len(got)-1].Time.Add(step)
+		if !to.IsZero() && !from.Before(to) {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+// binanceMaxPages bounds how many 1000-kline requests one Candles call may
+// make: 30 pages is ~20 days of minute bars, a month of 15-minute ones.
+const binanceMaxPages = 30
+
+// klinePage is one klines request from from (zero = Binance's default) to to.
+func (b *Binance) klinePage(ctx context.Context, sym string, res Resolution, from, to time.Time) ([]Candle, error) {
 	url := fmt.Sprintf("%s/api/v3/klines?symbol=%s&interval=%s&limit=%d",
 		b.base, sym, binanceInterval(res), binanceMaxKlines)
 
@@ -333,6 +452,23 @@ func klineFloat(v any) float64 {
 }
 
 // binanceInterval maps a Resolution to Binance's interval string.
+// binanceStep is one kline's length at res.
+func binanceStep(res Resolution) time.Duration {
+	switch res {
+	case Res5Min:
+		return 5 * time.Minute
+	case Res15Min:
+		return 15 * time.Minute
+	case Res1Hour:
+		return time.Hour
+	case Res1Day:
+		return 24 * time.Hour
+	case Res1Min:
+	}
+
+	return time.Minute
+}
+
 func binanceInterval(res Resolution) string {
 	switch res {
 	case Res5Min:

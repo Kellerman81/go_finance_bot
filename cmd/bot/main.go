@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	_ "time/tzdata" // bundle the IANA tz database so exchange-hours lookups work without OS zoneinfo (e.g. Windows)
@@ -208,13 +209,22 @@ func run() int {
 		brk = broker.NewAlpaca(cfg.Alpaca.BaseURL, cfg.Alpaca.KeyID, cfg.Alpaca.SecretKey, cfg.Alpaca.PreferredCurrency)
 		log.Info("using Alpaca broker", "base_url", cfg.Alpaca.BaseURL, "paper", cfg.Alpaca.Paper)
 
+		// use_sim promises "no Alpaca calls" and does nothing once broker:
+		// alpaca is named — said, not refused, since it is on by default
+		// (CM3-6).
+		if cfg.AlpacaUseSimIgnored() {
+			log.Warn("alpaca.use_sim is ignored with broker: alpaca — this bot calls Alpaca; " +
+				"set broker: sim for the simulator")
+			errlog.RecordOnce("config", "alpaca.use_sim is ignored with broker: alpaca: the bot calls "+
+				"Alpaca. Set broker: sim for the simulator, or use_sim: false to silence this.")
+		}
+
 	default:
+		// Fill friction is installed by engine.New (installSimFriction):
+		// the same per-symbol model the backtester charges, measured spreads
+		// included — a flat closure here charged spread_pct until the first
+		// costs edit (CM2-3).
 		sim := broker.NewSim(cfg.Alpaca.SimCash, prices.Get, cfg.Costs.Commission)
-		// Same friction the backtester models, so paper results and backtest
-		// results are produced under the same assumptions.
-		sim.SetSlippage(func(_ string, buy bool, price float64) float64 {
-			return cfg.Costs.FillPrice(buy, price)
-		})
 
 		brk = sim
 		paperSim = sim
@@ -229,9 +239,13 @@ func run() int {
 	// free, keyless source — to seed indicators regardless of the execution
 	// broker. Non-fatal: warmup falls back to live ticks if it's unavailable.
 	if history == nil {
-		history = market.NewYahooHistory()
+		history = defaultHistory(cfg.Feed, provider)
 
-		log.Info("using Yahoo Finance for indicator warmup (free, no key)")
+		if cfg.Feed == "binance" {
+			log.Info("using the Binance feed for history, Yahoo Finance as fallback")
+		} else {
+			log.Info("using Yahoo Finance for indicator warmup (free, no key)")
+		}
 	}
 
 	// Wrap in a short-TTL cache so repeated warmups and the per-order venue-price
@@ -347,8 +361,9 @@ func run() int {
 	// The live-editable blocks go through the same setters the API uses, so the
 	// engine retains them and /api/settings reads back what is actually in
 	// force rather than what the file said at startup.
+	// Also restores the persisted halt/peak state when protections are on: an
+	// active halt from a previous run must not silently clear.
 	eng.SetProtectionsConfig(cfg.Protections)
-	eng.RestoreProtectionState() // an active halt from a previous run must not silently clear
 	// Tell the engine which file to write protection changes back to, before
 	// any config is applied: drop_after_losses comments a dropped symbol out
 	// of watchlist:, and a drop that only changed the running watchlist would
@@ -428,7 +443,15 @@ func run() int {
 	// the whole process silently vanishing. See CODE_REVIEW_FINDINGS.md's
 	// "an unrecovered panic in the engine goroutine crashes the whole
 	// process".
-	go runSupervised(log, "engine", func() { eng.SetTradingEnabled(false) }, func() { eng.Run(ctx) })
+	// Joined at shutdown (see below): Run's ctx.Done arm saves the protection
+	// state, and the deferred store Close used to win the race — the save
+	// failed on "database is closed" every time, and an equity peak from the
+	// last five minutes was lost (CM3-1).
+	var workers sync.WaitGroup
+
+	workers.Go(func() {
+		runSupervised(log, "engine", func() { eng.SetTradingEnabled(false) }, func() { eng.Run(ctx) })
+	})
 
 	// Optional, off by default (see config.AutotuneConfig): a scheduled
 	// background job that periodically re-runs the Strategy tab's per-symbol
@@ -438,8 +461,10 @@ func run() int {
 	// autotune.Schedule itself is a no-op when cfg.Autotune.Enabled is
 	// false, so this is started unconditionally like every other
 	// runSupervised goroutine rather than branching at the call site.
-	go runSupervised(log, "autotune", nil, func() {
-		autotune.Schedule(ctx, eng, rm, pf, cfg.Autotune, *cfgPath, log)
+	workers.Go(func() {
+		runSupervised(log, "autotune", nil, func() {
+			autotune.Schedule(ctx, eng, rm, pf, cfg.Autotune, *cfgPath, log)
+		})
 	})
 
 	// No config.Validate() check enforces this (see CODE_REVIEW_FINDINGS.md
@@ -469,9 +494,15 @@ func run() int {
 		"auth_required", cfg.Server.AuthToken != "")
 
 	if err := srv.Run(ctx, cfg.Server.Addr); err != nil {
+		stop() // the engine and autotune must still wind down before the store closes
+		waitBounded(&workers, shutdownGrace, log)
 		log.Error("server error", "err", err)
+
 		return 1
 	}
+
+	// Before run's defers close the store and the notifier.
+	waitBounded(&workers, shutdownGrace, log)
 
 	log.Info("shutdown complete")
 
@@ -551,4 +582,42 @@ func runSupervised(log *slog.Logger, name string, onPanic func(), work func()) {
 	}()
 
 	work()
+}
+
+// defaultHistory is the history source when the broker offers none: Yahoo,
+// keyless — except that with feed: binance the feed itself comes first.
+// Yahoo has no BTCUSDT, and the venue-price check and the screener read only
+// this source: every crypto entry was refused "venue price unavailable" and
+// every crypto candidate failed its history filter, so the documented
+// binance + sim paper-trading mode never bought anything (CM2-2). Yahoo stays
+// behind it for any equity symbol on the same watchlist.
+func defaultHistory(feed string, provider market.DataProvider) market.HistoryFetcher {
+	yahoo := market.NewYahooHistory()
+
+	if feed == "binance" {
+		return market.NewFallbackHistory(provider, yahoo)
+	}
+
+	return yahoo
+}
+
+// shutdownGrace bounds how long shutdown waits for the engine and autotune
+// goroutines: long enough for an evaluation in progress and the final saves,
+// short enough that a hung broker call cannot hold a container stop forever.
+const shutdownGrace = 30 * time.Second
+
+// waitBounded waits for wg, at most d.
+func waitBounded(wg *sync.WaitGroup, d time.Duration, log *slog.Logger) {
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(d):
+		log.Warn("shutdown: background work still running after the grace period; exiting anyway", "grace", d)
+	}
 }

@@ -82,8 +82,12 @@ func LinReg(values []float64, period int) (slope, intercept, r2 float64, ok bool
 //
 //nolint:revive,cyclop // four results beat a struct; Wilder's smoothing is one pass
 func ADXLast(high, low, closes []float64, period int) (adx, plusDI, minusDI float64, ok bool) {
+	// The ADX seed needs DX readings at indices period..2·period-1, so 2·period
+	// bars are enough. "n <= 2·period" refused at exactly that length, one bar
+	// after ADX is defined — every disagreement with a textbook ADX was that
+	// case (IN2-3).
 	n := len(closes)
-	if period <= 0 || n <= 2*period {
+	if period <= 0 || n < 2*period {
 		return 0, 0, 0, false
 	}
 

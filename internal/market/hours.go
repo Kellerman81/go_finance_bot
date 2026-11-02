@@ -23,14 +23,26 @@ func hm(h, m int) int { return h*60 + m }
 
 // Common European cash sessions (local time).
 var (
-	exUS       = Exchange{"US", "America/New_York", hm(9, 30), hm(16, 0)}
-	exXetra    = Exchange{"Xetra", "Europe/Berlin", hm(9, 0), hm(17, 30)}
-	exParis    = Exchange{"Euronext", "Europe/Paris", hm(9, 0), hm(17, 30)}
-	exAms      = Exchange{"Euronext", "Europe/Amsterdam", hm(9, 0), hm(17, 30)}
-	exBrussels = Exchange{"Euronext", "Europe/Brussels", hm(9, 0), hm(17, 30)}
-	exLisbon   = Exchange{"Euronext", "Europe/Lisbon", hm(8, 0), hm(16, 30)}
-	exDublin   = Exchange{"Euronext", "Europe/Dublin", hm(8, 0), hm(16, 30)}
-	exLSE      = Exchange{"LSE", "Europe/London", hm(8, 0), hm(16, 30)}
+	exUS    = Exchange{"US", "America/New_York", hm(9, 30), hm(16, 0)}
+	exXetra = Exchange{"Xetra", "Europe/Berlin", hm(9, 0), hm(17, 30)}
+	// The German regional exchanges are NOT on Xetra's session: Frankfurt's
+	// specialist trading in shares and ETPs, and Stuttgart, Munich/gettex,
+	// Düsseldorf, Hamburg-Hannover and Berlin, all run 08:00-22:00. Frankfurt
+	// was set to 20:00 here, holding a .F stop that triggered at 20:30 until
+	// the next morning while the venue traded — 22:00 checked against
+	// Deutsche Börse's published hours (MK3-6). (Bonds close at 17:30; the
+	// bot trades no bonds on .F.) Gating them to Xetra held a
+	// stop on a .SG holding that triggered at 18:00 until the next morning
+	// while its own venue was open — the hours gate also gates exits on a
+	// broker with no schedule (T212, Alpaca) (MK2-8).
+	exFrankfurt  = Exchange{"Börse Frankfurt", "Europe/Berlin", hm(8, 0), hm(22, 0)}
+	exDERegional = Exchange{"German regional exchange", "Europe/Berlin", hm(8, 0), hm(22, 0)}
+	exParis      = Exchange{"Euronext", "Europe/Paris", hm(9, 0), hm(17, 30)}
+	exAms        = Exchange{"Euronext", "Europe/Amsterdam", hm(9, 0), hm(17, 30)}
+	exBrussels   = Exchange{"Euronext", "Europe/Brussels", hm(9, 0), hm(17, 30)}
+	exLisbon     = Exchange{"Euronext", "Europe/Lisbon", hm(8, 0), hm(16, 30)}
+	exDublin     = Exchange{"Euronext", "Europe/Dublin", hm(8, 0), hm(16, 30)}
+	exLSE        = Exchange{"LSE", "Europe/London", hm(8, 0), hm(16, 30)}
 	// Cboe Europe's UK order book. Yahoo reports its listings as exchange
 	// "Cboe UK" in Europe/London and they trade the LSE cash session; they
 	// are named separately only so a refusal says which venue it means.
@@ -69,18 +81,55 @@ var exCrypto = Exchange{Name: "Crypto"}
 var cryptoQuoteCurrencies = []string{
 	"USDT", "USDC", "BUSD", "FDUSD", "TUSD",
 	"USD", "EUR", "GBP", "TRY",
+	// Fiat quotes Binance lists that no common equity ticker ends in. ARS and
+	// DAI are left out on purpose (CARS is a NYSE listing): those pairs are
+	// recognised through the feed instead — see cryptoFeedSymbols.
+	"BRL", "JPY", "AUD", "PLN", "MXN", "ZAR", "RON", "UAH", "IDR",
 	"BTC", "ETH", "BNB",
+}
+
+// cryptoFeedSymbols holds every symbol a crypto feed (Binance) has priced. The quote-suffix list is a heuristic, and a real Binance quote
+// outside it — BRL, JPY, AUD, PLN, ARS, MXN, ZAR, DAI, … — fell through to the
+// US equity session: BTCBRL was refused on a Saturday, exits included, until
+// Monday 09:30 ET (MK3-5). A symbol the crypto feed carries is a crypto pair
+// whatever it ends in; the list stays for symbols not (yet) subscribed.
+var cryptoFeedSymbols sync.Map
+
+// markCryptoFeedSymbol records that a crypto feed streams symbol.
+func markCryptoFeedSymbol(symbol string) {
+	cryptoFeedSymbols.Store(normalizePair(symbol), true)
+}
+
+// isCryptoFeedSymbol reports whether a crypto feed streams symbol.
+func isCryptoFeedSymbol(symbol string) bool {
+	_, ok := cryptoFeedSymbols.Load(normalizePair(symbol))
+
+	return ok
 }
 
 // looksLikeCryptoPair reports whether symbol matches a Binance-style pair: a
 // base asset concatenated directly with one of cryptoQuoteCurrencies, no
-// separator. It requires at least one character before the quote currency,
-// so the quote currency alone ("USDT") is never mistaken for a pair.
+// separator.
+//
+// Against a BTC or ETH quote the base must be at least two characters. The US
+// crypto ETFs and trusts are a one-letter prefix on exactly those two codes —
+// GBTC, FBTC, FETH, CETH, EETH, SETH — which a one-character minimum read as
+// 24/7 pairs: OrderingAllowed said yes on a Saturday and, the venue being
+// "known", entryAllowed's weekend guard was skipped too, so a weekend buy was
+// queued at the broker for Monday's open (MK2-5). The stablecoin and fiat
+// quotes keep the one-character minimum: one-letter Binance bases exist
+// (WUSDT, SUSDT, TUSDT), and misreading a real pair as an NYSE listing is the
+// costly direction — the hours gate holds back its EXITS too.
 func looksLikeCryptoPair(symbol string) bool {
 	up := strings.ToUpper(symbol)
 
 	for _, q := range cryptoQuoteCurrencies {
-		if len(up) > len(q) && strings.HasSuffix(up, q) {
+		minBase := 1
+		if q == "BTC" || q == "ETH" {
+			minBase = 2
+		}
+
+		if len(up) >= len(q)+minBase && strings.HasSuffix(up, q) {
 			return true
 		}
 	}
@@ -89,11 +138,13 @@ func looksLikeCryptoPair(symbol string) bool {
 }
 
 // suffixExchange maps a Yahoo-style exchange suffix to its venue. "" (no suffix)
-// is treated as a US listing. German regional exchanges share Xetra's hours.
+// is treated as a US listing. German regional exchanges keep their own, longer
+// sessions — see exDERegional.
 var suffixExchange = map[string]Exchange{
 	"":   exUS,
-	"DE": exXetra, "F": exXetra, "SG": exXetra, "MU": exXetra,
-	"DU": exXetra, "HM": exXetra, "HA": exXetra, "BE": exXetra, "BM": exXetra,
+	"DE": exXetra, "F": exFrankfurt,
+	"SG": exDERegional, "MU": exDERegional, "DU": exDERegional, "HM": exDERegional,
+	"HA": exDERegional, "BE": exDERegional, "BM": exDERegional,
 	"PA": exParis,
 	"AS": exAms,
 	"BR": exBrussels,
@@ -125,7 +176,7 @@ func ExchangeFor(symbol string) (Exchange, bool) {
 	// e.g. "AAPL" and "BTCUSDT" have none) — try the crypto pattern first,
 	// since misreading a US equity ticker as 24/7 is far less costly than
 	// gating a 24/7 market to NYSE hours.
-	if suffix == "" && looksLikeCryptoPair(symbol) {
+	if suffix == "" && (isCryptoFeedSymbol(symbol) || looksLikeCryptoPair(symbol)) {
 		return exCrypto, true
 	}
 

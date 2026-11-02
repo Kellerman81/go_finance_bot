@@ -138,7 +138,7 @@ func (e *Engine) adoptUntrackedHoldings(holdings []portfolio.Holding) {
 
 		// AdoptHeldPosition re-checks "already tracked" under its own lock, so
 		// the reads above are only an early-out, not the decision.
-		if e.AdoptHeldPosition(h.Symbol) {
+		if e.AdoptHeldPosition(h.Symbol) == nil {
 			e.log.Warn("adopted an untracked broker holding — until now it traded without "+
 				"keep_interval, max_hold, the ROI/scale-out ladders or realized P&L",
 				"symbol", h.Symbol, "qty", h.Qty, "entry_price", h.AvgPrice)

@@ -37,8 +37,9 @@ type Manager struct {
 
 	// reserved holds the estimated cash cost of buys that have been
 	// authorised and sent toward a broker but whose outcome (filled, or
-	// definitively not filled) is not yet known — see Reserve.
-	reserved  map[uint64]float64
+	// definitively not filled) is not yet known — see Reserve. Each carries
+	// its symbol, so an in-flight buy also counts against max_open_positions.
+	reserved  map[uint64]reservation
 	nextResID uint64
 
 	// guard supplies the one portfolio limit that sizes an order rather than
@@ -241,6 +242,11 @@ func (m *Manager) SpentToday() float64 {
 // reservation only makes a future buy more conservative, never less safe,
 // matching the fails-closed design the rest of this package already uses.
 func (m *Manager) Reserve(amount float64) uint64 {
+	return m.reserveFor(amount, "")
+}
+
+// reserveFor is Reserve with the symbol the buy is for.
+func (m *Manager) reserveFor(amount float64, symbol string) uint64 {
 	if amount <= 0 {
 		return 0
 	}
@@ -252,10 +258,10 @@ func (m *Manager) Reserve(amount float64) uint64 {
 	id := m.nextResID
 
 	if m.reserved == nil {
-		m.reserved = make(map[uint64]float64)
+		m.reserved = make(map[uint64]reservation)
 	}
 
-	m.reserved[id] = amount
+	m.reserved[id] = reservation{amount: amount, symbol: portfolio.Normalize(symbol)}
 
 	return id
 }
@@ -264,7 +270,10 @@ func (m *Manager) Reserve(amount float64) uint64 {
 // the same way Authorize's cash_reserve/max_daily_spend headroom does (see
 // estimatedCost), so a reservation and the headroom it eats into are always
 // computed on a consistent basis.
-func (m *Manager) ReserveBuy(qty, price float64) uint64 {
+//
+// symbol is the instrument being bought: an in-flight buy of a symbol not yet
+// held is a position about to exist, and counts against max_open_positions.
+func (m *Manager) ReserveBuy(symbol string, qty, price float64) uint64 {
 	if qty <= 0 || price <= 0 {
 		return 0
 	}
@@ -273,7 +282,29 @@ func (m *Manager) ReserveBuy(qty, price float64) uint64 {
 	amount := m.estimatedCost(qty, price)
 	m.mu.Unlock()
 
-	return m.Reserve(amount)
+	return m.reserveFor(amount, symbol)
+}
+
+// pendingNewPositions counts the distinct symbols with a buy in flight that
+// the snapshot does not hold yet, other than exclude. Caller holds m.mu.
+func (m *Manager) pendingNewPositions(snap portfolio.Snapshot, exclude string) int {
+	exclude = portfolio.Normalize(exclude)
+
+	seen := make(map[string]bool)
+
+	for _, r := range m.reserved {
+		if r.symbol == "" || r.symbol == exclude || seen[r.symbol] {
+			continue
+		}
+
+		if h, ok := snap.Holding(r.symbol); ok && h.Held() {
+			continue
+		}
+
+		seen[r.symbol] = true
+	}
+
+	return len(seen)
 }
 
 // Release clears a reservation made by Reserve/ReserveBuy. id 0 (what
@@ -291,11 +322,48 @@ func (m *Manager) Release(id uint64) {
 	delete(m.reserved, id)
 }
 
+// reservation is one in-flight buy's estimated cash cost.
+type reservation struct {
+	amount float64
+	symbol string // "" for a Reserve made without one
+}
+
+// reservedFor sums symbol's outstanding reservations. Caller holds m.mu.
+func (m *Manager) reservedFor(symbol string) float64 {
+	symbol = portfolio.Normalize(symbol)
+
+	var sum float64
+
+	for _, r := range m.reserved {
+		if r.symbol == symbol {
+			sum += r.amount
+		}
+	}
+
+	return sum
+}
+
+// HasReservation reports whether a buy of symbol is in flight — authorised
+// and sent, its outcome not yet known (a resting limit, an unconfirmed
+// order). The engine treats such a symbol as already being bought.
+//
+// Nil-safe, like the guards: no manager, nothing in flight.
+func (m *Manager) HasReservation(symbol string) bool {
+	if m == nil {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.reservedFor(symbol) > 0
+}
+
 // reservedTotal sums all outstanding reservations. Caller holds m.mu.
 func (m *Manager) reservedTotal() float64 {
 	var sum float64
 	for _, v := range m.reserved {
-		sum += v
+		sum += v.amount
 	}
 
 	return sum
@@ -332,12 +400,15 @@ func (m *Manager) Authorize(
 
 	d := Decision{Symbol: o.Symbol, Side: o.Side, OrigQty: o.Qty}
 
-	if estPrice <= 0 {
+	// !(x > 0) rather than x <= 0: NaN fails every comparison, so "<= 0" let
+	// a NaN price through with every cap's maxValue/NaN comparison false — no
+	// cap clamped, and the full requested quantity was approved (RK2-5).
+	if !(estPrice > 0) || math.IsInf(estPrice, 0) {
 		d.Reason = "no valid price"
 		return o, d
 	}
 
-	if o.Qty <= 0 {
+	if !(o.Qty > 0) || math.IsInf(o.Qty, 0) {
 		d.Reason = "non-positive quantity"
 		return o, d
 	}
@@ -352,6 +423,9 @@ func (m *Manager) Authorize(
 		// refusal this package must never make by accident.
 		heldPos, _ := snap.Holding(o.Symbol)
 		held := heldPos.Qty
+		// "<= 0", NOT !heldPos.Held(): the dust rule (portfolio.DustQty)
+		// is for counting positions on the BUY side. A sell of a residual is
+		// never refused here — exits are never blocked (PF2-4).
 		if held <= 0 {
 			d.Reason = "no position to sell"
 			return o, d
@@ -389,6 +463,15 @@ func (m *Manager) Authorize(
 			return o, d
 		}
 
+		// A cap whose price is not positive cannot be divided by: with
+		// commission_pct at or above 1 the effective price was <= 0 and the
+		// cash_reserve clamp silently stopped clamping. Fail closed (RK2-6;
+		// config.CostsConfig.Validate rejects the settings at load too).
+		if !(c.price > 0) {
+			d.Reason = fmt.Sprintf("blocked by %s (cost settings leave no valid price)", c.name)
+			return o, d
+		}
+
 		maxQty := c.maxValue / c.price
 		if maxQty < qty {
 			qty = maxQty
@@ -404,10 +487,16 @@ func (m *Manager) Authorize(
 		// entry into that symbol skip the check entirely. See
 		// CODE_REVIEW_FINDINGS.md's "max_open_positions bypassed by a
 		// zero-quantity holdings row".
+		//
+		// In-flight buys of symbols not yet held count as positions about to
+		// exist (RK2-2), for the same reason they count against
+		// max_total_invested.
 		cur, _ := snap.Holding(o.Symbol)
-		alreadyHeld := cur.Qty > 0
-		if !alreadyHeld && snap.OpenPositions >= l.MaxOpenPositions {
-			d.Reason = fmt.Sprintf("blocked by max_open_positions (%d held)", snap.OpenPositions)
+		alreadyHeld := cur.Held() // dust is not a position (PF2-4)
+		open := snap.OpenPositions + m.pendingNewPositions(snap, o.Symbol)
+
+		if !alreadyHeld && open >= l.MaxOpenPositions {
+			d.Reason = fmt.Sprintf("blocked by max_open_positions (%d held or in flight)", open)
 			return o, d
 		}
 	}
@@ -504,29 +593,43 @@ func (m *Manager) buyCapRules(o broker.Order, estPrice float64, snap portfolio.S
 	slotValue, slotRule, slotted := m.guard.MaxPositionValue(
 		o.Symbol, m.investableBase(snap), m.minPositions)
 
+	// The position as it will stand: held, plus this symbol's buys still in
+	// flight. RK2-2 counted reservations against the account-wide caps only;
+	// a resting limit buy of 500 left max_per_position 500 reporting 500 of
+	// room for the same name, and every evaluation until it resolved could
+	// approve another full clip (RK3-1). Reservations carry cash cost — a
+	// slight over-count, on the safe side.
+	position := heldValue(snap, o.Symbol) + m.reservedFor(o.Symbol)
+
 	return []capRule{
 		{"max_order_value", l.MaxOrderValue, estPrice, l.MaxOrderValue > 0},
 		{
 			"max_per_position",
-			l.MaxPerPosition - heldValue(snap, o.Symbol),
+			l.MaxPerPosition - position,
 			estPrice,
 			l.MaxPerPosition > 0,
 		},
 		{
 			slotRule,
-			slotValue - heldValue(snap, o.Symbol),
+			slotValue - position,
 			estPrice,
 			slotted,
 		},
 		{
+			// Less what is in flight: a resting limit or an unconfirmed buy
+			// is not in the snapshot (nor in openPos, so pendingExposure
+			// cannot add it), and without this a second buy was approved
+			// against headroom the first had already claimed — 2000
+			// invested under a 1000 cap (RK2-2). Reservations carry cash
+			// cost, a slight over-count that errs on the safe side.
 			"max_total_invested",
-			l.MaxTotalInvested - snap.Invested,
+			l.MaxTotalInvested - snap.Invested - reserved,
 			estPrice,
 			l.MaxTotalInvested > 0,
 		},
 		{
 			"max_daily_spend",
-			l.MaxDailySpend - m.spentToday - reserved - fixedFee,
+			l.MaxDailySpend - m.spentTodayAsOfNow() - reserved - fixedFee,
 			effPrice,
 			l.MaxDailySpend > 0,
 		},
@@ -631,6 +734,22 @@ func (m *Manager) RecordBuy(notional float64) {
 	m.rollDay()
 
 	m.spentToday += notional + m.costs.Commission(notional)
+}
+
+// spentTodayAsOfNow is spentToday as the current UTC day sees it: spend
+// recorded on an earlier day counts as 0, without rolling the day (callers
+// such as BuyHeadroomBinding are read-only). Reading the raw counter let a
+// budget exhausted yesterday refuse every SizeBuy after midnight — and since
+// both live and the backtester size BEFORE Authorize, which is what rolls the
+// day, nothing rolled it until a sell, a manual order or a UI poll did; a
+// headless bot with no exits stayed locked out of buys (RK2-1). Caller holds
+// m.mu.
+func (m *Manager) spentTodayAsOfNow() float64 {
+	if m.day != m.today() {
+		return 0
+	}
+
+	return m.spentToday
 }
 
 // rollDay resets daily spend when the trading day changes. Caller holds m.mu.

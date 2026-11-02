@@ -175,7 +175,7 @@ func TestBuyHeadroomAccountsForReservations(t *testing.T) {
 		t.Fatalf("BuyHeadroom before any reservation = %v, want 1000", before)
 	}
 
-	id := m.ReserveBuy(3, 100) // reserves ~300 (+ commission, here 0)
+	id := m.ReserveBuy("", 3, 100) // reserves ~300 (+ commission, here 0)
 
 	after := m.BuyHeadroom(order, 100, snap)
 	if after != 700 {

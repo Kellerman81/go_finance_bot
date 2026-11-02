@@ -10,7 +10,12 @@ import "time"
 // Candles already at or coarser than the target pass through unchanged in shape
 // (one bucket per bar) — Resample never upsamples.
 func Resample(candles []Candle, target Resolution) []Candle {
-	step := resolutionDuration(target)
+	return ResampleStep(candles, resolutionDuration(target))
+}
+
+// ResampleStep is Resample to a bar size given as a duration — the engine's
+// bar_interval, which need not be one of the named resolutions.
+func ResampleStep(candles []Candle, step time.Duration) []Candle {
 	if step <= 0 || len(candles) == 0 {
 		return candles
 	}

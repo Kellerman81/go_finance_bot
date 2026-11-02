@@ -7,8 +7,11 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Kellerman81/go_finance_bot/internal/errlog"
 )
 
 // opposite returns the protective-leg side for a given entry side.
@@ -135,7 +138,7 @@ func (s *Saxo) PlaceBracket(ctx context.Context, b BracketOrder) (BracketResult,
 		return BracketResult{}, err
 	}
 
-	amount := math.Floor(b.Qty)
+	amount := floorUnits(b.Qty) // BR3-6, see SubmitOrder
 	if amount < 1 {
 		return BracketResult{}, fmt.Errorf(
 			"saxo: bracket for %s floors to 0 whole shares (qty %.4f)",
@@ -180,6 +183,8 @@ func (s *Saxo) PlaceBracket(ctx context.Context, b BracketOrder) (BracketResult,
 		}
 	}
 
+	b = s.bracketOnTickGrid(ctx, inst, b)
+
 	body := buildBracketBody(s.accountKey, inst, b, amount)
 
 	var resp saxoPlaceResponse
@@ -216,11 +221,18 @@ func (s *Saxo) PlaceBracket(ctx context.Context, b BracketOrder) (BracketResult,
 }
 
 // buildModifyBody constructs the PATCH /trade/v2/orders payload. Pure for tests.
+//
+// workingType is the order's current Saxo OpenOrderType. A type this package
+// cannot express (a stop leg, a stop-limit, a trailing stop) is kept as it is:
+// OrderModification only knows Market and Limit, and re-sending a bracket's
+// stop as "Limit" turned a sell stop below the market into a sell limit below
+// it, which fills at once (BR2-2).
 func buildModifyBody(
 	accountKey string,
 	inst instrument,
 	m OrderModification,
 	amount float64,
+	workingType, workingDuration string,
 ) map[string]any {
 	orderType := "Limit"
 	switch m.Type {
@@ -230,6 +242,10 @@ func buildModifyBody(
 		orderType = "Limit"
 	}
 
+	if workingType != "" && workingType != "Limit" && workingType != "Market" {
+		orderType = workingType
+	}
+
 	body := map[string]any{
 		"OrderId":       m.OrderID,
 		"AccountKey":    accountKey,
@@ -237,7 +253,7 @@ func buildModifyBody(
 		"AssetType":     inst.AssetType,
 		"Amount":        amount,
 		"OrderType":     orderType,
-		"OrderDuration": map[string]any{"DurationType": "GoodTillCancel"},
+		"OrderDuration": map[string]any{"DurationType": modifyDuration(workingDuration)},
 	}
 	if m.Side == Buy || m.Side == Sell {
 		body["BuySell"] = saxoSide(m.Side)
@@ -261,16 +277,39 @@ func (s *Saxo) ModifyOrder(ctx context.Context, m OrderModification) (OrderResul
 		return OrderResult{}, err
 	}
 
-	amount := math.Floor(m.Qty)
+	amount := floorUnits(m.Qty) // BR3-6, see SubmitOrder
 	if amount < 1 {
 		return OrderResult{}, fmt.Errorf("saxo: modify amount floors to 0 shares (qty %.4f)", m.Qty)
+	}
+
+	// The new price is in the preferred currency, like every other price the
+	// engine hands this adapter; SubmitOrder and PlaceBracket convert it to
+	// the instrument's own currency or refuse. ModifyOrder sent it as-is, so
+	// a €150 limit went out as 150 USD (BR2-2).
+	if m.Price > 0 {
+		rate, resolved := s.fxRateForCurrencyResolved(ctx, inst.Currency)
+		if !resolved {
+			return OrderResult{}, fmt.Errorf(
+				"saxo: cannot price the modification of %s: fx rate %s->%s unavailable",
+				m.OrderID,
+				inst.Currency,
+				s.preferCcy,
+			)
+		}
+
+		m.Price = s.roundToTick(ctx, inst, m.Price/rate)
+	}
+
+	working, err := s.workingOrder(ctx, m.OrderID)
+	if err != nil {
+		return OrderResult{}, err
 	}
 
 	if err := s.pace(ctx); err != nil {
 		return OrderResult{}, err
 	}
 
-	body := buildModifyBody(s.accountKey, inst, m, amount)
+	body := buildModifyBody(s.accountKey, inst, m, amount, working.Type, working.Duration)
 
 	var resp struct {
 		OrderID string `json:"OrderId"`
@@ -342,6 +381,42 @@ type saxoWorkingOrder struct {
 	DisplayAndFormat saxoDisplayFormat `json:"DisplayAndFormat"`
 }
 
+// modifyDuration is the duration a modification re-sends: the working
+// order's own. It always sent GoodTillCancel, so a modify turned the bot's
+// DayOrder limits into GTC orders that outlive the session — and, once their
+// watcher was gone, could fill days later as an untracked position (BR3-7).
+// An order whose duration the listing does not report keeps the old GTC.
+func modifyDuration(working string) string {
+	if working != "" {
+		return working
+	}
+
+	return "GoodTillCancel"
+}
+
+// workingOrder returns a working order as OpenOrders lists it (its Saxo
+// OpenOrderType and duration). An order it cannot find, or a listing that
+// fails, refuses the modification: guessing "Limit" for what may be a stop
+// leg is the failure buildModifyBody avoids.
+func (s *Saxo) workingOrder(ctx context.Context, id string) (OpenOrder, error) {
+	orders, err := s.OpenOrders(ctx)
+	if err != nil {
+		return OpenOrder{}, fmt.Errorf(
+			"saxo: cannot confirm the type of order %s before modifying it: %w",
+			id,
+			err,
+		)
+	}
+
+	for _, o := range orders {
+		if o.OrderID == id {
+			return o, nil
+		}
+	}
+
+	return OpenOrder{}, fmt.Errorf("saxo: order %s is not working; nothing to modify", id)
+}
+
 // OpenOrders lists the account's working (unfilled) orders.
 func (s *Saxo) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 	q := url.Values{}
@@ -359,17 +434,151 @@ func (s *Saxo) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 
 	out := make([]OpenOrder, 0, len(resp.Data))
 	for _, d := range resp.Data {
+		price, ccy := s.reportingPrice(ctx, d.Price, d.DisplayAndFormat.Currency)
+
 		out = append(out, OpenOrder{
 			OrderID:  d.OrderID,
-			Symbol:   strings.Split(d.DisplayAndFormat.Symbol, ":")[0],
+			Symbol:   s.symbolForUic(d.Uic, strings.Split(d.DisplayAndFormat.Symbol, ":")[0]),
 			Side:     Side(strings.ToLower(d.BuySell)),
 			Type:     d.OpenOrderType,
 			Qty:      d.Amount,
-			Price:    d.Price,
+			Price:    price,
+			Currency: ccy,
 			Status:   d.Status,
 			Duration: d.Duration.DurationType,
 		})
 	}
 
 	return out, nil
+}
+
+// reportingPrice converts a working order's price from the instrument's
+// currency into preferCcy, the currency every other price this adapter
+// reports — and ModifyOrder expects — is in. Shown raw, a USD order read
+// 163.00 in a EUR book; the operator typed 160 meaning USD, ModifyOrder took
+// it as EUR and sent 160 / 0.92 = 173.9 USD, a buy limit 7% above the
+// intended level (BR3-8). ccy is set only when the price could NOT be
+// converted, so the panel can say which currency it is in.
+func (s *Saxo) reportingPrice(ctx context.Context, price float64, native string) (float64, string) {
+	native = strings.ToUpper(strings.TrimSpace(native))
+	if price == 0 || native == "" || s.preferCcy == "" || native == s.preferCcy {
+		return price, ""
+	}
+
+	rate, resolved := s.fxRateForCurrencyResolved(ctx, native)
+	if !resolved {
+		return price, native
+	}
+
+	return price * rate, ""
+}
+
+// saxoTickScheme is an instrument's price grid: one tick size, or a ladder of
+// (price ceiling, tick) steps.
+type saxoTickScheme struct {
+	TickSize       float64 `json:"TickSize"`
+	TickSizeScheme struct {
+		DefaultTickSize float64 `json:"DefaultTickSize"`
+		Elements        []struct {
+			HighPrice float64 `json:"HighPrice"`
+			TickSize  float64 `json:"TickSize"`
+		} `json:"Elements"`
+	} `json:"TickSizeScheme"`
+}
+
+// tickAt is the tick size that applies at price, 0 when none is known.
+func (t saxoTickScheme) tickAt(price float64) float64 {
+	for _, e := range t.TickSizeScheme.Elements {
+		if price <= e.HighPrice && e.TickSize > 0 {
+			return e.TickSize
+		}
+	}
+
+	if t.TickSizeScheme.DefaultTickSize > 0 {
+		return t.TickSizeScheme.DefaultTickSize
+	}
+
+	return t.TickSize
+}
+
+// roundToTick puts price on the instrument's tick grid, to the nearest tick.
+// Saxo refuses an order price off the grid (PriceNotInTickSizeIncrements),
+// and every price the engine sends is off it: a passive limit is
+// price × (1 ± offset), then divided by an FX rate — 163.04347826 for a €150
+// limit on a USD line. Limit execution, which only Saxo actually rests, had
+// every clip refused, each evaluation (BR3-5). When the instrument details
+// cannot be read the price goes as it is, and that is said once.
+func (s *Saxo) roundToTick(ctx context.Context, inst instrument, price float64) float64 {
+	tick := s.tickScheme(ctx, inst).tickAt(price)
+	if tick <= 0 || price <= 0 {
+		return price
+	}
+
+	return roundToStep(price, tick)
+}
+
+// roundToStep rounds v to the nearest multiple of step, with the result
+// rendered at step's own decimals so no float tail (163.04000000000002)
+// leaves it off the grid again.
+func roundToStep(v, step float64) float64 {
+	n := math.Round(v / step)
+	decimals := 0
+
+	if _, frac, ok := strings.Cut(strconv.FormatFloat(step, 'f', -1, 64), "."); ok {
+		decimals = len(frac)
+	}
+
+	out, err := strconv.ParseFloat(strconv.FormatFloat(n*step, 'f', decimals, 64), 64)
+	if err != nil {
+		return n * step
+	}
+
+	return out
+}
+
+// tickScheme returns inst's tick scheme, fetched once and cached.
+func (s *Saxo) tickScheme(ctx context.Context, inst instrument) saxoTickScheme {
+	s.mu.Lock()
+	t, ok := s.ticks[inst.Uic]
+	s.mu.Unlock()
+
+	if ok {
+		return t
+	}
+
+	path := fmt.Sprintf("/ref/v1/instruments/details/%d/%s", inst.Uic, url.PathEscape(inst.AssetType))
+	if err := s.do(ctx, http.MethodGet, path, nil, &t); err != nil {
+		errlog.RecordOncef("saxo", "instrument %d: tick size unavailable (%v); order prices are sent "+
+			"unrounded and Saxo may refuse them", inst.Uic, err)
+
+		return saxoTickScheme{}
+	}
+
+	s.mu.Lock()
+	if s.ticks == nil {
+		s.ticks = make(map[int]saxoTickScheme)
+	}
+
+	s.ticks[inst.Uic] = t
+	s.mu.Unlock()
+
+	return t
+}
+
+// bracketOnTickGrid puts a bracket's entry, stop and take-profit prices on the
+// instrument's tick grid, after conversion — see roundToTick (BR3-5).
+func (s *Saxo) bracketOnTickGrid(ctx context.Context, inst instrument, b BracketOrder) BracketOrder {
+	if b.EntryType == Limit {
+		b.EntryPrice = s.roundToTick(ctx, inst, b.EntryPrice)
+	}
+
+	if b.StopLoss > 0 {
+		b.StopLoss = s.roundToTick(ctx, inst, b.StopLoss)
+	}
+
+	if b.TakeProfit > 0 {
+		b.TakeProfit = s.roundToTick(ctx, inst, b.TakeProfit)
+	}
+
+	return b
 }

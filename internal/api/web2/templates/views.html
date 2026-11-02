@@ -492,6 +492,7 @@
 </form>
 
 {{if .Error}}<p class="small muted">{{.Error}}</p>{{end}}
+{{if .Overridden}}<p class="small muted">{{call $t "opt.overridden" "symbol" .Symbol}}</p>{{end}}
 
 {{if .Rows}}
   <p class="small muted">{{call $t "opt.baselineLine"

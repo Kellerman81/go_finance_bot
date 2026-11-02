@@ -227,3 +227,139 @@ func TestCheckDrawdownSkipsWhileTestModeIsActive(t *testing.T) {
 			"observe the simulated equity at all while test mode is active", got)
 	}
 }
+
+// drawdownEngine is a forgetEngine over store with the drawdown halt at 20%
+// and the account's equity set to cash (no positions).
+func drawdownEngine(store Store, enabled bool) *Engine {
+	e, _ := forgetEngine()
+	e.store = store
+	e.SetProtectionsConfig(config.ProtectionsConfig{Enabled: enabled, MaxDrawdownPct: 0.20})
+
+	return e
+}
+
+// TestDrawdownInProgressSurvivesARestart is the regression for PR2-1. The
+// protection state was saved only when a halt tripped or on Resume, so a
+// restart in the MIDDLE of a drawdown reset the peak to the current, already
+// lower equity. With a 20% limit, a 100k peak and 85k equity, a restart and a
+// further fall to 75k — 25% below the real peak — halted nothing.
+func TestDrawdownInProgressSurvivesARestart(t *testing.T) {
+	store := &protectionStateStore{}
+
+	before := drawdownEngine(store, true)
+	before.pf.SetCash(100000)
+	before.checkDrawdown()
+	before.pf.SetCash(85000) // -15%: no halt yet
+	before.checkDrawdown()
+
+	if halted, _ := before.Protections().Halted(); halted {
+		t.Fatal("halted at -15% under a 20% limit; the scenario did not set up")
+	}
+
+	after := drawdownEngine(store, true) // the restart, sharing only the store
+	after.pf.SetCash(75000)              // -25% from the real 100k peak
+	after.checkDrawdown()
+
+	if halted, _ := after.Protections().Halted(); !halted {
+		t.Error("equity 25% below the pre-restart peak did not halt — the restart reset the drawdown baseline")
+	}
+}
+
+// TestHaltSurvivesARestartWhileProtectionsAreOff is the regression for PR2-2.
+// A disabled manager is nil from protect.New, so a restart with protections
+// off had nothing to restore into, and enabling them later built a clean
+// manager: the halt was gone without anyone resuming it, and the next save
+// overwrote the stored halt for good.
+func TestHaltSurvivesARestartWhileProtectionsAreOff(t *testing.T) {
+	store := &protectionStateStore{}
+
+	before := drawdownEngine(store, true)
+	before.pf.SetCash(100000)
+	before.checkDrawdown()
+	before.pf.SetCash(70000) // -30%: halts and persists
+	before.checkDrawdown()
+
+	after := drawdownEngine(store, false) // restarted with protections switched off
+	after.SetProtectionsConfig(config.ProtectionsConfig{Enabled: true, MaxDrawdownPct: 0.20})
+
+	if halted, _ := after.Protections().Halted(); !halted {
+		t.Error("re-enabling protections after a restart dropped the stored halt nobody resumed")
+	}
+}
+
+// countingProtStore is a protectionStateStore that counts its saves.
+type countingProtStore struct {
+	protectionStateStore
+
+	saves int
+}
+
+func (s *countingProtStore) SaveProtectionState(st protect.State) error {
+	s.saves++
+
+	return s.protectionStateStore.SaveProtectionState(st)
+}
+
+// TestRisingPeakSavesAreThrottled pins the cost side of the PR2-1 fix:
+// checkDrawdown runs every sync, and a climbing account raises the peak on
+// most of them. Only a material change (new day, halt, realized counters, a
+// lowered peak) saves at once; a peak that merely rose waits for the throttle,
+// so the evaluation path does not write the database every 30 s.
+func TestRisingPeakSavesAreThrottled(t *testing.T) {
+	store := &countingProtStore{}
+
+	e := drawdownEngine(store, true)
+	for i := range 20 {
+		e.pf.SetCash(100000 + float64(i)*100) // a new peak every sync
+		e.checkDrawdown()
+	}
+
+	if store.saves != 1 {
+		t.Errorf("20 syncs of a rising peak saved %d times, want 1 (the first sight of the day)", store.saves)
+	}
+}
+
+// TestLoweredPeakIsSavedAtOnce covers the forced PR2-1 save: ForgetOpenPosition
+// lowers the peak to undo a phantom holding's inflation, and a restart that
+// restored the old peak would trip exactly the false halt LowerPeak prevented.
+func TestLoweredPeakIsSavedAtOnce(t *testing.T) {
+	store := &countingProtStore{}
+
+	e := drawdownEngine(store, true)
+	e.pf.SetCash(100000)
+	e.checkDrawdown()
+
+	e.openPos["X"] = &OpenPosition{Symbol: "X", Qty: 10, EntryPrice: 100}
+	e.prices.Set("X", 100)
+	e.checkDrawdown() // the phantom 1000 is overlaid: peak 101000
+
+	before := store.saves
+
+	e.ForgetOpenPosition("X")
+
+	if store.saves == before {
+		t.Fatal("lowering the peak on a forget was not saved")
+	}
+
+	if store.saved.PeakEquity >= 101000 {
+		t.Errorf("saved peak %v still carries the forgotten phantom", store.saved.PeakEquity)
+	}
+}
+
+// TestProtectedEquityCountsPendingFills is the regression for PR2-8: Resume
+// re-based the protections on the raw broker snapshot, while checkDrawdown
+// measures with pending fills overlaid. With a buy still settling at resume
+// time the raw figure was low by the cash that buy committed, so the day's
+// starting equity was set too low for the rest of the UTC day. Resume now
+// uses this, the figure checkDrawdown measures.
+func TestProtectedEquityCountsPendingFills(t *testing.T) {
+	e, _ := forgetEngine()
+	e.pf.SetCash(9000) // 1000 already spent on a fill the broker has not reported
+
+	e.openPos["X"] = &OpenPosition{Symbol: "X", Qty: 10, EntryPrice: 100, EntryTime: time.Now()}
+	e.prices.Set("X", 100)
+
+	if got := e.ProtectedEquity(); got != 10000 {
+		t.Errorf("ProtectedEquity = %v, want 10000 (9000 cash + the 1000 pending fill)", got)
+	}
+}

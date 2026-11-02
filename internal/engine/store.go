@@ -36,6 +36,17 @@ type OpenPosition struct {
 	// backtested candidate was net, and internal/autotune compared the two
 	// directly. See CODE_REVIEW_FINDINGS.md's EN-1 finding.
 	EntryCommission float64 `json:"entry_commission,omitempty"`
+	// TrailFloor is the lowest the trailing stop may sit, set when the
+	// position is added to: an add re-bases the peak to the new average, and
+	// the trail level in force just before it is kept as a floor so the trail
+	// never moves down because of the add. See exits.RebaseOnAdd (EX2-1).
+	TrailFloor float64 `json:"trail_floor,omitempty"`
+	// TrailFloorKey names the trailing settings TrailFloor was computed under
+	// (exits.TrailKey). The floor lapses once they change: a position that was
+	// ever added to otherwise kept firing at the OLD tight trail after the
+	// operator widened it, while every other position took the new one
+	// (EX3-5). Empty — a row from before the key — keeps the floor.
+	TrailFloorKey string `json:"trail_floor_key,omitempty"`
 }
 
 // Store is the persistence contract the engine depends on. Implementations live

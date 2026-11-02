@@ -176,11 +176,16 @@ func TestVerdictExpires(t *testing.T) {
 	clock := func() time.Time { return start.Add(time.Duration(offset.Load())) }
 
 	a := testAdvisor(t, config.AIConfig{
-		Blocking: true, RefreshInterval: time.Hour, MaxAge: 30 * time.Minute,
+		Blocking: true, RefreshInterval: 30 * time.Minute, MaxAge: 30 * time.Minute,
 	}, func(context.Context, Features) (Verdict, error) {
 		return Verdict{Action: Buy, Confidence: 0.9, At: clock()}, nil
 	})
 	a.now = clock
+	// A refresh interval longer than max_age is refused at load (AI3-4); set
+	// on the advisor directly it isolates the staleness rule, which still
+	// matters on its own — a refresh can fail, and the old verdict must then
+	// expire rather than vote forever.
+	a.cfg.RefreshInterval = time.Hour
 
 	if _, ok := a.Verdict("TSLA", feats("TSLA", 1)); !ok {
 		t.Fatal("want a fresh verdict")
@@ -516,4 +521,67 @@ func (fixedCompleter) Name() string { return "stub" }
 // Complete returns the canned answer.
 func (c fixedCompleter) Complete(context.Context, string, string) (string, error) {
 	return c.answer, nil
+}
+
+// TestBlockingAdvisorRunsOnTheBarClock is the regression for AI2-1. A
+// blocking advisor — the backtest of it config.example.yaml tells operators to
+// run before trusting "ai" — timed refresh_interval and max_age on the WALL
+// clock, while a replay races through bars in milliseconds. After the first
+// bar every bar replayed in the next 15 real minutes got that first verdict
+// back: 1 model call for 1000 bars. On the bar's own clock, bars 20 simulated
+// minutes apart must each get asked.
+func TestBlockingAdvisorRunsOnTheBarClock(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	a := testAdvisor(t, config.AIConfig{Blocking: true, RefreshInterval: 15 * time.Minute},
+		func(context.Context, Features) (Verdict, error) {
+			calls++
+
+			return Verdict{Action: Buy, Confidence: 0.9}, nil
+		})
+
+	base := time.Date(2026, 1, 5, 14, 30, 0, 0, time.UTC)
+
+	for i := range 5 {
+		f := Features{Symbol: "X", RSI: float64(30 + 10*i), At: base.Add(time.Duration(i) * 20 * time.Minute)}
+		if _, ok := a.Verdict("X", f); !ok {
+			t.Fatalf("bar %d: no usable verdict on the bar clock", i)
+		}
+	}
+
+	if calls != 5 {
+		t.Errorf("5 bars 20 simulated minutes apart made %d model calls, want 5 (one per refresh interval of market time)", calls)
+	}
+}
+
+// TestUnchangedReadingStillRefreshesOnceExpired is the regression for AI2-5:
+// a refresh was only due when the fingerprint changed, so in a quiet market
+// the verdict aged past max_age with nothing ever asking again and the
+// detector voted "awaiting model" until some reading moved.
+func TestUnchangedReadingStillRefreshesOnceExpired(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	a := testAdvisor(t, config.AIConfig{
+		Blocking: true, RefreshInterval: 15 * time.Minute, MaxAge: 30 * time.Minute,
+	}, func(context.Context, Features) (Verdict, error) {
+		calls++
+
+		return Verdict{Action: Buy, Confidence: 0.9}, nil
+	})
+
+	base := time.Date(2026, 1, 5, 14, 30, 0, 0, time.UTC)
+	f := Features{Symbol: "X", RSI: 50, At: base}
+
+	a.Verdict("X", f)
+
+	f.At = base.Add(45 * time.Minute) // same reading, verdict now past max_age
+	if _, ok := a.Verdict("X", f); !ok {
+		t.Error("an expired verdict on an unchanged reading was not refreshed: no usable verdict")
+	}
+
+	if calls != 2 {
+		t.Errorf("model calls = %d, want 2", calls)
+	}
 }

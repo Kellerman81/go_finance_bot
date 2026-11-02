@@ -12,6 +12,7 @@ package screener
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -44,8 +45,16 @@ type Verdict struct {
 	ATRPct    float64 `json:"atr_pct"`
 	SpreadPct float64 `json:"spread_pct"` // estimated bid-ask spread (Corwin-Schultz), as a fraction of price
 	Rank      float64 `json:"rank"`
-	Bars      int     `json:"bars"`
-	Momentum  float64 `json:"momentum_pct"`
+	// Unmeasured is set when the candidate could not be judged at all — its
+	// history fetch failed or returned nothing. That says something about the
+	// provider, not the instrument; see engine.rescreen, which keeps such a
+	// symbol on the watchlist rather than dropping it (SC2-3).
+	Unmeasured bool `json:"unmeasured,omitempty"`
+	// rankTier orders verdicts before Rank does: Rank is only comparable
+	// within one tier. See rankTierOf.
+	rankTier int
+	Bars     int     `json:"bars"`
+	Momentum float64 `json:"momentum_pct"`
 
 	// AssetClass is what the candidate was judged AS — which profile's
 	// resolution, filters and thresholds produced this verdict. Empty means
@@ -143,7 +152,7 @@ type Probe struct {
 	Trades        int     `json:"trades"`
 	ReturnPct     float64 `json:"return_pct"`
 	WinRatePct    float64 `json:"win_rate_pct"`
-	ExpectancyPct float64 `json:"expectancy_pct"`
+	ExpectancyPct float64 `json:"expectancy_pct"` // a FRACTION per trade (0.008 = 0.8%)
 	// Score is the probe's own ranking number, comparable only within one
 	// Source.
 	Score float64 `json:"score"`
@@ -296,7 +305,16 @@ func (s *Screener) Screen(ctx context.Context, in Inputs) Result {
 	// best-first, so a large universe costs no more searches than a small one.
 	s.probeAll(ctx, passed, out.Verdicts)
 
-	out.Selected = s.selectPerClass(passed)
+	out.Selected = s.selectPerClass(passed, s.heldSectors(out.Verdicts, held), held)
+
+	// The bars were working state for the probe stage. publishVerdict
+	// cleared them only on verdicts it probed, so every other passing
+	// verdict — all of them with probing off — kept its whole series in the
+	// Result the engine stores until the next pass: tens of MB held for six
+	// hours for nothing (SC3-7).
+	for i := range out.Verdicts {
+		out.Verdicts[i].candles = nil
+	}
 
 	// Protected symbols are tracked whether or not they ranked, and whether or
 	// not the cap had room.
@@ -311,10 +329,29 @@ func (s *Screener) Screen(ctx context.Context, in Inputs) Result {
 	return out
 }
 
+// heldSectors is the sector budget the held positions already spend, keyed
+// like sectorBudgetKey. risk.PortfolioGuard's max_positions_per_sector counts
+// held positions, and the screener's budget did not: with two tech names held
+// and both caps at 2, the screener still picked two tech discoveries and the
+// guard refused every buy of them — the blocked-trade stream
+// max_symbols_per_sector exists to stop (SC3-6). Held symbols still never
+// drop; they only count.
+func (s *Screener) heldSectors(verdicts []Verdict, held map[string]bool) map[string]int {
+	sectors := make(map[string]int)
+
+	for _, v := range verdicts {
+		if held[v.Symbol] && v.Sector != "" {
+			sectors[s.sectorBudgetKey(v)]++
+		}
+	}
+
+	return sectors
+}
+
 // selectPerClass ranks and caps each class independently, then concatenates
 // them in a stable class order so two identical passes produce an identical
-// list.
-func (s *Screener) selectPerClass(passed map[string][]Verdict) []string {
+// list. sectors starts as what the held positions spend (see heldSectors).
+func (s *Screener) selectPerClass(passed map[string][]Verdict, sectors map[string]int, held map[string]bool) []string {
 	classes := make([]string, 0, len(passed))
 	for class := range passed {
 		classes = append(classes, class)
@@ -328,13 +365,11 @@ func (s *Screener) selectPerClass(passed map[string][]Verdict) []string {
 	// on a different rule than the guard enforces would just move the
 	// disagreement rather than fix it. Classes are walked in sorted order so
 	// the same input always produces the same selection.
-	sectors := make(map[string]int)
-
-	var out []string
+	out := make([]string, 0, len(classes))
 
 	for _, class := range classes {
 		cfg := s.cfg.ForAssetClass(class)
-		out = append(out, s.rankAndCap(cfg, passed[class], sectors)...)
+		out = append(out, s.rankAndCap(cfg, passed[class], sectors, held)...)
 	}
 
 	return out
@@ -353,7 +388,14 @@ func (s *Screener) candidatesByClass(ctx context.Context, current []string) map[
 	out := make(map[string][]string, len(pool))
 
 	for _, sym := range pool {
-		out[s.classOf(ctx, sym)] = append(out[s.classOf(ctx, sym)], sym)
+		// Once per symbol. Both sides of the old one-liner called classOf,
+		// which can be a fresh provider lookup each time; when the first
+		// failed and the second succeeded, the unclassified bucket was
+		// overwritten with the other class's symbols — those screened twice,
+		// the unclassified ones never (SC2-4).
+		c := s.classOf(ctx, sym)
+
+		out[c] = append(out[c], sym)
 	}
 
 	return out
@@ -473,6 +515,7 @@ func (s *Screener) rankAndCap(
 	cfg config.ScreenerConfig,
 	passed []Verdict,
 	sectors map[string]int,
+	held map[string]bool,
 ) []string {
 	sortByRank(passed)
 
@@ -492,7 +535,9 @@ func (s *Screener) rankAndCap(
 		// the next candidate down may be in a different industry, and it is
 		// exactly that substitution the cap exists to make. An unsectored
 		// symbol is exempt, matching the guard.
-		if cfg.MaxSymbolsPerSector > 0 && v.Sector != "" {
+		// A held symbol already counted in sectors (heldSectors) and is
+		// never refused for its own sector.
+		if cfg.MaxSymbolsPerSector > 0 && v.Sector != "" && !held[v.Symbol] {
 			key := s.sectorBudgetKey(v)
 			if sectors[key] >= cfg.MaxSymbolsPerSector {
 				continue
@@ -572,10 +617,14 @@ func (s *Screener) sectorBudgetKey(v Verdict) string {
 	return v.AssetClass + "/" + v.Sector
 }
 
-// sortByRank orders verdicts best-first. Ties break on symbol so a pass is
-// reproducible.
+// sortByRank orders verdicts best-first: by tier, then by Rank within it. Ties
+// break on symbol so a pass is reproducible.
 func sortByRank(v []Verdict) {
 	slices.SortStableFunc(v, func(a, b Verdict) int {
+		if c := cmp.Compare(b.rankTier, a.rankTier); c != 0 {
+			return c
+		}
+
 		if c := cmp.Compare(b.Rank, a.Rank); c != 0 {
 			return c
 		}
@@ -607,12 +656,37 @@ func (s *Screener) judge(
 	candles, err := s.history.Candles(ctx, symbol, res, from, to)
 	if err != nil {
 		v.Reason = "history unavailable: " + err.Error()
+		v.Unmeasured = true
+
+		return v
+	}
+
+	if len(candles) == 0 {
+		v.Reason = "history unavailable: the provider returned no bars"
+		v.Unmeasured = true
+
+		return v
+	}
+
+	// A history source may serve coarser bars than asked for — Yahoo falls
+	// back to hourly or daily when it has too few at the interval, over the
+	// fallback's whole range. Judged as the requested resolution, every
+	// per-bar measure moved the way that flatters a thin listing: volume 4×
+	// or ~26× per bar, a bar count that clears min_history_bars, ATR and
+	// drawdown over a different window — so the very "too few intraday bars"
+	// case the screener exists to refuse passed, labelled "15" (SC3-3,
+	// MK3-4). Too few bars at the requested resolution IS the measurement.
+	if gap, ok := market.FinestBarGap(candles); ok && gap > market.ResolutionDuration(res)*3/2 {
+		v.Bars = len(candles)
+		v.Reason = fmt.Sprintf("too few bars at resolution %s: the provider served %s bars instead",
+			res, gap.Round(time.Minute))
+
 		return v
 	}
 
 	cols := columns(candles)
 	m := measure(cols)
-	m.measureCost(cols, s.costs.CommissionPct)
+	m.measureCost(cols, s.costs)
 
 	v.Bars, v.Price, v.AvgVol = m.Bars, m.Price, m.AvgVol
 	v.ATRPct, v.SpreadPct, v.Momentum = m.ATRPct, m.SpreadPct, m.Momentum

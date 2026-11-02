@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
@@ -89,9 +91,7 @@ func (e *Engine) EnableTestMode(ctx context.Context, dur time.Duration) error {
 	// could not see that history rejected every one of them with "sim: no price
 	// for X", once per evaluation, forever. See CODE_REVIEW_FINDINGS.md's TM-1.
 	sim := broker.NewSim(acct.Cash, e.ReferencePrice, costs.Commission)
-	sim.SetSlippage(func(_ string, buy bool, price float64) float64 {
-		return costs.FillPrice(buy, price)
-	})
+	e.installSimFriction(sim) // per-symbol, like the startup sim (CM2-3)
 	sim.SeedPositions(acct.Cash, positions)
 
 	var deadline time.Time
@@ -110,6 +110,18 @@ func (e *Engine) EnableTestMode(ctx context.Context, dur time.Duration) error {
 	spendDay, spendAmount := e.rm.Day(), e.rm.SpentToday()
 
 	e.mu.Lock()
+
+	// A real limit order still resting would be filled by the REAL broker
+	// during the window, but booked as simulated — no protections, no
+	// realized-drawdown input — and then undone by the book restore at the
+	// end (PR3-2). Wait for it rather than lose it.
+	if n := len(e.restingWatchers); n > 0 {
+		e.mu.Unlock()
+
+		return fmt.Errorf("test mode refused: real limit orders are still working for %d symbol(s) — wait for them to fill or time out", n)
+	}
+
+	e.testModeBook = e.snapshotBookLocked()
 	e.testModeRealBrk = realBrk
 	e.brk = sim
 	e.testModeActive = true
@@ -148,6 +160,15 @@ func (e *Engine) EndTestMode(reason string) {
 	realBrk := e.testModeRealBrk
 	spendDay, spendAmount := e.testModeSpendDay, e.testModeSpend
 
+	// Put the real position bookkeeping back. Simulated buys left records
+	// for stock the real account never bought — read by pendingExposure as
+	// fills still settling, they lifted the drawdown peak by their value
+	// and tripped a false halt when the overlay expired ten minutes later
+	// (the TM-3 09:19 halt: peak 1310.98 against 909.89, the gap exactly the
+	// simulated buys) — and simulated sells deleted real records (EN3-1).
+	touched := e.restoreBookLocked(e.testModeBook)
+	e.testModeBook = nil
+
 	e.brk = realBrk
 	e.testModeActive = false
 	e.testModeDeadline = time.Time{}
@@ -160,6 +181,14 @@ func (e *Engine) EndTestMode(reason string) {
 	// it. Restore itself drops the figure if the window crossed midnight,
 	// which is the right answer there too.
 	e.rm.Restore(spendDay, spendAmount)
+	e.persistSpend() // the real figure; nothing was written during the window (SG3-1)
+
+	// The store still holds the pre-window rows (nothing was persisted while
+	// simulating); re-persisting every symbol either side touched makes that
+	// certain, deleting any row the window created.
+	for _, sym := range touched {
+		e.persistOpenPosition(sym, "open position after test mode")
+	}
 
 	// Restore the dashboard/portfolio to the real broker's actual current
 	// state — untouched by any simulated order, but prices/time have moved
@@ -186,4 +215,67 @@ func (e *Engine) checkTestModeExpiry(_ context.Context) {
 	if expired {
 		e.EndTestMode("training window elapsed")
 	}
+}
+
+// bookSnapshot is the engine's real per-position bookkeeping, held while test
+// mode runs (EN3-1).
+type bookSnapshot struct {
+	openPos     map[string]OpenPosition
+	peaks       map[string]float64
+	roundTrip   map[string]roundTripOutcome
+	pendingSell map[string]float64
+}
+
+// snapshotBookLocked copies the bookkeeping simulated fills would change.
+// e.mu must be held.
+func (e *Engine) snapshotBookLocked() *bookSnapshot {
+	b := &bookSnapshot{
+		openPos:     make(map[string]OpenPosition, len(e.openPos)),
+		peaks:       maps.Clone(e.peaks),
+		roundTrip:   maps.Clone(e.roundTrip),
+		pendingSell: maps.Clone(e.pendingSell),
+	}
+
+	for sym, p := range e.openPos {
+		b.openPos[sym] = *p
+	}
+
+	return b
+}
+
+// restoreBookLocked puts b back and returns every symbol whose open-position
+// record existed on either side, for re-persisting. e.mu must be held.
+func (e *Engine) restoreBookLocked(b *bookSnapshot) []string {
+	if b == nil {
+		return nil
+	}
+
+	seen := make(map[string]bool, len(e.openPos)+len(b.openPos))
+	for sym := range e.openPos {
+		seen[sym] = true
+	}
+
+	e.openPos = make(map[string]*OpenPosition, len(b.openPos))
+
+	for sym, p := range b.openPos {
+		cp := p
+		e.openPos[sym] = &cp
+		seen[sym] = true
+	}
+
+	e.peaks = orEmpty(b.peaks)
+	e.roundTrip = b.roundTrip
+	e.pendingSell = orEmpty(b.pendingSell)
+
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// orEmpty returns m, or an empty map in place of nil, for maps the engine
+// writes to without a nil check.
+func orEmpty[V any](m map[string]V) map[string]V {
+	if m == nil {
+		return make(map[string]V)
+	}
+
+	return m
 }

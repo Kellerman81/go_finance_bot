@@ -22,6 +22,17 @@ import (
 // same equity denominator, same "a flat row is not a position" rule — because a
 // panel that disagreed with the limit it displays would be worse than no panel.
 
+// applyCap fills in a capped row's ceiling, headroom and at-cap flag.
+func (r *allocationRow) applyCap(capFrac, equity float64) {
+	r.Capped = true
+	r.CapPct = capFrac * 100
+	// No equity, no binding cap: the guard allows everything at equity <= 0
+	// (it cannot form a share), and "Value >= 0" would mark every capped row
+	// at its cap (AP2-7).
+	r.AtCap = equity > 0 && r.Value >= capFrac*equity
+	r.HeadroomPct = max(r.CapPct-r.PctEquity, 0)
+}
+
 // allocationRow is one asset class's share of the book.
 type allocationRow struct {
 	// Class is the canonical label, or "" for the row holding everything
@@ -65,8 +76,8 @@ func allocation(
 	// another here — the panel then showed an uncapped "ETF" row holding the
 	// position next to a capped "etf" row reading 0% used, while the guard was
 	// refusing buys against the cap the panel called absent. Same function,
-	// same buckets. See risk.NormalizeLabels.
-	classes = risk.NormalizeLabels(classes)
+	// same buckets. See risk.NormalizeClassLabels.
+	classes = risk.NormalizeClassLabels(classes)
 
 	rows := make(map[string]*allocationRow, len(caps)+len(snap.Holdings))
 
@@ -93,8 +104,8 @@ func allocation(
 	}
 
 	for sym, h := range snap.Holdings {
-		if h.Qty <= 0 {
-			continue // a flat row is not a position, matching the guard
+		if !h.Held() {
+			continue // a flat or dust row is not a position, matching the guard (PF3-4)
 		}
 
 		r := row(classes[strings.ToUpper(strings.TrimSpace(sym))])
@@ -110,10 +121,7 @@ func allocation(
 		}
 
 		if capFrac, ok := caps[capKey(class)]; ok && capFrac > 0 {
-			r.Capped = true
-			r.CapPct = capFrac * 100
-			r.AtCap = r.Value >= capFrac*equity
-			r.HeadroomPct = max(r.CapPct-r.PctEquity, 0)
+			r.applyCap(capFrac, equity)
 		}
 
 		out = append(out, *r)

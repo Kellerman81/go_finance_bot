@@ -24,12 +24,18 @@ type watchLimitBroker struct {
 	canCancel   bool
 	fallback    broker.OrderResult // SubmitOrder's result for the market-fallback clip
 	fallbackErr error
-	cash        float64 // GetAccount's reported cash; syncPortfolio applies it over any SetCash a test made
+	cash        float64           // GetAccount's reported cash; syncPortfolio applies it over any SetCash a test made
+	positions   []broker.Position // GetPositions' report — what the venue says is held after the cancel
+	sent        *[]broker.Order   // when non-nil, every submitted order is appended here
 }
 
 func (watchLimitBroker) Name() string { return "watchlimit" }
 
-func (b watchLimitBroker) SubmitOrder(_ context.Context, _ broker.Order) (broker.OrderResult, error) {
+func (b watchLimitBroker) SubmitOrder(_ context.Context, o broker.Order) (broker.OrderResult, error) {
+	if b.sent != nil {
+		*b.sent = append(*b.sent, o)
+	}
+
 	return b.fallback, b.fallbackErr
 }
 
@@ -42,7 +48,9 @@ func (b watchLimitBroker) GetAccount(context.Context) (broker.Account, error) {
 	return broker.Account{Cash: cash}, nil
 }
 
-func (watchLimitBroker) GetPositions(context.Context) ([]broker.Position, error) { return nil, nil }
+func (b watchLimitBroker) GetPositions(context.Context) ([]broker.Position, error) {
+	return b.positions, nil
+}
 
 // watchLimitBrokerWithLister adds OpenOrders (broker.OrderLister).
 type watchLimitBrokerWithLister struct{ watchLimitBroker }
@@ -415,4 +423,206 @@ func TestSubmitPlanWatchesTheRemainderOfAPartiallyFilledLimitClip(t *testing.T) 
 	}
 
 	t.Error("no watcher ran for the working remainder of a partially-filled limit clip")
+}
+
+// cancellingBroker builds a watchLimitBroker that lists ord-1 as still
+// working, cancels it successfully, fills the market fallback in full, and
+// records every order sent.
+func cancellingBroker(sent *[]broker.Order, positions []broker.Position) watchLimitBrokerWithCanceller {
+	return watchLimitBrokerWithCanceller{watchLimitBrokerWithLister{watchLimitBroker{
+		listOrders: true, openOrders: []broker.OpenOrder{{OrderID: "ord-1"}},
+		fallback:  broker.OrderResult{ID: "ord-2", Terminal: true, FilledQty: 0, Status: "filled"},
+		positions: positions,
+		sent:      sent,
+		cash:      1e6, // headroom is not what these tests are about
+	}}}
+}
+
+// TestMarketFallbackBuyRespectsAHaltDuringTheLimitWindow is the regression for
+// EN2-4: the market fallback after an unfilled limit BUY went straight to the
+// broker. A drawdown halt, the kill switch or a breaker trip during the
+// limit_timeout window did not stop it, and neither did the risk limits —
+// it skipped tradingOn, guardOrderRate and Authorize. That is a fresh
+// commitment of money made minutes after the decision, while trading is off:
+// exactly what "fail closed on money" forbids.
+func TestMarketFallbackBuyRespectsAHaltDuringTheLimitWindow(t *testing.T) {
+	var sent []broker.Order
+
+	e := watchLimitEngine(cancellingBroker(&sent, nil))
+	e.cfg.Execution.MarketFallback = true
+	e.tradingEnabled = false // halted while the limit rested
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 5, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 0 {
+		t.Fatalf("fallback buy sent %+v while trading was disabled", sent)
+	}
+
+	if trades := e.Trades(); len(trades) == 0 || trades[0].Status != "blocked" {
+		t.Errorf("trades = %+v, want the skipped fallback recorded as blocked", trades)
+	}
+}
+
+// TestMarketFallbackBuyIsAuthorized is the risk-limit half of EN2-4: the
+// fallback buy is re-authorized against current headroom, so it is clamped by
+// max_order_value like any other buy instead of going out at the clip size.
+func TestMarketFallbackBuyIsAuthorized(t *testing.T) {
+	var sent []broker.Order
+
+	e := watchLimitEngine(cancellingBroker(&sent, nil))
+	e.cfg.Execution.MarketFallback = true
+	e.rm = risk.New(config.Limits{
+		MaxOrderValue: 200, MaxPerPosition: 1e9, MaxTotalInvested: 1e9,
+		MaxDailySpend: 1e9, MaxOpenPositions: 10,
+	}, config.CostsConfig{})
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 5, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 1 || sent[0].Qty > 2 {
+		t.Fatalf("fallback sent %+v, want one order clamped to max_order_value (<= 2 shares at 100)", sent)
+	}
+}
+
+// TestMarketFallbackSellIsNotGatedByAHalt pins the asymmetry: an exit's
+// fallback must still go out while trading is off (invariant 1).
+func TestMarketFallbackSellIsNotGatedByAHalt(t *testing.T) {
+	var sent []broker.Order
+
+	e := watchLimitEngine(cancellingBroker(&sent, []broker.Position{{Symbol: "X", Qty: 5, Current: 100}}))
+	e.cfg.Execution.MarketFallback = true
+	e.tradingEnabled = false
+	e.openPos["X"] = &OpenPosition{Symbol: "X", Qty: 5, OrigQty: 5, EntryPrice: 90}
+
+	order := broker.Order{Symbol: "X", Side: broker.Sell, Qty: 5, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 1 || sent[0].Side != broker.Sell || sent[0].Qty != 5 {
+		t.Fatalf("fallback sell sent %+v while halted, want one 5-share sell", sent)
+	}
+}
+
+// TestMarketFallbackSendsOnlyWhatDidNotFillWhileResting is the regression for
+// EN2-5, the half of LS-6 the earlier fix did not reach. A limit order can
+// fill partially at any point while it rests, and OpenOrder carries no filled
+// quantity. The watcher assumed a successful cancel meant nothing had filled
+// and re-sent the whole clip: 60 of 100 filled, then 100 more at market — 160
+// bought, above the authorised size, and the 60 never booked.
+func TestMarketFallbackSendsOnlyWhatDidNotFillWhileResting(t *testing.T) {
+	var sent []broker.Order
+
+	// The venue reports 60 held after the cancel; the engine has no record
+	// (a resting clip is never booked at submission).
+	e := watchLimitEngine(cancellingBroker(&sent, []broker.Position{{Symbol: "X", Qty: 60, Current: 100}}))
+	e.cfg.Execution.MarketFallback = true
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 100, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 1 || sent[0].Qty != 40 {
+		t.Fatalf("fallback sent %+v, want one order for the 40 unfilled shares", sent)
+	}
+
+	if p, ok := e.openPos["X"]; !ok || p.Qty != 60 {
+		t.Errorf("open position = %+v, want the 60 that filled while resting booked", p)
+	}
+}
+
+// TestMarketFallbackSellNeverExceedsTheHolding is EN2-5's sell side: a limit
+// sell that partly filled while resting must not re-sell the whole clip, which
+// would sell stock that is already gone.
+func TestMarketFallbackSellNeverExceedsTheHolding(t *testing.T) {
+	var sent []broker.Order
+
+	e := watchLimitEngine(cancellingBroker(&sent, []broker.Position{{Symbol: "X", Qty: 40, Current: 100}}))
+	e.cfg.Execution.MarketFallback = true
+	e.openPos["X"] = &OpenPosition{Symbol: "X", Qty: 100, OrigQty: 100, EntryPrice: 90}
+
+	order := broker.Order{Symbol: "X", Side: broker.Sell, Qty: 100, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 1 || sent[0].Qty != 40 {
+		t.Fatalf("fallback sent %+v, want one sell of the 40 still held", sent)
+	}
+}
+
+// TestMarketFallbackDoesNotClaimASiblingSlicesFill guards the EN2-5 fix
+// against its own failure mode, found in verification. submitPlan starts one
+// watcher per resting slice and they share limit_timeout, so they wake
+// together. Measuring "broker holding minus record" then lets every slice
+// claim the same excess — openPos ends above the broker's holding and each
+// fallback is too small — and a sibling that filled in full is claimed as
+// this one's partial. With another slice still in flight the excess cannot be
+// attributed, so no buy fallback is sent at all: under-buying is the safe side.
+func TestMarketFallbackDoesNotClaimASiblingSlicesFill(t *testing.T) {
+	var sent []broker.Order
+
+	e := watchLimitEngine(cancellingBroker(&sent, []broker.Position{{Symbol: "X", Qty: 60, Current: 100}}))
+	e.cfg.Execution.MarketFallback = true
+	e.restingWatchers = map[string]int{"X": 1} // a sibling slice is still resting
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 100, Type: broker.Limit, LimitPx: 100}
+	e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+
+	if len(sent) != 0 {
+		t.Errorf("fallback sent %+v with a sibling slice in flight, want none", sent)
+	}
+
+	if _, booked := e.openPos["X"]; booked {
+		t.Error("booked a sibling's fill as this slice's partial")
+	}
+}
+
+// TestLimitExecutionNeedsABrokerThatCanManageIt is the regression for EN2-6
+// (and the test-mode half of EN2-9). A resting limit needs a watcher that can
+// see and cancel it; on a broker that can do neither (Alpaca here, Sim in test
+// mode) the watcher gave up, so an expired limit SELL left pendingSell equal to
+// the holding forever — stop-losses blocked — and buy reservations were never
+// released. Such a broker gets market orders instead.
+func TestLimitExecutionNeedsABrokerThatCanManageIt(t *testing.T) {
+	e := watchLimitEngine(asyncBroker{}) // no OrderLister, no OrderCanceller
+	e.cfg.Execution.Type = "limit"
+
+	if got := e.planningExecutionConfig().Type; got != "market" {
+		t.Errorf("limit execution on a broker that cannot list or cancel planned %q, want market", got)
+	}
+
+	e.brk = watchLimitBrokerWithCanceller{}
+	if got := e.planningExecutionConfig().Type; got != "limit" {
+		t.Errorf("limit execution on a broker that can manage it planned %q, want limit", got)
+	}
+}
+
+// TestWatcherKeepsTheBrokerItsOrderWentTo is the regression for EN2-9's
+// broker-swap half: the watcher re-read e.brk when it woke, so test mode
+// starting during the wait pointed a REAL order's watcher at the simulated
+// broker, which cannot cancel — the real order was abandoned at the venue.
+func TestWatcherKeepsTheBrokerItsOrderWentTo(t *testing.T) {
+	real := watchLimitBrokerWithCanceller{watchLimitBrokerWithLister{watchLimitBroker{
+		listOrders: true, openOrders: []broker.OpenOrder{{OrderID: "ord-1"}},
+	}}}
+
+	e := watchLimitEngine(real)
+	e.cfg.Execution.LimitTimeout = 50 * time.Millisecond
+	e.cfg.Execution.MarketFallback = false
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 5, Type: broker.Limit, LimitPx: 100}
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		e.watchLimitOrder(context.Background(), broker.OrderResult{ID: "ord-1"}, order, 0)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	e.mu.Lock()
+	e.brk = asyncBroker{} // test mode began: orders now go to a broker that cannot cancel
+	e.mu.Unlock()
+
+	<-done
+
+	if trades := e.Trades(); len(trades) == 0 || trades[0].Status != "cancelled" {
+		t.Errorf("trades = %+v, want the real order cancelled at the broker it was sent to", trades)
+	}
 }

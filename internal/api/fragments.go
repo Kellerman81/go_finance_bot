@@ -115,11 +115,20 @@ func (s *Server) fragPositions(c *gin.Context) {
 	// running once per holding inside a page render.
 	port, _, classes := s.eng.PortfolioConfig()
 
+	// No caps while portfolio limits are off: the guard is nil then and
+	// enforces nothing, and a panel showing ceilings and "At cap" there
+	// described limits that do not bind (AP2-7).
+	var caps map[string]float64
+
+	if port.Enabled {
+		caps = port.NormalizedAssetClassCaps()
+	}
+
 	render(c, "positions", map[string]any{
 		"Holdings":   sortedHoldings(snap),
 		"Tracked":    tracked,
 		"Drift":      reconcile(snap, tracked),
-		"Allocation": allocation(snap, classes, port.NormalizedAssetClassCaps()),
+		"Allocation": allocation(snap, classes, caps),
 	})
 }
 
@@ -172,7 +181,9 @@ func reconcile(snap portfolio.Snapshot, tracked []engine.OpenPosition) []driftRo
 	held := make(map[string]float64, len(snap.Holdings))
 
 	for sym, h := range snap.Holdings {
-		if h.Qty > 0 {
+		// Dust is not a position: shown as "held, not tracked" it invited an
+		// Adopt click that recorded a permanent dust position (PF3-4).
+		if h.Held() {
 			held[sym] = h.Qty
 		}
 	}
@@ -180,12 +191,17 @@ func reconcile(snap portfolio.Snapshot, tracked []engine.OpenPosition) []driftRo
 	var out []driftRow
 
 	for _, p := range tracked {
-		broker := held[p.Symbol]
+		// held is keyed the way the snapshot is — normalised — while an
+		// openPos key is whatever the order carried; a raw lookup reported a
+		// differently-cased record as both "not held" and "not tracked" (PF2-6).
+		key := portfolio.Normalize(p.Symbol)
+
+		broker := held[key]
 		if disagrees(p.Qty, broker) {
 			out = append(out, driftRow{Symbol: p.Symbol, Bot: p.Qty, Broker: broker})
 		}
 
-		delete(held, p.Symbol)
+		delete(held, key)
 	}
 
 	for sym, qty := range held {
@@ -606,7 +622,12 @@ type settingsBlock struct {
 }
 
 func (s *Server) fragSettings(c *gin.Context) {
-	port, sectors, assetClasses := s.eng.PortfolioConfig()
+	port, _, _ := s.eng.PortfolioConfig()
+
+	// The form edits the HAND-WRITTEN maps: filled from the merged view, a
+	// save posted every learned label back as a hand-written one (AP3-3,
+	// SG2-2 again through the form round trip).
+	sectors, assetClasses := s.eng.PortfolioOverrides()
 
 	values := map[string]map[string]any{
 		"exits":   asMap(wrapExits(s.eng.ExitsConfig())),

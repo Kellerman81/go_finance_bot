@@ -75,8 +75,8 @@ func (m *Manager) SizeBuy(
 	cfg SizingConfig,
 	atr float64,
 ) BuySize {
-	if price <= 0 {
-		return BuySize{Reason: "no valid price"}
+	if reason := unsizeable(cfg, price, atr); reason != "" {
+		return BuySize{Reason: reason}
 	}
 
 	order := broker.Order{Symbol: symbol, Side: broker.Buy}
@@ -149,6 +149,25 @@ func (m *Manager) SizeBuy(
 	}
 
 	return BuySize{Notional: notional, Note: note, OK: true}
+}
+
+// unsizeable is why a buy at price cannot be sized at all, or "".
+//
+// An ATR so large that the ATR stop cannot sit above zero leaves no stop to
+// size against: the percentage stop takes over, and the most volatile entry
+// would go out at FULL size behind the narrowest stop (EX3-4). Refused — a
+// buy is the side that fails closed. The reason carries no numbers, so the
+// announce-once dedupe holds.
+func unsizeable(cfg SizingConfig, price, atr float64) string {
+	switch {
+	case price <= 0:
+		return "no valid price"
+	case cfg.Exits.Enabled && exits.ATROutOfRange(cfg.Exits, price, atr):
+		return "ATR × atr_stop_mult reaches the price — no stop the position " +
+			"could be sized against; entry refused until volatility settles"
+	}
+
+	return ""
 }
 
 // stopFraction returns the distance from entry to the stop as a fraction of

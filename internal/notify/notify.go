@@ -87,6 +87,12 @@ type Notifier struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+	// stopped is closed by the worker once it has drained the urgent lane;
+	// Close waits on it (NT3-3). sendMu serialises Send's "not closed yet"
+	// check and enqueue against Close, so nothing lands in a buffer after
+	// the worker stopped reading it.
+	stopped chan struct{}
+	sendMu  sync.RWMutex
 
 	mu      sync.Mutex
 	sent    int64
@@ -109,12 +115,22 @@ func New(cfg config.NotifyConfig) *Notifier {
 	}
 
 	n := &Notifier{
-		cfg:    cfg,
-		kinds:  parseKinds(cfg.Events),
-		hc:     &http.Client{Timeout: timeoutOr(cfg.Timeout)},
-		queue:  make(chan Event, queueSize),
-		urgent: make(chan Event, urgentQueueSize),
-		done:   make(chan struct{}),
+		cfg:   cfg,
+		kinds: parseKinds(cfg.Events),
+		hc: &http.Client{
+			Timeout: timeoutOr(cfg.Timeout),
+			// A redirect is a failure, not a delivery. Go's default follows a
+			// 301/302 by turning the POST into a body-less GET — a
+			// discord_webhook written as http:// redirects to https://, the
+			// GET on a webhook URL answers 200, and every alert (halts
+			// included) was counted as sent while the channel stayed empty
+			// (NT2-2). The 3xx now reaches post's non-2xx check.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		queue:   make(chan Event, queueSize),
+		urgent:  make(chan Event, urgentQueueSize),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 
 	if u := strings.TrimSpace(cfg.Webhook); u != "" {
@@ -125,15 +141,27 @@ func New(cfg config.NotifyConfig) *Notifier {
 		n.sinks = append(n.sinks, sink{"discord", discordSink(u)})
 	}
 
-	if cfg.TelegramToken != "" && cfg.TelegramChatID != "" {
-		n.sinks = append(n.sinks, sink{
-			"telegram",
-			telegramSink(cfg.TelegramToken, cfg.TelegramChatID),
-		})
+	// Trimmed: a token with a trailing newline (an env var, a YAML block
+	// scalar) made an invalid URL, so every alert failed — and the parse
+	// error, which embeds the URL with the token in it, went to errlog
+	// (NT2-1).
+	tok, chat := strings.TrimSpace(cfg.TelegramToken), strings.TrimSpace(cfg.TelegramChatID)
+	if tok != "" && chat != "" {
+		n.sinks = append(n.sinks, sink{"telegram", telegramSink(tok, chat)})
 	}
 
-	if cfg.PushoverToken != "" && cfg.PushoverUser != "" {
-		n.sinks = append(n.sinks, sink{"pushover", pushoverSink(cfg, pushoverEndpoint)})
+	// Trimmed like Telegram's (NT2-1): a trailing newline made Pushover
+	// reject every alert as an invalid token, and a whitespace-only value
+	// still built a sink (NT3-5).
+	po := cfg
+	po.PushoverToken, po.PushoverUser = strings.TrimSpace(
+		cfg.PushoverToken,
+	), strings.TrimSpace(
+		cfg.PushoverUser,
+	)
+
+	if po.PushoverToken != "" && po.PushoverUser != "" {
+		n.sinks = append(n.sinks, sink{"pushover", pushoverSink(po, pushoverEndpoint)})
 	}
 
 	if u := strings.TrimSpace(cfg.AppriseURL); u != "" {
@@ -175,6 +203,8 @@ func parseKinds(events []string) map[Kind]bool {
 
 // Send queues an event for delivery. It never blocks: a full queue drops the
 // event and counts it. Nil-safe.
+//
+//nolint:cyclop // filter, suppress, route and enqueue — each a single guard
 func (n *Notifier) Send(e Event) {
 	if n == nil || !n.kinds[e.Kind] {
 		return
@@ -193,6 +223,23 @@ func (n *Notifier) Send(e Event) {
 	q := n.queue
 	if e.Kind == KindHalt {
 		q = n.urgent
+	}
+
+	n.sendMu.RLock()
+	defer n.sendMu.RUnlock()
+
+	// After Close nothing will ever deliver it: count it as dropped rather
+	// than let it sit in a buffer no worker reads (NT2-6).
+	select {
+	case <-n.done:
+		n.mu.Lock()
+
+		n.dropped++
+		n.mu.Unlock()
+
+		return
+
+	default:
 	}
 
 	select {
@@ -220,11 +267,16 @@ func (n *Notifier) run() {
 			n.deliver(e)
 
 			continue
+
 		default:
 		}
 
 		select {
 		case <-n.done:
+			n.drainUrgent()
+			n.countUndelivered()
+			close(n.stopped)
+
 			return
 		case e := <-n.urgent:
 			n.deliver(e)
@@ -234,8 +286,41 @@ func (n *Notifier) run() {
 	}
 }
 
-// deliver sends one event to every sink, recording failures in the error log
-// rather than retrying: a notification is worth one attempt, not a backlog.
+// drainUrgent delivers whatever is still queued on the urgent lane when the
+// worker stops. Close runs on every notify settings save and at shutdown, and
+// a halt or an "unknown order" alert queued just before it was discarded
+// (NT2-6). Routine events are still dropped: the old worker exiting must not
+// delay the settings save or the shutdown behind a slow sink's backlog.
+func (n *Notifier) drainUrgent() {
+	for {
+		select {
+		case e := <-n.urgent:
+			n.deliver(e)
+		default:
+			return
+		}
+	}
+}
+
+// countUndelivered counts the routine events still queued when the worker
+// stops as dropped: they will never be sent, and Stats should say so.
+func (n *Notifier) countUndelivered() {
+	for {
+		select {
+		case <-n.queue:
+			n.mu.Lock()
+
+			n.dropped++
+			n.mu.Unlock()
+		default:
+			return
+		}
+	}
+}
+
+// deliver sends one event to every sink, recording failures in the error log.
+// A routine notification is worth one attempt, not a backlog; a halt is
+// retried on a rate limit or a server error (sendWithRetry).
 //
 // Each sink gets its own fresh timeout rather than sharing one context across
 // the loop: a shared deadline lets a first slow sink consume the whole
@@ -244,13 +329,7 @@ func (n *Notifier) run() {
 // silently taken every other configured sink down with it.
 func (n *Notifier) deliver(e Event) {
 	for _, s := range n.sinks {
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutOr(n.cfg.Timeout))
-
-		err := s.send(ctx, n.hc, e)
-
-		cancel()
-
-		if err != nil {
+		if err := n.sendWithRetry(s, e); err != nil {
 			n.mu.Lock()
 
 			n.failed++
@@ -268,13 +347,85 @@ func (n *Notifier) deliver(e Event) {
 	}
 }
 
-// Close stops the delivery worker. Safe to call more than once, and nil-safe.
+// Close stops the delivery worker and waits — bounded — for it to deliver the
+// urgent lane. It used to return at once, and cmd/bot exits right after: a
+// halt queued just before shutdown was never sent, and NT2-6's drain only held
+// while the process kept running (NT3-3). Safe to call more than once, and
+// nil-safe.
 func (n *Notifier) Close() {
 	if n == nil {
 		return
 	}
 
-	n.closeOnce.Do(func() { close(n.done) })
+	n.closeOnce.Do(func() {
+		n.sendMu.Lock()
+		close(n.done)
+		n.sendMu.Unlock()
+	})
+
+	// One attempt per sink for the event in flight, and the urgent lane's
+	// retries on top: a bound, so a dead sink cannot hold a shutdown.
+	grace := timeoutOr(n.cfg.Timeout) * time.Duration(len(n.sinks)+1) * haltAttempts
+
+	select {
+	case <-n.stopped:
+	case <-time.After(grace):
+	}
+}
+
+// haltAttempts / haltRetryCap bound a halt's retries: Discord and Telegram
+// rate-limit bursts, and the burst just before a halt (several stop-outs in
+// one tick) is what puts the halt itself into a 429 — lost, counted only as
+// failed (NT3-4).
+const (
+	haltAttempts = 3
+	haltRetryCap = 30 * time.Second
+)
+
+// sendWithRetry sends e to s once, or for a halt up to haltAttempts times on
+// a 429 or 5xx, waiting what Retry-After asks (at most haltRetryCap).
+func (n *Notifier) sendWithRetry(s sink, e Event) error {
+	var err error
+
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeoutOr(n.cfg.Timeout))
+		err = s.send(ctx, n.hc, e)
+
+		cancel()
+
+		var se *statusError
+		if err == nil || e.Kind != KindHalt || attempt >= haltAttempts ||
+			!errors.As(err, &se) || !se.retryable() {
+			return err
+		}
+
+		time.Sleep(se.wait(attempt))
+	}
+}
+
+// statusError is a sink's non-2xx answer.
+type statusError struct {
+	code       int
+	body       string
+	retryAfter time.Duration
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("http %d: %s", e.code, e.body) }
+
+// retryable reports a rate limit or a server-side failure.
+func (e *statusError) retryable() bool {
+	return e.code == http.StatusTooManyRequests || e.code >= 500
+}
+
+// wait is how long to pause before the next attempt: Retry-After when the
+// sink sent one, else a second per attempt so far — capped either way.
+func (e *statusError) wait(attempt int) time.Duration {
+	d := e.retryAfter
+	if d <= 0 {
+		d = time.Duration(attempt) * time.Second
+	}
+
+	return min(d, haltRetryCap)
 }
 
 // Stats reports delivery counters, exposed at GET /api/notify so a silently
@@ -327,7 +478,7 @@ func postJSONSink(endpoint string) func(context.Context, *http.Client, Event) er
 // discordSink posts a plain message to a Discord channel webhook.
 func discordSink(endpoint string) func(context.Context, *http.Client, Event) error {
 	return func(ctx context.Context, hc *http.Client, e Event) error {
-		body, err := json.Marshal(map[string]string{"content": format(e)})
+		body, err := json.Marshal(map[string]string{"content": capRunes(format(e), discordMaxLen)})
 		if err != nil {
 			return err
 		}
@@ -343,12 +494,34 @@ func telegramSink(token, chatID string) func(context.Context, *http.Client, Even
 	return func(ctx context.Context, hc *http.Client, e Event) error {
 		form := url.Values{}
 		form.Set("chat_id", chatID)
-		form.Set("text", format(e))
+		form.Set("text", capRunes(format(e), telegramMaxLen))
 		form.Set("disable_web_page_preview", "true")
 
 		return post(ctx, hc, endpoint, "application/x-www-form-urlencoded",
 			[]byte(form.Encode()))
 	}
+}
+
+// Per-sink message limits. A longer message is refused by the sink (HTTP 400)
+// and the alert is lost — a broker error body embedded in "instrument not
+// tradeable", or a first screener pass adding 100+ symbols, went over them
+// (NT2-5).
+const (
+	discordMaxLen      = 2000
+	telegramMaxLen     = 4096
+	pushoverMaxMessage = 1024
+	pushoverMaxTitle   = 250
+)
+
+// capRunes cuts s to at most n runes, marking the cut, so a long message is
+// shortened rather than rejected.
+func capRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+
+	return string(r[:n-1]) + "…"
 }
 
 // pushoverEndpoint is the Pushover message API.
@@ -375,8 +548,8 @@ func pushoverSink(
 		form := url.Values{}
 		form.Set("token", cfg.PushoverToken)
 		form.Set("user", cfg.PushoverUser)
-		form.Set("title", pushoverTitle(e))
-		form.Set("message", e.Text)
+		form.Set("title", capRunes(pushoverTitle(e), pushoverMaxTitle))
+		form.Set("message", capRunes(e.Text, pushoverMaxMessage))
 		form.Set("priority", strconv.Itoa(pushoverPriority(cfg.PushoverPriority, e.Kind)))
 
 		if e.Text == "" {
@@ -511,7 +684,11 @@ func format(e Event) string {
 func post(ctx context.Context, hc *http.Client, endpoint, contentType string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		// A *url.Error too, from parsing the endpoint — and it embeds the URL,
+		// which for most sinks IS the secret. Only the transport error was
+		// sanitized before, so a malformed sink URL leaked its token into
+		// errlog on every alert (NT2-1).
+		return sanitizeTransportErr(err)
 	}
 
 	req.Header.Set("Content-Type", contentType)
@@ -526,7 +703,15 @@ func post(ctx context.Context, hc *http.Client, endpoint, contentType string, bo
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		se := &statusError{code: resp.StatusCode, body: strings.TrimSpace(string(snippet))}
+		if secs, err := strconv.Atoi(
+			strings.TrimSpace(resp.Header.Get("Retry-After")),
+		); err == nil &&
+			secs > 0 {
+			se.retryAfter = time.Duration(secs) * time.Second
+		}
+
+		return se
 	}
 
 	return nil

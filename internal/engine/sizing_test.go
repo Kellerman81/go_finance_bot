@@ -2,6 +2,7 @@ package engine
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/risk"
@@ -50,5 +51,35 @@ func TestSetSizingPushesMinPositionsToTheRiskManager(t *testing.T) {
 
 	if got := e.rm.MinPositions(); got != 5 {
 		t.Errorf("risk manager min_positions = %d, want 5 — the setting would enforce nothing", got)
+	}
+}
+
+// TestSizeBuySeesPendingFills is the regression for EN2-10. act and
+// addToPosition authorise against the pending-exposure overlay — fills the
+// broker snapshot does not show yet — but sizeBuy sized from the raw
+// snapshot. The risk ratio was applied to headroom those fills had already
+// used, and Authorize then clamped the result to the real headroom, so a
+// wide-stop buy went out at full headroom instead of its risk-scaled share.
+func TestSizeBuySeesPendingFills(t *testing.T) {
+	e := ledgerEngine(t) // X's fixture holding carries no market value: nothing invested yet
+	e.rm = risk.New(config.Limits{
+		MaxOrderValue: 1e9, MaxPerPosition: 1e9, MaxTotalInvested: 1000,
+		MaxDailySpend: 1e9, MaxOpenPositions: 10,
+	}, config.CostsConfig{})
+	e.pf.SetCash(10000)
+
+	// A confirmed fill of Y the broker has not reported yet: 500 more invested.
+	e.openPos["Y"] = &OpenPosition{Symbol: "Y", Qty: 5, OrigQty: 5, EntryPrice: 100, EntryTime: time.Now()}
+	e.prices.Set("Y", 100)
+	e.prices.Set("Z", 10)
+
+	size := e.sizeBuy("Z", 10)
+	if !size.OK {
+		t.Fatalf("sizing refused: %s", size.Reason)
+	}
+
+	if size.Notional > 500+1e-6 {
+		t.Errorf("sized %.2f against max_total_invested 1000 with 500 already committed to a pending fill, want <= 500",
+			size.Notional)
 	}
 }

@@ -153,7 +153,25 @@ var csDenom = 3 - 2*math.Sqrt2
 // (which volatility noise produces regularly) are treated as zero rather than
 // allowed to cancel real ones, as the authors recommend. ok is false when there
 // is not enough usable data.
+//
+// HighLowSpread has no closes and so cannot make the paper's overnight
+// adjustment; callers that have them use HighLowSpreadAdjusted.
 func HighLowSpread(high, low []float64) (float64, bool) {
+	return HighLowSpreadAdjusted(high, low, nil)
+}
+
+// HighLowSpreadAdjusted is HighLowSpread with Corwin & Schultz's adjustment
+// for moves between bars: when bar t+1 trades entirely above bar t's close,
+// it is shifted down by the difference (and up in the mirror case), so its
+// low (high) sits at that close. Unadjusted, a pair whose second bar opened
+// away from the first's close but still overlapped it went in with an
+// inflated two-bar range — on simulated daily bars with a true 1% spread
+// that read 0.70% (overnight sd 1%) and 0.54% (sd 2%) where the adjusted
+// estimate reads 0.80% and 0.66% (IN3-2). The gap fix's claim that no
+// adjustment can recover a gapped pair was true only of shifts measured
+// against bar t's high/low: the paper shifts to the CLOSE, which lies inside
+// bar t's range. A nil or short closes slice leaves pairs unadjusted.
+func HighLowSpreadAdjusted(high, low, closes []float64) (float64, bool) {
 	n := min(len(high), len(low))
 	if n < 2 {
 		return 0, false
@@ -165,7 +183,12 @@ func HighLowSpread(high, low []float64) (float64, bool) {
 	)
 
 	for i := 1; i < n; i++ {
-		s, ok := csPair(high[i-1], low[i-1], high[i], low[i])
+		h2, l2 := high[i], low[i]
+		if i-1 < len(closes) {
+			h2, l2 = shiftToClose(closes[i-1], h2, l2)
+		}
+
+		s, ok := csPair(high[i-1], low[i-1], h2, l2)
 		if !ok {
 			continue
 		}
@@ -181,10 +204,54 @@ func HighLowSpread(high, low []float64) (float64, bool) {
 	return sum / float64(got), true
 }
 
+// shiftToClose moves a bar that trades entirely above (below) the previous
+// close down (up) so that its low (high) sits at that close — the paper's
+// overnight adjustment. A bar containing the close, or an unusable close, is
+// returned unchanged.
+func shiftToClose(prevClose, h, l float64) (float64, float64) {
+	if !(prevClose > 0) || math.IsInf(prevClose, 0) {
+		return h, l
+	}
+
+	switch {
+	case l > prevClose:
+		d := l - prevClose
+
+		return h - d, l - d
+	case h < prevClose:
+		d := prevClose - h
+
+		return h + d, l + d
+	}
+
+	return h, l
+}
+
 // csPair returns the Corwin–Schultz spread estimate for one pair of consecutive
 // bars, clamped at zero.
+//
+//nolint:cyclop // one guard per input the estimator cannot use
 func csPair(h1, l1, h2, l2 float64) (float64, bool) {
-	if h1 <= 0 || l1 <= 0 || h2 <= 0 || l2 <= 0 || h1 < l1 || h2 < l2 {
+	// !(x > 0) and an explicit Inf test, not x <= 0: NaN fails every
+	// comparison, so the old guard let a NaN high or low through, and the
+	// NaN result below was then returned as a MEASURED 0% spread — an
+	// all-NaN series passed max_spread_pct as the tightest instrument there
+	// is (SC2-7).
+	for _, v := range [...]float64{h1, l1, h2, l2} {
+		if !(v > 0) || math.IsInf(v, 0) {
+			return 0, false
+		}
+	}
+
+	// A zero-range bar — one print, or a minute nothing moved — shows neither
+	// bid nor ask, and the formula then returns exactly 0 whatever the other
+	// bar did (b1 = 0 makes the joint range the other bar's own, so γ = β and
+	// α = 0). Counted, those zeros were a MEASURED tightest spread: a name
+	// with a true 1% spread read 0.51% at 30% single-print minutes and 0.26%
+	// at 60%, and passed a 0.40% max_spread_pct (IN3-1). Left out like a
+	// gapped pair; an all-flat series is unmeasurable, which the screener
+	// already refuses.
+	if h1 <= l1 || h2 <= l2 {
 		return 0, false
 	}
 
@@ -207,7 +274,10 @@ func csPair(h1, l1, h2, l2 float64) (float64, bool) {
 	// as unmeasurable instead lets HighLowSpread average only the
 	// overlapping, informative pairs rather than being dragged toward zero
 	// by gap pairs that were never evidence of tightness at all. See
-	// CODE_REVIEW_FINDINGS.md's "Corwin-Schultz isn't gap-adjusted".
+	// CODE_REVIEW_FINDINGS.md's "Corwin-Schultz isn't gap-adjusted". (The
+	// "no adjustment" above holds for shifts against bar 1's high/low only:
+	// the paper's shift to bar 1's CLOSE does make a gapped pair overlap —
+	// HighLowSpreadAdjusted applies it before this check, IN3-2.)
 	if l2 > h1 || h2 < l1 {
 		return 0, false
 	}
@@ -222,7 +292,11 @@ func csPair(h1, l1, h2, l2 float64) (float64, bool) {
 	alpha := (math.Sqrt(2*beta)-math.Sqrt(beta))/csDenom - math.Sqrt(gamma/csDenom)
 
 	spread := 2 * (math.Exp(alpha) - 1) / (1 + math.Exp(alpha))
-	if math.IsNaN(spread) || math.IsInf(spread, 0) || spread < 0 {
+	if math.IsNaN(spread) || math.IsInf(spread, 0) {
+		return 0, false // not a measurement at all
+	}
+
+	if spread < 0 {
 		return 0, true // a negative estimate is noise, not a negative spread
 	}
 

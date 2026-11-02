@@ -69,7 +69,7 @@ func (e *Engine) PlaceBracket(
 	// for the round trip to the broker — see risk.Manager.Reserve.
 	var resID uint64
 	if b.Side == broker.Buy {
-		resID = e.rm.ReserveBuy(b.Qty, price)
+		resID = e.rm.ReserveBuy(b.Symbol, b.Qty, price)
 	}
 
 	res, err := ab.PlaceBracket(ctx, b)

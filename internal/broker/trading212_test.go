@@ -1231,3 +1231,106 @@ func TestT212LimitOrderDowngradeIsSurfaced(t *testing.T) {
 		}
 	}
 }
+
+// TestT212NotOwnedSellIsCutToTheHoldingNotToWholeShares is the regression for
+// BR2-1. "Selling equity not owned" was retried as if it were a precision
+// error. It names no precision, so the retry jumped to whole shares: with 1.5
+// held, a sell of 1.50000001 sold 1 share, and precision 0 was cached for the
+// ticker until restart. Selling the remaining 0.5 then failed on every
+// attempt ("rounds to zero shares") — an exit blocked for the rest of the
+// process — and every fractional buy of the ticker was floored or refused.
+func TestT212NotOwnedSellIsCutToTheHoldingNotToWholeShares(t *testing.T) {
+	held := 1.5
+
+	var sent []float64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/equity/metadata/instruments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"ticker": "AAPL_US_EQ", "shortName": "AAPL", "isin": "US0378331005", "type": "STOCK"},
+		})
+	})
+	mux.HandleFunc("/equity/portfolio", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"ticker": "AAPL_US_EQ", "quantity": held}})
+	})
+	mux.HandleFunc("POST /equity/orders/market", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		q, _ := body["quantity"].(float64)
+		sent = append(sent, -q)
+
+		if -q > held+1e-12 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type": "/api-errors/selling-equity-not-owned", "status": 400,
+				"detail": "Selling equity not owned",
+			})
+
+			return
+		}
+
+		held += q // q is negative for a sell
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 1, "ticker": body["ticker"], "quantity": q, "filledQuantity": 0, "status": "SUBMITTED",
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewTrading212(srv.URL, "k", "s", nil, "EUR")
+	c.limiters = map[string]*t212RateLimiter{}
+	ctx := context.Background()
+
+	if _, err := c.SubmitOrder(ctx, Order{Symbol: "AAPL", Side: Sell, Qty: 1.50000001, Type: Market}); err != nil {
+		t.Fatalf("sell of a float tail over the holding: %v", err)
+	}
+
+	if last := sent[len(sent)-1]; math.Abs(last-1.5) > 1e-9 {
+		t.Fatalf("sent %v, want the sell cut to the 1.5 held — not floored to whole shares", sent)
+	}
+
+	if p, ok := c.cachedQtyPrecision("AAPL_US_EQ"); ok && p == 0 {
+		t.Error("whole-share precision cached for a fractional instrument after a not-owned rejection")
+	}
+}
+
+// TestT212FillWithoutAnFXRateReportsNoPrice is the Trading 212 half of BR2-3:
+// the "resolved" flag of the rate lookup was thrown away, so a failed fetch
+// converted the fill price at 1:1 and booked the instrument's USD as the
+// account's EUR. The order has already gone out by then, so there is nothing
+// to protect by keeping 1:1 — report the price as unknown instead.
+func TestT212FillWithoutAnFXRateReportsNoPrice(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/equity/metadata/instruments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"ticker": "AAPL_US_EQ", "shortName": "AAPL", "isin": "US0378331005", "type": "STOCK", "currencyCode": "USD"},
+		})
+	})
+	mux.HandleFunc("POST /equity/orders/market", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "ticker": "AAPL_US_EQ", "quantity": 1, "status": "NEW"})
+	})
+	mux.HandleFunc("GET /equity/orders/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 7, "ticker": "AAPL_US_EQ", "quantity": 1.0,
+			"filledQuantity": 1.0, "filledValue": 163.0, "status": "FILLED",
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewTrading212(srv.URL, "k", "s", nil, "EUR")
+	c.limiters = map[string]*t212RateLimiter{}
+	c.fx.baseURL = "http://127.0.0.1:1" // the rate fetch fails deterministically
+
+	res, err := c.SubmitOrder(context.Background(), Order{Symbol: "AAPL", Side: Buy, Qty: 1, Type: Market})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if res.FilledPx != 0 {
+		t.Errorf("FilledPx = %v with no USD->EUR rate, want 0 (unknown)", res.FilledPx)
+	}
+}

@@ -77,8 +77,9 @@ func TestAssetClassesSurviveARestartAndConfigStillWins(t *testing.T) {
 	// A fresh engine, as if the process restarted, sharing only the store —
 	// config.yaml disagrees with what was classified before the restart.
 	second := nameEngine(st, nil)
-	second.portCfg = config.PortfolioConfig{Enabled: true}
-	second.assetClasses = map[string]string{"XEON.DE": "etf"} // config.yaml's own entry
+	// config.yaml's own entry, applied the way startup applies it — the
+	// hand-written layer is held apart from the learned one (SG2-2).
+	second.SetPortfolioConfig(config.PortfolioConfig{Enabled: true}, nil, map[string]string{"XEON.DE": "etf"})
 
 	second.restoreAssetClasses()
 

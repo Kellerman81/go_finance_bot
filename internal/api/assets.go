@@ -1,60 +1,30 @@
 package api
 
 import (
-	"bytes"
 	"compress/gzip"
-	"crypto/sha256"
 	"crypto/subtle"
-	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
-// staticAsset holds a precomputed embedded page: the raw bytes, a gzip-compressed
-// copy, and a content-hash ETag. Compressing and hashing once at startup avoids
-// re-reading the embed FS and re-compressing on every request.
+// staticAsset holds a precomputed embedded asset: the raw bytes, a
+// gzip-compressed copy, and a content-hash ETag. Compressing and hashing once
+// at startup avoids re-reading the embed FS and re-compressing on every
+// request. Built by web2.go for every file in the /v2 asset tree.
 type staticAsset struct {
 	raw  []byte
 	gz   []byte
 	etag string
-	mime string // media type; empty means HTML, for the original single-page asset
+	mime string // media type
 }
 
-// indexAsset is the compiled UI page, built once at package init.
-var indexAsset = buildIndexAsset()
-
-// buildIndexAsset reads the embedded UI page and precomputes its gzip copy
-// and content-hash ETag.
-func buildIndexAsset() staticAsset {
-	raw, err := webFS.ReadFile("web/index.html")
-	if err != nil {
-		// Embedded at build time — a read failure is a programming error.
-		panic("api: read embedded index.html: " + err.Error())
-	}
-
-	var buf bytes.Buffer
-
-	gw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-
-	_, _ = gw.Write(raw)
-	_ = gw.Close()
-
-	sum := sha256.Sum256(raw)
-
-	return staticAsset{
-		raw:  raw,
-		gz:   buf.Bytes(),
-		etag: fmt.Sprintf("\"%x\"", sum[:16]),
-		mime: "text/html; charset=utf-8",
-	}
-}
-
-// serveIndex serves the UI page with an ETag and long-lived cache, returning 304
-// when the client already has the current build, and a gzip copy when accepted.
+// serve writes the asset with an ETag and long-lived cache, returning 304 when
+// the client already has the current build, and a gzip copy when accepted.
 func (a staticAsset) serve(c *gin.Context) {
 	c.Header("ETag", a.etag)
 	c.Header("Cache-Control", "no-cache") // always revalidate; ETag makes that a 304
@@ -166,6 +136,68 @@ func blockSimpleCrossOriginWrites() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// requireSameOriginWrites rejects a state-changing /v2 request a browser says
+// came from another site.
+//
+// The /v2 forms post form-encoded bodies — the one shape
+// blockSimpleCrossOriginWrites exists to refuse on /api — so that guard cannot
+// apply here, and nothing replaced it: with auth off (the default) any page
+// the operator visited could auto-submit a plain HTML form to
+// /v2/form/settings/limits, exits, strategy, notify or autotune, applied live
+// and saved to config.yaml (AP2-6). Browsers label every cross-site request
+// with Sec-Fetch-Site and every cross-origin POST with Origin; the UI's own
+// fetches are same-origin. A request with neither header (curl, a script) is
+// not a browser being tricked, and is let through like before.
+//
+// It guards /api as well as /v2. /api had only blockSimpleCrossOriginWrites,
+// which lets a request with no body through — and the bodyless endpoints are
+// actions in themselves: any web page could fetch(..., {method: "POST",
+// mode: "no-cors"}) to start test mode (real stops then fill in the
+// simulator for 48 h), clear a drawdown halt and switch trading on, or start
+// autotune (AP3-1). Scripts and curl send neither header and pass.
+//
+// A GET of a /v2/f/ fragment is refused cross-site too: fragments are loaded
+// only by the page's own scripts, and one of them (symbolOptimize) runs an
+// optimizer search that holds the shared autotune slot — an <img> on any page
+// could keep it busy.
+func requireSameOriginWrites() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			if !strings.HasPrefix(c.Request.URL.Path, "/v2/f/") {
+				c.Next()
+
+				return
+			}
+		}
+
+		if isCrossSite(c) {
+			refused := gin.H{"error": "cross-site request refused"}
+			c.AbortWithStatusJSON(http.StatusForbidden, refused)
+
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// isCrossSite reports whether the browser says the request came from another
+// site: Sec-Fetch-Site when sent, else an Origin whose host is not ours. A
+// request with neither header (curl, scripts) is not cross-site.
+func isCrossSite(c *gin.Context) bool {
+	site := c.GetHeader("Sec-Fetch-Site")
+	crossSite := site != "" && site != "same-origin" && site != "none"
+
+	if origin := c.GetHeader("Origin"); origin != "" && !crossSite {
+		u, err := url.Parse(origin)
+
+		crossSite = err != nil || !strings.EqualFold(u.Host, c.Request.Host)
+	}
+
+	return crossSite
 }
 
 // maxRequestBodyBytes bounds a request body this API ever legitimately needs

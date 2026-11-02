@@ -665,3 +665,25 @@ func TestStatusEnabledFollowsTheConfig(t *testing.T) {
 		t.Error("Status().Enabled did not come back with the re-enable")
 	}
 }
+
+// TestStopGuardIgnoresWinningTrailingStops is the regression for PR2-3. The
+// live engine and the backtester both report a trailing-stop exit as a
+// stop-out, and RecordClose ignored the P&L: with the defaults, four
+// PROFITABLE trailing-stop exits in a day locked the symbol for 4h as a
+// "stop-loss guard". A trail that exits in profit is the trail working.
+func TestStopGuardIgnoresWinningTrailingStops(t *testing.T) {
+	t.Parallel()
+
+	m, advance := clocked(t, config.ProtectionsConfig{
+		StopGuardTrades: 3, StopGuardLookback: time.Hour, StopGuardLock: 4 * time.Hour,
+	})
+
+	for range 4 {
+		m.RecordClose("NVDA", 25, true) // a trailing stop locking in a gain
+		advance(time.Minute)
+	}
+
+	if ok, reason := m.AllowEntry("NVDA"); !ok {
+		t.Errorf("four winning trailing-stop exits locked the symbol: %s", reason)
+	}
+}

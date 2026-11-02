@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 )
@@ -78,11 +79,9 @@ func TestRunLossPassRunsAnEligibleSymbol(t *testing.T) {
 	}
 }
 
-// Only one search runs at a time. A reactive request arriving while a
-// scheduled pass holds the slot is dropped rather than queued: by the time a
-// long pass finishes, that pass has very likely re-evaluated the symbol
-// anyway, and a stale backlog would fire searches for streaks that no longer
-// exist.
+// Only one search runs at a time. A reactive request arriving while another
+// holder has the slot does not run — and reports it, so Schedule can retry it
+// (AT3-6) instead of losing it until N more losses in a row.
 func TestRunLossPassSkipsWhileASearchIsRunning(t *testing.T) {
 	eng, rm, pf := newTestEngine(t, nil)
 
@@ -93,9 +92,13 @@ func TestRunLossPassSkipsWhileASearchIsRunning(t *testing.T) {
 
 	var buf strings.Builder
 
-	runLossPass(context.Background(), eng, rm, pf,
+	ran := runLossPass(context.Background(), eng, rm, pf,
 		eligibilityCfg(nil, nil), filepath.Join(t.TempDir(), "config.yaml"),
 		"AAPL", captureLog(&buf))
+
+	if ran {
+		t.Error("runLossPass reported the request served while the slot was held; it would not be retried")
+	}
 
 	if !strings.Contains(buf.String(), "already running") {
 		t.Errorf("a reactive run proceeded while the slot was held: %s", buf.String())
@@ -138,4 +141,47 @@ func TestRunLossPassDropsWhenDisabledLive(t *testing.T) {
 // which branch a pass actually took.
 func captureLog(buf *strings.Builder) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// AT3-6: a loss re-tune that found the run slot busy was dropped, and the
+// streak publishes again only after another after_losses losses in a row — a
+// symbol whose 3rd loss landed during a screener probe was not re-tuned until
+// its 6th. A busy request is retried after busyRetry, once per symbol.
+func TestABusyLossRequestIsRetried(t *testing.T) {
+	t.Parallel()
+
+	fire := make(chan time.Time, 1)
+	armed := 0
+	l := newLossRetries(func(time.Duration) <-chan time.Time {
+		armed++
+
+		return fire
+	})
+
+	busy := true
+	runs := map[string]int{}
+	run := func(symbol string) bool {
+		runs[symbol]++
+
+		return !busy
+	}
+
+	l.serve("AAPL", run)
+	l.serve("AAPL", run) // the same streak again: one entry, one timer
+
+	if armed != 1 || len(l.pending) != 1 {
+		t.Fatalf("armed %d timers for %d pending symbols, want 1 and 1", armed, len(l.pending))
+	}
+
+	busy = false
+
+	l.retry(run)
+
+	if runs["AAPL"] != 3 {
+		t.Errorf("AAPL ran %d times, want the retry to serve it (3)", runs["AAPL"])
+	}
+
+	if len(l.pending) != 0 || l.due != nil {
+		t.Errorf("served request still pending (%v) or the timer still armed", l.pending)
+	}
 }

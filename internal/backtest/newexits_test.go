@@ -86,17 +86,20 @@ func TestMaxHoldClosesADeadPosition(t *testing.T) {
 	}
 }
 
-// A stop breached in the same bar the clock runs out must report the stop: that
-// is the difference between filling at the stop price and at the close.
+// A stop already breached when the clock runs out must report the stop, and
+// fill where the price is. The barrier is judged at the bar's open (BT2-6):
+// a position whose max_hold is due at the open leaves THERE, so only a stop
+// the open itself has gapped through can outrank it — a dive later in the
+// bar happens to a position live has already closed.
 func TestPriceExitOutranksMaxHoldInTheBacktest(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	bars := flatSeries(base, 12, 100)
 	// The buy is decided on bar 0's close and fills at bar 1's open, so the
-	// position is 5 minutes old on bar 6 — where it both dives through a 5% stop
-	// and reaches max_hold. Both barriers break on the same bar.
-	bars[6] = openBar(base.Add(6*time.Minute), 100, 100, 80, 90)
+	// position is 5 minutes old on bar 6 — which opens through the 5% stop as
+	// max_hold falls due. Both barriers are broken at the open.
+	bars[6] = openBar(base.Add(6*time.Minute), 90, 92, 80, 90)
 
 	bt := &Backtester{
 		Strategy: &buyOnce{done: map[string]bool{}}, Limits: testLimits(),
@@ -516,4 +519,112 @@ func reasons(r Result) []string {
 	}
 
 	return out
+}
+
+// TestATRStopIsNotWidenedByTheBarItTests is the regression for BT2-1. The
+// exit check passed atrAt(c, i), a window that includes bar i's own high and
+// low. Because the wider of the percentage and ATR stops wins, a crashing bar
+// widened its own stop just before being tested against it: a stop at 98 (ATR
+// 1 before the bar) moved to 96.67 once the bar's 3-point range was folded
+// in, and a low of 97 exited nothing. Live trading never sees a bar's range
+// before the bar happens.
+func TestATRStopIsNotWidenedByTheBarItTests(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	bars := make([]market.Candle, 20)
+	for i := range bars {
+		bars[i] = openBar(base.Add(time.Duration(i)*time.Minute), 100, 100.5, 99.5, 100) // TR 1
+	}
+
+	bars[12] = openBar(base.Add(12*time.Minute), 100, 100, 97, 100) // TR 3, low 97
+
+	bt := &Backtester{
+		Strategy: &buyOnce{done: map[string]bool{}}, Limits: testLimits(),
+		Cash: 100000, OrderSize: 1000,
+		Exits: config.ExitsConfig{Enabled: true, StopLossPct: 0.01, ATRStopMult: 2, ATRPeriod: 3},
+	}
+
+	if got := countSells(bt.Run(data(bars))); got != 1 {
+		t.Errorf("a stop at 98 (from the ATR known before the bar) was pierced by a low of 97; "+
+			"got %d exits, want 1", got)
+	}
+}
+
+// TestScaleInDoesNotArmTheTightTrailAboveThePrice is the backtest half of
+// EX2-1, with the README's two-stage trail. Bought at 100, the peak reaches
+// 104.5 (+4.5%, under the 5% offset: loose 10% trail at 94.05). The price
+// falls to 95 and scale-in adds, pulling the average cost below 99.5. Judged
+// against the new average, the old 104.5 peak reads as more than +5%: the
+// tight 2% stage armed at 102.41 — above the price — and the next bar sold
+// the whole enlarged position at a loss. The add must re-base the peak and
+// keep only the pre-add trail (94.05) as a floor.
+func TestScaleInDoesNotArmTheTightTrailAboveThePrice(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(i int) time.Time { return base.Add(time.Duration(i) * time.Minute) }
+
+	bars := []market.Candle{
+		openBar(at(0), 100, 100, 100, 100),    // decide: buy
+		openBar(at(1), 100, 104.5, 99.8, 104), // filled at 100; peak 104.5
+		openBar(at(2), 104, 104.2, 95, 95.5),  // trail 94.05 holds; scale-in at 95
+		openBar(at(3), 96, 97, 95.5, 96),      // the bar the tight trail sold on
+		openBar(at(4), 96, 96.5, 95.6, 96),
+		openBar(at(5), 96, 96.5, 95.6, 96),
+	}
+
+	bt := &Backtester{
+		Strategy: &buyOnce{done: map[string]bool{}}, Limits: testLimits(),
+		Cash: 100000, OrderSize: 1000,
+		Exits: config.ExitsConfig{
+			Enabled: true, TrailingStopPct: 0.10, TrailingOffsetPct: 0.05, TrailingTightPct: 0.02,
+		},
+		ScaleIn: config.ScaleInConfig{Enabled: true, MaxAdds: 1, StepPct: 0.05, SizePct: 1},
+	}
+
+	res := bt.Run(data(bars))
+
+	adds := 0
+
+	for _, tr := range res.Trades {
+		if tr.Side == "buy" {
+			adds++
+		}
+
+		if tr.Side == "sell" {
+			t.Errorf("sold after a scale-in, at %.2f: %s", tr.Price, tr.Reason)
+		}
+	}
+
+	if adds != 2 {
+		t.Fatalf("%d buys, want the entry plus one scale-in add — the scenario did not set up", adds)
+	}
+}
+
+// TestMinPositionsCapsEachBuyToOneSlot is the regression for CM2-1. The live
+// engine sets engine.min_positions on its risk.Manager, which cuts the
+// investable pot into that many slots; the backtester never did, so with the
+// example config's min_positions: 4 every offline position — in cmd/backtest
+// and the limit-respecting optimizer — was about four times its live size.
+func TestMinPositionsCapsEachBuyToOneSlot(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	bt := &Backtester{
+		Strategy: &buyOnce{done: map[string]bool{}}, Limits: testLimits(),
+		Cash: 100000, MinPositions: 10,
+	}
+
+	res := bt.Run(data(flatSeries(base, 10, 100)))
+
+	if len(res.Trades) == 0 {
+		t.Fatal("no buy; the scenario did not set up")
+	}
+
+	if v := res.Trades[0].Value; v > 10000*1.01 {
+		t.Errorf("first buy worth %.2f, want at most one min_positions slot (100000 / 10)", v)
+	}
 }

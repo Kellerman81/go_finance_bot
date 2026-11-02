@@ -201,10 +201,13 @@ func TestVerdictsCarryTheSector(t *testing.T) {
 	}
 }
 
-// Held and pinned symbols are appended after the cap, so they never consume a
-// sector slot — the same exemption they already have from MaxSymbols. Dropping
-// a held symbol would strand the position.
-func TestProtectedSymbolsDoNotSpendSectorSlots(t *testing.T) {
+// SC3-6: a held position spends its sector's budget, because the guard's
+// max_positions_per_sector counts it — with HELD in technology and a cap of 2,
+// only ONE tech discovery can still be bought, and picking two meant the guard
+// refused one of them on every evaluation. The held symbol is still kept.
+// This test used to assert the opposite (held never counted), which is the
+// defect SC3-6 describes.
+func TestHeldSymbolsSpendTheirSectorBudget(t *testing.T) {
 	t.Parallel()
 
 	series := volumeSeries("HELD", "T1", "T2")
@@ -212,7 +215,7 @@ func TestProtectedSymbolsDoNotSpendSectorSlots(t *testing.T) {
 
 	cfg := config.ScreenerConfig{
 		Enabled: true, Universe: keysOf(series), Rank: "volume",
-		Filters: []string{"history"}, MaxSymbolsPerSector: 1, KeepHeld: true,
+		Filters: []string{"history"}, MaxSymbolsPerSector: 2, KeepHeld: true,
 	}
 
 	got := New(cfg, fakeHistory{series: series}, market.Res1Min,
@@ -223,19 +226,45 @@ func TestProtectedSymbolsDoNotSpendSectorSlots(t *testing.T) {
 		t.Fatalf("selected %v, want the held symbol kept", got)
 	}
 
-	// One discovery still gets the sector's slot despite HELD sharing it.
-	discoveries := 0
+	if n := countPrefix(got, "T"); n != 1 {
+		t.Errorf("selected %d tech discoveries from %v beside a held tech position under a cap of 2, want 1",
+			n, got)
+	}
+}
 
-	for _, sym := range got {
-		if strings.HasPrefix(sym, "T") {
-			discoveries++
+// A pinned symbol that is NOT held spends nothing: the guard counts
+// positions, not watchlist entries, so the cap of 1 still has its slot.
+func TestPinnedUnheldSymbolsDoNotSpendSectorSlots(t *testing.T) {
+	t.Parallel()
+
+	series := volumeSeries("PIN", "T1", "T2")
+	sectors := sectorMap{"PIN": "technology", "T1": "technology", "T2": "technology"}
+
+	cfg := config.ScreenerConfig{
+		Enabled: true, Universe: keysOf(series), Rank: "volume",
+		Filters: []string{"history"}, MaxSymbolsPerSector: 1, KeepManual: true,
+	}
+
+	got := New(cfg, fakeHistory{series: series}, market.Res1Min,
+		Options{Sectors: sectors}).Screen(context.Background(),
+		Inputs{Pinned: []string{"PIN"}}).Selected
+
+	if !containsStr(got, "PIN") || countPrefix(got, "T") != 1 {
+		t.Errorf("selected %v, want PIN kept and one tech discovery", got)
+	}
+}
+
+// countPrefix counts the symbols in syms that start with prefix.
+func countPrefix(syms []string, prefix string) int {
+	n := 0
+
+	for _, sym := range syms {
+		if strings.HasPrefix(sym, prefix) {
+			n++
 		}
 	}
 
-	if discoveries != 1 {
-		t.Errorf("selected %d discoveries from %v, want the cap of 1 unaffected by the held symbol",
-			discoveries, got)
-	}
+	return n
 }
 
 // The screener must count its sector budget the same way the guard counts its

@@ -90,6 +90,23 @@ func (h *higherTimeframe) BaseBars() int {
 	return (h.maxLookback + 2) * h.multiple
 }
 
+// ReadyBars is how many base-timeframe bars the higher timeframe needs before
+// vote() can say anything: its own readiness floor, aggregated. This — not
+// BaseBars — is what the strategy's warmup waits for. BaseBars sizes the
+// backtest's history window off maxLookback (TrendPeriod, 1950, for the
+// default trend detector), and folding it into the warmup demanded 3906 bars
+// at htf_multiple 2 and 29282 at the 15 config.example.yaml suggests — more
+// than the live engine's 3000-bar history ever holds, so every evaluation
+// returned "warming up" and the strategy never entered or exited (ST2-1). The
+// backtest, sized from MaxLookback, kept trading, so nothing showed it.
+func (h *higherTimeframe) ReadyBars() int {
+	if h == nil {
+		return 0
+	}
+
+	return (h.warmup + 2) * h.multiple
+}
+
 // htfRead is the higher timeframe's opinion. ok is false when there is not
 // enough history to aggregate, in which case the caller must not gate on it — an
 // unknown higher timeframe should leave the base strategy alone, not silently

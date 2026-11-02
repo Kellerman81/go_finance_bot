@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"maps"
 	"strings"
 	"time"
 
@@ -183,6 +184,8 @@ func (e *Engine) TradeableAtBroker(ctx context.Context, symbol string) (tradeabl
 // leaves names and sectors unresolvable, but the broker can still classify —
 // so the pass runs regardless and simply fills in less.
 func (e *Engine) resolveNames(ctx context.Context, symbols []string) {
+	defer e.contain("name resolver")
+
 	lookup := e.instrumentLookup()
 
 	classifier, canClassify := e.brk.(broker.AssetClassifier)
@@ -338,38 +341,29 @@ func (e *Engine) setAutoSector(symbol, sector string) {
 		return
 	}
 
-	merged := make(map[string]string, len(e.sectors)+1)
-	for sym, sec := range e.sectors {
-		merged[sym] = sec
+	if e.autoSectors == nil {
+		e.autoSectors = make(map[string]string)
 	}
 
-	merged[symbol] = sector
-	cfg, classes := e.portCfg, e.assetClasses
+	e.autoSectors[symbol] = sector
 
 	e.mu.Unlock()
 
 	// Rebuilds the portfolio guard and logs, same as a live settings PUT —
-	// SetPortfolioConfig does not persist to config.yaml itself (that file
-	// is the hand-maintained override layer, not where auto-learned data
-	// belongs), so the auto-fetch cache is saved separately below.
-	e.SetPortfolioConfig(cfg, merged, classes)
+	// the learned cache is saved separately below, never into config.yaml
+	// (that file is the hand-maintained override layer).
+	e.rebuildPortfolio()
 	e.persistSectors()
 }
 
-// persistSectors writes the auto-learned sector cache so a restart does not
-// re-fetch every one of them. Unlike restoreSectors (which must merge under
-// config.yaml), this simply saves the engine's current live map: whatever
-// config.yaml contributed is already folded in by the time this is called,
-// and re-saving it alongside the auto-learned entries is harmless — the
-// config file itself remains the source of truth for its own entries on the
-// next restore, since restoreSectors always re-applies it on top.
+// persistSectors writes the auto-learned sector cache — only what was learned,
+// never the hand-written layer (SG2-2) — so a restart does not re-fetch every
+// one of them.
 func (e *Engine) persistSectors() {
 	e.mu.RLock()
-	sectors := make(map[string]string, len(e.sectors))
 
-	for sym, sec := range e.sectors {
-		sectors[sym] = sec
-	}
+	sectors := maps.Clone(e.autoSectors)
+
 	e.mu.RUnlock()
 
 	if err := e.store.SaveSectors(sectors); err != nil {
@@ -377,9 +371,8 @@ func (e *Engine) persistSectors() {
 	}
 }
 
-// restoreSectors loads the auto-learned sector cache and layers it under
-// whatever config.yaml already contributed to e.sectors (via the startup
-// SetPortfolioConfig call) — config always wins, this only fills gaps.
+// restoreSectors loads the auto-learned sector cache under the hand-written
+// layer — config always wins, this only fills gaps.
 func (e *Engine) restoreSectors() {
 	auto, err := e.store.LoadSectors()
 	if err != nil || len(auto) == 0 {
@@ -388,19 +381,11 @@ func (e *Engine) restoreSectors() {
 
 	e.mu.Lock()
 
-	merged := make(map[string]string, len(e.sectors)+len(auto))
-	for sym, sec := range auto {
-		merged[sym] = sec
-	}
+	e.autoSectors = auto
 
-	for sym, sec := range e.sectors { // config.yaml entries win on conflict
-		merged[sym] = sec
-	}
-
-	cfg, classes := e.portCfg, e.assetClasses
 	e.mu.Unlock()
 
-	e.SetPortfolioConfig(cfg, merged, classes)
+	e.rebuildPortfolio()
 }
 
 // hasAssetClass reports whether symbol already has an asset class, from either
@@ -454,34 +439,37 @@ func (e *Engine) setAutoAssetClass(symbol, class string) {
 		return
 	}
 
-	merged := make(map[string]string, len(e.assetClasses)+1)
-	for sym, c := range e.assetClasses {
-		merged[sym] = c
+	if e.autoClasses == nil {
+		e.autoClasses = make(map[string]string)
 	}
 
-	merged[symbol] = class
-	cfg, sectors := e.portCfg, e.sectors
+	e.autoClasses[symbol] = class
 
 	e.mu.Unlock()
 
 	// Rebuilds the portfolio guard, same as setAutoSector does — and for the
 	// same reason the auto-learned cache is persisted separately rather than
 	// written back into config.yaml.
-	e.SetPortfolioConfig(cfg, sectors, merged)
+	e.rebuildPortfolio()
 	e.persistAssetClasses()
 }
 
-// persistAssetClasses writes the auto-learned classification cache so a restart
-// does not re-classify every symbol.
+// persistAssetClasses writes the auto-learned classification cache — only
+// what was learned (SG2-2) — so a restart does not re-classify every symbol.
 func (e *Engine) persistAssetClasses() {
-	if err := e.store.SaveAssetClasses(e.AssetClasses()); err != nil {
+	e.mu.RLock()
+
+	classes := maps.Clone(e.autoClasses)
+
+	e.mu.RUnlock()
+
+	if err := e.store.SaveAssetClasses(classes); err != nil {
 		e.log.Warn("persist auto-learned asset classes failed", "err", err)
 	}
 }
 
-// restoreAssetClasses loads the auto-learned classification cache and layers it
-// under whatever config.yaml already contributed (via the startup
-// SetPortfolioConfig call) — config always wins, this only fills gaps.
+// restoreAssetClasses loads the auto-learned classification cache under the
+// hand-written layer — config always wins, this only fills gaps.
 func (e *Engine) restoreAssetClasses() {
 	auto, err := e.store.LoadAssetClasses()
 	if err != nil || len(auto) == 0 {
@@ -490,17 +478,9 @@ func (e *Engine) restoreAssetClasses() {
 
 	e.mu.Lock()
 
-	merged := make(map[string]string, len(e.assetClasses)+len(auto))
-	for sym, class := range auto {
-		merged[sym] = class
-	}
+	e.autoClasses = auto
 
-	for sym, class := range e.assetClasses { // config.yaml entries win on conflict
-		merged[sym] = class
-	}
-
-	cfg, sectors := e.portCfg, e.sectors
 	e.mu.Unlock()
 
-	e.SetPortfolioConfig(cfg, sectors, merged)
+	e.rebuildPortfolio()
 }

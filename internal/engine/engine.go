@@ -9,18 +9,22 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/ai"
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/errlog"
+	"github.com/Kellerman81/go_finance_bot/internal/exits"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
 	"github.com/Kellerman81/go_finance_bot/internal/ml"
 	"github.com/Kellerman81/go_finance_bot/internal/notify"
@@ -49,8 +53,15 @@ const (
 	// sellDustQty is the smallest holding worth trying to sell. A residual below
 	// this (e.g. left by broker quantity rounding after a full exit) is treated as
 	// closed, so a sub-fractional "position" can't trigger an endless sell-retry
-	// loop against the broker.
-	sellDustQty = 1e-6
+	// loop against the broker. It is portfolio.DustQty, so a residual the
+	// engine treats as closed is not an open position to the caps (PF2-4).
+	sellDustQty = portfolio.DustQty
+	// maxPeakJump is the largest tick-to-tick rise ratchetPeak takes on a
+	// single print; a bigger one has to be confirmed by the next tick. Wide
+	// on purpose: a genuine one-tick spike of a few percent is exactly what
+	// the backtest's bar high records (EX2-3), while a bad print is usually
+	// far off — a wrong currency, a misplaced decimal.
+	maxPeakJump = 0.15
 	// warmupLookback is how far back to request history on warmup. It spans
 	// enough calendar days to pull a full trading week of 1-minute bars
 	// (markets are closed nights/weekends, so this reaches ~5 trading days).
@@ -207,10 +218,48 @@ type Engine struct {
 	// see EnableTestMode.
 	testModeSpendDay string
 	testModeSpend    float64
-	// unsizeable holds the reason a symbol's buy could not be sized, so the
-	// refusal is recorded once rather than every eval_interval — see
-	// noteUnsizeable.
-	unsizeable map[string]string
+	// testModeBook is the real position bookkeeping as it stood when test
+	// mode started, restored when it ends — simulated fills write the same
+	// openPos/peaks/roundTrip/pendingSell maps the real account uses (EN3-1).
+	testModeBook *bookSnapshot
+	// blockedOnce holds the reason a symbol's buy was last refused by a
+	// standing CONDITION (unsizeable, or no current venue price), so it is
+	// recorded once rather than every eval_interval — see noteBlockedOnce.
+	blockedOnce map[string]string
+	// protSaved / protSavedAt are the protection state last persisted and
+	// when, so persistProtectionsIfChanged writes only what moved — see there.
+	// Guarded by protSaveMu, not mu: the save is a DB write.
+	// restingWatchers counts live watchLimitOrder goroutines per symbol, and
+	// restMu serialises their cancel-time reconciliation — see
+	// filledWhileResting.
+	restingWatchers map[string]int
+	// limitDegraded remembers, per broker name, that limit execution was
+	// already reported as degraded to market — see planningExecutionConfig.
+	limitDegraded map[string]bool
+	// handSectors/handClasses are the hand-written sector and asset-class
+	// maps; autoSectors/autoClasses what the bot learned. e.sectors and
+	// e.assetClasses are the merge — see SetPortfolioConfig.
+	handSectors, handClasses map[string]string
+	autoSectors, autoClasses map[string]string
+	// persistMu serialises open-position writes so each writes the current
+	// record, never a stale snapshot (persistOpenPosition, SG2-3).
+	persistMu sync.Mutex
+	// addRefusedAt is when the broker last refused a scale-in add, per
+	// symbol (addRefusedRecently, EN3-7).
+	addRefusedAt map[string]time.Time
+	// screening is set while a screening pass runs, so passes never overlap
+	// (rescreen, AT3-1 / SC3-1).
+	screening atomic.Bool
+	// roundTrip accumulates a position's exit tranches until it closes, so
+	// the protections see one outcome per trade (closeTranche, PR2-6).
+	roundTrip map[string]roundTripOutcome
+	// parkedRes holds unconfirmed clips' reservations per symbol until the
+	// order is flagged — see parkUnconfirmedReservation.
+	parkedRes   map[string][]uint64
+	restMu      sync.Mutex
+	protSaveMu  sync.Mutex
+	protSaved   protect.State
+	protSavedAt time.Time
 	// lastOrderErr remembers the most recent order-failure signature per
 	// symbol, so an unchanged failure repeating every evaluation is announced
 	// once instead of once per cycle. See untradeable.go's announcedOrderError.
@@ -304,7 +353,7 @@ func New(
 	// nothing until someone touched the UI.
 	rm.SetMinPositions(cfg.MinPositions)
 
-	return &Engine{
+	e := &Engine{
 		cfg:             cfg,
 		exits:           exitRules,
 		safety:          safety,
@@ -331,13 +380,26 @@ func New(
 		spreads:         make(map[string]float64),
 		openPos:         make(map[string]*OpenPosition),
 		pendingSell:     make(map[string]float64),
-		unsizeable:      make(map[string]string),
+		blockedOnce:     make(map[string]string),
 		driftSince:      make(map[string]time.Time),
 		unconfirmed:     make(map[string]UnconfirmedOrder),
 		streaks:         make(map[string]signalStreak),
 		tradingEnabled:  cfg.TradingEnabled,
 		fxRates:         make(map[string]float64),
 	}
+
+	// A simulated broker charges the same per-symbol friction from the
+	// first fill, not only after a costs edit in the UI: cmd/bot installed a
+	// flat spread_pct closure, so with measure_spread on, paper trading
+	// charged 5 bps where the backtest charged a measured 40 until someone
+	// saved the costs form (CM2-3).
+	if sim, ok := b.(*broker.Sim); ok {
+		e.installSimFriction(sim)
+	}
+
+	e.reportWarmup("strategy", e.start) // ST3-3
+
+	return e
 }
 
 // HistorySource supplies historical candles for indicator warmup. The live
@@ -667,6 +729,81 @@ func (e *Engine) fxRateFor(symbol string) float64 {
 	return rate
 }
 
+// setFXRate installs symbol's native-to-preferred-currency multiplier and, when
+// that CHANGES a rate the engine was already pricing with, brings every cached
+// price for the symbol onto the new scale.
+//
+// This is the second half of FX-1. Prices are converted once, at the moment
+// they enter the engine — warmup multiplies the seeded candles, ingest
+// multiplies each tick — so a rate that arrives late, or moves, leaves a
+// whole bar history denominated at the old rate while anything computed fresh
+// uses the new one. venuePrice is computed fresh, which is how a symbol whose
+// rate resolved after start-up ended up with a venue price that disagreed with
+// its own signal by exactly the exchange rate, permanently.
+//
+// Rescaling is the honest correction rather than a patch: the stored bars
+// describe real prices in one currency, and the same prices in another are
+// those multiplied by the ratio between the rates. Everything derived from
+// them — indicator levels, the trailing-stop high-water mark, the last cached
+// tick — moves with them, so the whole symbol stays internally consistent.
+//
+// Deliberately NOT rescaled: openPos.EntryPrice and realized P&L. Those come
+// from actual fills, converted by the broker adapter at fill time, and are
+// historical facts rather than a view of a current price.
+func (e *Engine) setFXRate(symbol string, rate float64) {
+	if rate <= 0 {
+		return
+	}
+
+	e.fxMu.Lock()
+
+	prev, had := e.fxRates[symbol]
+	if !had || prev <= 0 {
+		prev = 1 // what fxRateFor returned, so what the stored prices used
+	}
+
+	e.fxRates[symbol] = rate
+	e.fxMu.Unlock()
+
+	if prev == rate {
+		return
+	}
+
+	factor := rate / prev
+
+	e.barsStore.rescale(symbol, factor)
+
+	e.prices.Rescale(symbol, factor) // keeps the tick's age (PF3-1)
+
+	// The trailing-stop high-water mark is a price like any other, and a peak
+	// left on the old scale would move every trailing stop for this symbol by
+	// the rate. So are the record's durable Peak and TrailFloor: rescaling
+	// only e.peaks left the floor on the old scale — above the market after
+	// a rate that lowers prices, a spurious full stop-out — and a restart
+	// restored the stale Peak (EN3-4).
+	e.mu.Lock()
+
+	if peak, ok := e.peaks[symbol]; ok {
+		e.peaks[symbol] = peak * factor
+	}
+
+	_, tracked := e.openPos[symbol]
+	if tracked {
+		p := e.openPos[symbol]
+		p.Peak *= factor
+		p.TrailFloor *= factor
+	}
+
+	e.mu.Unlock()
+
+	if tracked {
+		e.persistOpenPosition(symbol, "open position after an fx rescale")
+	}
+
+	e.log.Info("fx rate changed; re-scaled this symbol's cached prices",
+		"symbol", symbol, "from", prev, "to", rate)
+}
+
 // resolveFXRates caches each symbol's native-to-preferred-currency multiplier
 // up front, before warmup seeds any candles — so warmup history and every
 // live tick after it are priced in the same currency from the first bar.
@@ -680,22 +817,57 @@ func (e *Engine) resolveFXRates(symbols []string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
-	defer cancel()
+	// One timeout PER SYMBOL, not one shared across the loop.
+	//
+	// A single budget for the whole list cannot work against a paced broker:
+	// Trading 212 spaces its instrument-metadata reads 50s apart, so a shared
+	// 30s deadline expired before the first symbol resolved and every symbol
+	// after it silently kept the default rate of 1. On a 120-symbol watchlist
+	// that left most of the book priced in its native currency while the
+	// account, the limits and the venue check all speak the preferred one.
+	//
+	// The failure was invisible until an hourly refreshFXRates later supplied
+	// the real rate for ONE symbol, at which point its freshly-converted venue
+	// price disagreed with its still-unconverted bars by exactly the exchange
+	// rate — a 4.8% "deviation" that blocked every entry in it. See
+	// CODE_REVIEW_FINDINGS.md's FX-1.
+	failed := 0
 
 	for _, s := range symbols {
-		_, rate, err := csr.InstrumentCurrency(ctx, s)
+		rate, err := e.resolveOneFXRate(csr, s)
 		if err != nil {
-			e.log.Warn("fx rate resolution failed; prices for this symbol will not be currency-converted",
+			failed++
+
+			e.log.Debug("fx rate resolution failed; this symbol keeps its previous rate",
 				"symbol", s, "err", err)
 
 			continue
 		}
 
-		e.fxMu.Lock()
-		e.fxRates[s] = rate
-		e.fxMu.Unlock()
+		e.setFXRate(s, rate)
 	}
+
+	// Summarised once rather than per symbol: on a cold broker cache this can
+	// be most of the watchlist, and the evaluation loop must not be preceded
+	// by a hundred identical warnings.
+	if failed > 0 {
+		e.log.Warn("some symbols have no broker fx rate and are priced unconverted",
+			"failed", failed, "of", len(symbols))
+	}
+}
+
+// resolveOneFXRate resolves a single symbol under its own deadline, so one
+// slow or paced lookup cannot consume the budget of every symbol behind it.
+func (e *Engine) resolveOneFXRate(
+	csr broker.CurrencyResolver,
+	symbol string,
+) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	defer cancel()
+
+	_, rate, err := csr.InstrumentCurrency(ctx, symbol)
+
+	return rate, err
 }
 
 // fxRefreshInterval bounds how often refreshFXRates re-resolves the whole
@@ -864,6 +1036,20 @@ func (e *Engine) Run(ctx context.Context) {
 	e.mu.Unlock()
 
 	defer func() {
+		// A panic raised inside one of the many e.mu.Lock()…Unlock() sections
+		// that unlock without a defer unwinds with e.mu still held, and a
+		// blocking Lock here deadlocked the unwinding: the panic was never
+		// logged, runSupervised's handler never ran (CM3-4). While panicking,
+		// try the lock and re-raise either way.
+		if r := recover(); r != nil {
+			if e.mu.TryLock() {
+				e.running = false
+				e.mu.Unlock()
+			}
+
+			panic(r)
+		}
+
 		e.mu.Lock()
 
 		e.running = false
@@ -897,6 +1083,9 @@ func (e *Engine) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			e.log.Info("engine stopping")
+			// The newest equity peak may still be inside the save throttle;
+			// a restart must resume against it, not against a lower one.
+			e.PersistProtectionState()
 
 			return
 
@@ -928,7 +1117,13 @@ func (e *Engine) Run(ctx context.Context) {
 			e.evaluate(ctx)
 
 		case <-screenTick.C:
-			e.rescreen(ctx)
+			// Off this loop, always. A pass fetches history for every
+			// candidate, runs the probe's backtests and autotune searches and
+			// warms up what it adds — minutes, during which ingest, evaluate
+			// and so checkExits could not run: no stop fired for the length of
+			// a pass (AT3-1 / SC3-1). rescreen is single-flight, so a pass
+			// still running when the next tick lands is not doubled.
+			go e.rescreen(ctx)
 		}
 	}
 }
@@ -942,13 +1137,58 @@ func (e *Engine) Run(ctx context.Context) {
 // broker-reported (also-converted) equity and cash — see the fxRates field
 // doc for why this can't be a network call.
 func (e *Engine) ingest(q market.Quote) {
+	// A zero, negative or non-finite print is dropped before it reaches the
+	// cache, the mark or a bar: cached, it was what the next positions sync
+	// valued the holding at, and a bar built from it is a fake crash (PF2-5).
+	// Binance filters this at the source; Finnhub does not.
+	if !(q.Price > 0) || math.IsInf(q.Price, 0) {
+		return
+	}
+
 	price := q.Price * e.fxRateFor(q.Symbol)
+	prev, _ := e.prices.Get(q.Symbol)
 
 	e.prices.Set(q.Symbol, price)
 	e.pf.MarkPrice(q.Symbol, price)
+	e.ratchetPeak(q.Symbol, price, prev)
 
 	completed := e.barsStore.ingest(q.Symbol, price, q.Volume, q.Time)
 	e.met.onTick(completed)
+}
+
+// ratchetPeak raises a held symbol's trailing-stop high-water mark on every
+// tick, not just at checkExits. The backtest ratchets on each bar's high —
+// every tick the bar was built from — while live used to see only the prices
+// that happened to be current at a 30 s evaluation; a spike to +6% and back
+// inside one window armed the backtest's tight trail and left live on the
+// loose one, so offline results were systematically better (EX2-3). The peak
+// is persisted by checkExits once it next runs, as before.
+//
+// A tick more than maxPeakJump above the previous one does not move the peak
+// on its own: the peak is permanent, and one bad high print from the feed
+// would otherwise arm the tight trail against a price that never traded,
+// selling on the next check. A real move shows up again on the next tick —
+// compared with the now-cached high, it passes — so only an isolated outlier
+// is ignored (found by the verify-change pass). The backtest needs no such
+// guard: its bar highs come from cleaned history.
+func (e *Engine) ratchetPeak(symbol string, price, prev float64) {
+	if e.pf.PositionQty(symbol) <= sellDustQty {
+		return // syncPortfolio prunes peaks of unheld symbols; do not re-seed one
+	}
+
+	if prev > 0 && price > prev*(1+maxPeakJump) {
+		return
+	}
+
+	sym := portfolio.Normalize(symbol)
+
+	e.mu.Lock()
+
+	if price > e.peaks[sym] {
+		e.peaks[sym] = price
+	}
+
+	e.mu.Unlock()
 }
 
 // evalConcurrency bounds how many symbols are evaluated in parallel. The
@@ -1054,7 +1294,7 @@ func (e *Engine) evaluable(symbols []string) []string {
 	var excluded []string
 
 	for _, s := range symbols {
-		if h, held := snap.Holding(s); held && h.Qty > 0 {
+		if h, held := snap.Holding(s); held && h.Held() { // dust is not held (PF3-2)
 			out = append(out, s)
 		} else {
 			excluded = append(excluded, s)
@@ -1091,13 +1331,27 @@ func (e *Engine) evaluateSignals(symbols []string) []evalResult {
 	results := make([]evalResult, len(symbols))
 	sem := make(chan struct{}, evalConcurrency)
 
-	var wg sync.WaitGroup
+	var (
+		wg       sync.WaitGroup
+		panicked atomic.Pointer[workerPanic]
+	)
 
 	for i, sym := range symbols {
 		sem <- struct{}{}
 
 		wg.Go(func() {
 			defer func() { <-sem }()
+
+			// recover works only in the goroutine that panicked, and the
+			// strategy — indicator code, the likeliest place for an index
+			// panic — runs here, not on Run's goroutine: runSupervised
+			// never saw it, and the panic killed the process (CM3-4).
+			// Caught here and re-raised on the caller's goroutine below.
+			defer func() {
+				if r := recover(); r != nil {
+					panicked.CompareAndSwap(nil, &workerPanic{symbol: sym, value: r, stack: debug.Stack()})
+				}
+			}()
 
 			series := e.seriesFor(sym)
 			// Even with no bars yet, evaluate so the symbol shows as "warming up"
@@ -1113,7 +1367,40 @@ func (e *Engine) evaluateSignals(symbols []string) []evalResult {
 
 	wg.Wait()
 
+	if p := panicked.Load(); p != nil {
+		e.log.Error("strategy evaluation panicked", "symbol", p.symbol, "panic", p.value,
+			"stack", string(p.stack))
+		panic(fmt.Sprintf("evaluating %s: %v", p.symbol, p.value))
+	}
+
 	return results
+}
+
+// workerPanic is a panic caught in an evaluation worker, carried to the
+// goroutine that waits for the workers.
+type workerPanic struct {
+	symbol string
+	value  any
+	stack  []byte
+}
+
+// contain is deferred at the top of every goroutine the engine starts on its
+// own — a limit-order watcher, the name resolver. Each runs outside
+// cmd/bot's runSupervised, so a panic in one killed the live process (CM3-4).
+// It is logged with its stack and recorded, and trading is disarmed exactly
+// as runSupervised does for the Run loop: a watcher that died mid-order left
+// state no one can vouch for. Disarmed from its own goroutine, since the
+// panicking frame may still hold e.mu.
+func (e *Engine) contain(name string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+
+	e.log.Error(name+" panicked; trading disarmed", "panic", r, "stack", string(debug.Stack()))
+	errlog.Recordf("engine", "%s panicked: %v — trading disarmed", name, r)
+
+	go e.SetTradingEnabled(false)
 }
 
 // setSignal stores a symbol's latest signal and emits a signal event when the
@@ -1355,8 +1642,16 @@ func (e *Engine) act(
 		// (max_total_invested / max_per_position / max_open_positions would
 		// undercount exposure while a fill is pending).
 		snap = e.pendingExposure(snap)
-		if cur, _ := snap.Holding(sig.Symbol); !e.EngineConfig().AllowPyramiding && cur.Qty > 0 {
-			return // already in a position (confirmed or pending fill); don't pyramid
+
+		// Held() — dust is not a position: a 5e-7 broker remainder after a
+		// full exit blocked every later buy of the symbol, silently (PF3-2).
+		// And a buy already in flight (a resting limit, a parked
+		// reservation) is a position about to exist: without it a standing
+		// BUY signal sent another full clip every evaluation while the first
+		// rested (RK3-1).
+		if cur, _ := snap.Holding(sig.Symbol); !e.EngineConfig().AllowPyramiding &&
+			(cur.Held() || e.rm.HasReservation(sig.Symbol)) {
+			return // already in a position (confirmed, pending or in flight); don't pyramid
 		}
 
 		// Protections gate entries only — a cooldown or a halt must never stop
@@ -1376,24 +1671,34 @@ func (e *Engine) act(
 		// the signal blocks the buy.
 		confirmed, reason, ok := e.confirmVenuePrice(sig.Symbol, price)
 		if !ok {
-			e.record(TradeRecord{
-				Time: time.Now(), Symbol: sig.Symbol, Side: broker.Buy, Price: price,
-				Status: "blocked", Reason: reason, Indicators: indSnap,
-			})
+			// Announce-once: "the provider only has daily candles for this
+			// symbol" is a standing property of the symbol, not news each
+			// time it is re-checked. Recording it per evaluation produced
+			// 2,436 identical blocked trades — and notifications — across
+			// three symbols with no intraday history. See noteBlockedOnce.
+			e.noteBlockedOnce(sig.Symbol, reason, price, indSnap)
 
 			return
 		}
 
+		// No clearBlockedOnce here: passing the venue gate is not passing
+		// every gate. Clearing at this point wiped a stored sizing refusal
+		// right before sizeBuy refused again, so a symbol that could not be
+		// sized was recorded and notified on every evaluation (EN2-7). The
+		// state is cleared once sizing succeeds, below.
 		price = confirmed
 
 		size := e.sizeBuy(sig.Symbol, price)
 		if !size.OK {
-			e.noteUnsizeable(sig.Symbol, size.Reason, price, indSnap)
+			e.noteBlockedOnce(sig.Symbol, size.Reason, price, indSnap)
 
 			return
 		}
 
-		e.clearUnsizeable(sig.Symbol)
+		// No clearBlockedOnce here either: the guard and Authorize below can
+		// still refuse, and clearing first made every such refusal "new"
+		// again — recorded and notified each evaluation (RK3-3). Cleared once
+		// the buy is approved.
 
 		if size.Note != "" {
 			sig.Reason += " | " + size.Note
@@ -1410,10 +1715,9 @@ func (e *Engine) act(
 		if ok, reason := e.portfolioGuard().AllowEntry(
 			sig.Symbol, snap, size.Notional,
 		); !ok {
-			e.record(TradeRecord{
-				Time: time.Now(), Symbol: sig.Symbol, Side: broker.Buy, Price: price,
-				Status: "blocked", Reason: reason, Indicators: indSnap,
-			})
+			// A full class budget or sector is a standing condition: once,
+			// not every evaluation (RK3-3).
+			e.noteBlockedOnce(sig.Symbol, reason, price, indSnap)
 
 			return
 		}
@@ -1459,7 +1763,15 @@ func (e *Engine) act(
 
 	authOrder, decision := e.rm.Authorize(order, price, snap)
 	if !decision.Approved {
-		e.record(TradeRecord{
+		// A full book (max_open_positions) refuses a standing BUY on every
+		// evaluation — ~1,200 blocked records and notifications an hour
+		// with ten symbols signalling (RK3-3). Once per condition.
+		key := sig.Symbol // shared with the sizing and guard refusals; cleared on approval
+		if order.Side == broker.Sell {
+			key = "sell:" + sig.Symbol
+		}
+
+		e.recordOnce(key, decision.Reason, TradeRecord{
 			Time: time.Now(), Symbol: sig.Symbol, Side: order.Side, Price: price,
 			Status: "blocked", Reason: decision.Reason, Indicators: indSnap,
 		})
@@ -1467,8 +1779,18 @@ func (e *Engine) act(
 		return
 	}
 
+	if authOrder.Side == broker.Buy {
+		e.clearBlockedOnce(sig.Symbol) // past every buy gate: a later refusal is news
+	} else {
+		e.clearBlockedOnce("sell:" + sig.Symbol)
+	}
+
+	dryRunKey := "dry-run:" + string(authOrder.Side) + ":" + sig.Symbol
+
 	if !tradingEnabled {
-		e.record(TradeRecord{
+		// A standing signal with trading off is one dry run, not one per
+		// evaluation (invariant 2).
+		e.recordOnce(dryRunKey, sig.Reason+" | "+decision.Reason, TradeRecord{
 			Time: time.Now(), Symbol: sig.Symbol, Side: authOrder.Side, Qty: authOrder.Qty,
 			Price: price, Value: decision.EstValue, Status: "dry-run",
 			Reason: sig.Reason + " | " + decision.Reason, Indicators: indSnap,
@@ -1477,8 +1799,10 @@ func (e *Engine) act(
 		return
 	}
 
+	e.clearBlockedOnce(dryRunKey) // trading is on: a later dry run is news
+
 	// How the order reaches the venue: market or limit, in one clip or several.
-	plan := planExecution(e.executionConfig(), authOrder, price, false)
+	plan := planExecution(e.planningExecutionConfig(), authOrder, price, false)
 
 	res, filledQty, unconfirmedQty, resting, err := e.submitPlan(ctx, plan, sig.Symbol, price)
 	if err != nil {
@@ -1508,6 +1832,14 @@ func (e *Engine) act(
 		// one's outcome is confirmed yet — the dedupe guard exists precisely
 		// for the in-flight/unconfirmed window.
 		e.markPendingSell(sig.Symbol, sellHeldAtSubmit)
+
+		// Part of it filled and part is still working: the marker moves to
+		// the holding AFTER the fill, so the guard ("held >= marker") keeps
+		// blocking a resubmit until the remainder lands too. At the old
+		// value the partial fill opened the guard at once (EN3-3).
+		if unconfirmedQty > 0 && filledQty > 0 {
+			e.markPendingSell(sig.Symbol, sellHeldAtSubmit-filledQty)
+		}
 	}
 
 	if unconfirmedQty > 0 {
@@ -1643,34 +1975,9 @@ func (e *Engine) venuePrice(symbol string) (float64, string, bool) {
 	return last * e.fxRateFor(symbol), "", true
 }
 
-// finestBarGap infers a candle series' native spacing as the SMALLEST positive
-// gap between consecutive bars.
-//
-// The smallest gap, not the average or the last one: real 1-minute data on an
-// illiquid instrument is full of multi-minute holes where nothing traded, so an
-// average would read as "hourly" and reject perfectly good data. One genuine
-// one-minute step anywhere in the series proves the feed is minute-resolution.
-// Conversely a series that never steps finer than an hour IS hourly data,
-// whatever was asked for. ok is false for a series too short to measure.
+// finestBarGap is market.FinestBarGap, kept for its call sites here.
 func finestBarGap(candles []market.Candle) (time.Duration, bool) {
-	if len(candles) < 2 {
-		return 0, false
-	}
-
-	smallest := time.Duration(0)
-
-	for i := 1; i < len(candles); i++ {
-		gap := candles[i].Time.Sub(candles[i-1].Time)
-		if gap <= 0 {
-			continue
-		}
-
-		if smallest == 0 || gap < smallest {
-			smallest = gap
-		}
-	}
-
-	return smallest, smallest > 0
+	return market.FinestBarGap(candles)
 }
 
 // confirmVenuePrice validates a BUY's price against the broker venue right
@@ -1708,7 +2015,7 @@ func (e *Engine) confirmVenuePrice(
 // auto-trading toggle, since it is an explicit user action. Returns the
 // resulting trade record.
 //
-//nolint:cyclop // mirrors act(): authorize → submit → record in one flow
+//nolint:cyclop,funlen // mirrors act(): authorize → submit → record in one flow
 func (e *Engine) ManualOrder(
 	ctx context.Context,
 	symbol string,
@@ -1751,7 +2058,7 @@ func (e *Engine) ManualOrder(
 	// is about to commit. See risk.Manager.Reserve.
 	var resID uint64
 	if side == broker.Buy {
-		resID = e.rm.ReserveBuy(authOrder.Qty, price)
+		resID = e.rm.ReserveBuy(symbol, authOrder.Qty, price)
 	}
 
 	res, err := e.brk.SubmitOrder(ctx, authOrder)
@@ -1777,15 +2084,31 @@ func (e *Engine) ManualOrder(
 	e.met.onOrder() // count only orders the broker accepted
 
 	if side == broker.Sell {
-		e.markPendingSell(symbol, qty) // dedupe guard for the in-flight/unconfirmed window
+		// Dedupe guard for the in-flight/unconfirmed window. It records the
+		// quantity HELD at submit, never the quantity sold: the guards read
+		// "held >= marker" as "this sell has not landed yet", so marking a
+		// partial sale (3 of 10) left 7 >= 3 true forever and suppressed every
+		// later strategy sell and stop-loss for the symbol (EN2-3).
+		heldAtSubmit, _ := snap.Holding(symbol)
+		e.markPendingSell(symbol, heldAtSubmit.Qty)
 	}
 
 	settled, confirmed := settledQty(res)
+	rem := workingRemainder(authOrder, res, settled) // EN3-3
+
+	if confirmed && side == broker.Sell && rem == 0 {
+		// The outcome is known, so the guard has done its job — the same rule
+		// act applies. Left set, a confirmed partial manual sale kept blocking
+		// exits on brokers without an OrderLister (Sim, Alpaca), which never
+		// reconcile it away.
+		e.clearPendingSell(symbol)
+	}
+
 	if !confirmed {
 		// Ambiguous — leave resID reserved rather than guess; see
 		// risk.Manager.Reserve's fails-closed guidance.
 		rec := e.flagUnconfirmed(symbol, side, authOrder.Qty, res,
-			"manual | "+decision.Reason+" | broker did not confirm this order's outcome")
+			"manual | "+decision.Reason+" | broker did not confirm this order's outcome", resID)
 		e.syncPortfolio(ctx)
 
 		return rec, nil
@@ -1794,12 +2117,9 @@ func (e *Engine) ManualOrder(
 	e.rm.Release(resID) // settled one way or the other; RecordBuy books the real spend
 
 	if side == broker.Sell && settled <= 0 {
-		// A confirmed rejection/cancellation, not an unknown outcome — clear
-		// the dedupe guard (see the identical case in exitPosition) so a
-		// still-held position isn't permanently unsellable on a broker that
-		// doesn't implement OrderLister.
-		e.clearPendingSell(symbol)
-
+		// A confirmed rejection/cancellation, not an unknown outcome — the
+		// dedupe guard was already cleared above, so a still-held position
+		// isn't permanently unsellable on a broker without an OrderLister.
 		rec := TradeRecord{
 			Time: time.Now(), Symbol: symbol, Side: side, Price: price,
 			Status: filledOr(res.Status, settled), Reason: "manual | " + decision.Reason,
@@ -1853,6 +2173,24 @@ func (e *Engine) ManualOrder(
 		e.recordOpen(symbol, settled, fillPx, indSnap)
 	} else {
 		e.recordClose(symbol, settled)
+	}
+
+	// The rest of a partly filled order is still working (EN3-3): reported,
+	// a buy's reservation re-made, and a sell's guard moved to the holding
+	// left after the fill so nothing re-sells it while it works.
+	if rem > 0 {
+		var resIDs []uint64
+
+		if side == broker.Buy {
+			resIDs = append(resIDs, e.rm.ReserveBuy(symbol, rem, price))
+		} else {
+			held, _ := snap.Holding(symbol)
+			e.markPendingSell(symbol, held.Qty-settled)
+		}
+
+		e.flagUnconfirmed(symbol, side, rem, res,
+			"manual | partly filled at the broker's wait deadline; the rest is still working or its outcome is unknown",
+			resIDs...)
 	}
 
 	e.syncPortfolio(ctx)
@@ -1916,14 +2254,33 @@ func (e *Engine) feedProtections(t TradeRecord) {
 	stopped := strings.Contains(t.Reason, "stop-loss") ||
 		strings.Contains(t.Reason, "trailing-stop")
 
-	p.RecordClose(t.Symbol, *t.PnL, stopped)
+	// Cooldown, stop guard and low-profit lock judge the whole round trip,
+	// once (PR2-6); the realized-drawdown halt below is a running sum and
+	// takes every tranche as it lands.
+	if trip, closed := e.closeTranche(t.Symbol, t.Qty, *t.PnL, stopped); closed {
+		p.RecordClose(t.Symbol, trip.pnl, trip.stopped)
+	}
 
 	if reason := p.ObserveRealizedClose(*t.PnL); reason != "" {
 		e.haltFromProtections(reason)
 	}
+
+	e.persistProtectionsIfChanged(false)
+}
+
+// truncateRunes cuts s to at most n runes, marking the cut.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+
+	return string(r[:n]) + "…"
 }
 
 // alert forwards a trade record to the notifier as the appropriate event kind.
+//
+//nolint:cyclop // one branch per trade status a notification maps from
 func (e *Engine) alert(t TradeRecord) {
 	n := e.notifyOf()
 	if n == nil {
@@ -1946,23 +2303,51 @@ func (e *Engine) alert(t TradeRecord) {
 			e.announcedOrderError(t.Symbol, string(t.Side)+"|"+t.Err) {
 			return
 		}
-	case "halted":
-		kind = notify.KindHalt
-	case "unknown":
-		// An order the broker never confirmed — as urgent as a halt: an
-		// operator needs to reconcile it by hand, and the bot cannot.
+	case "halted", "unknown":
+		// "unknown" is an order the broker never confirmed — as urgent as a
+		// halt: an operator needs to reconcile it by hand, and the bot cannot.
 		kind = notify.KindHalt
 	case "dry-run":
 		return // a dry run placed nothing; not worth a notification
+	case "cancelled", "modified", "bracket-submitted":
+		// Order bookkeeping, not fills. Falling through to KindTrade sent a
+		// cancel as "✅ BUY X qty 0" and an unfilled bracket entry as a fill
+		// at full size and value (NT2-4).
+		kind = notify.KindAudit
 	}
 
-	if t.Status != "error" && t.Symbol != "" {
+	// Nothing filled is never a trade. A broker-confirmed zero carries the
+	// broker's own word — "rejected", Alpaca's "canceled", "expired",
+	// "unfilled" — which fell through to KindTrade: a refused stop-loss
+	// arrived as "✅ SELL X qty 0.0000", or not at all under min_notional,
+	// which drops small trades and a zero is the smallest (NT3-2). It is a
+	// failed order, announced once per condition like the "error" ones.
+	refused := kind == notify.KindTrade && t.Side != "" && t.Qty <= 0
+	if refused {
+		kind = notify.KindError
+
+		if t.Symbol != "" && e.announcedOrderError(t.Symbol, string(t.Side)+"|"+t.Status) {
+			return
+		}
+	}
+
+	if t.Status != "error" && !refused && t.Symbol != "" {
 		e.clearOrderError(t.Symbol) // the condition cleared; a recurrence is news again
 	}
 
 	title := fmt.Sprintf("%s %s", strings.ToUpper(string(t.Side)), t.Symbol)
 	if t.Symbol == "" {
 		title = t.Status
+	}
+
+	// A failed order must say so. Its title read exactly like a fill's and the
+	// broker's error was never included: a failed stop-loss sell arrived as
+	// "⚠️ SELL AAPL / qty 10 @ 150.00 / stop_loss" (NT2-3).
+	switch {
+	case t.Status == "error":
+		title = "ORDER FAILED: " + title
+	case refused:
+		title = "ORDER NOT FILLED (" + t.Status + "): " + title
 	}
 
 	text := fmt.Sprintf("qty %.4f @ %.2f (%.2f)", t.Qty, t.Price, t.Value)
@@ -1972,6 +2357,10 @@ func (e *Engine) alert(t TradeRecord) {
 
 	if t.Reason != "" {
 		text += "\n" + t.Reason
+	}
+
+	if t.Err != "" {
+		text += "\nerror: " + truncateRunes(t.Err, 300)
 	}
 
 	n.Send(notify.Event{
@@ -2000,6 +2389,12 @@ func (e *Engine) guardOrderRate(automated bool) bool {
 
 	limit := e.safety.MaxOrdersPerMin
 	if automated && limit > 0 && len(e.orderTimes) >= limit {
+		// Announced on the TRANSITION only. Every refused attempt used to
+		// re-trip and record another "halted" — each an urgent-lane alert —
+		// so one trip could fill the 8-slot urgent queue and push out a real
+		// drawdown halt raised the same tick (NT3-1).
+		wasOn := e.tradingEnabled || e.testModeActive
+		count := len(e.orderTimes)
 		wasTestModeActive := e.tripBreakerLocked() // trip the breaker; e.mu is already held here
 		e.mu.Unlock()
 
@@ -2007,12 +2402,14 @@ func (e *Engine) guardOrderRate(automated bool) bool {
 			e.EndTestMode("trade-rate circuit breaker tripped")
 		}
 
-		e.log.Error("trade-rate circuit breaker tripped — automated trading halted",
-			"orders_last_min", len(e.orderTimes), "limit", limit)
-		e.record(TradeRecord{
-			Time: time.Now(), Status: "halted",
-			Reason: fmt.Sprintf("circuit breaker: >= %d orders/min — trading disabled", limit),
-		})
+		if wasOn {
+			e.log.Error("trade-rate circuit breaker tripped — automated trading halted",
+				"orders_last_min", count, "limit", limit)
+			e.record(TradeRecord{
+				Time: time.Now(), Status: "halted",
+				Reason: fmt.Sprintf("circuit breaker: >= %d orders/min — trading disabled", limit),
+			})
+		}
 
 		return false
 	}
@@ -2034,6 +2431,11 @@ func (e *Engine) recordOpen(symbol string, qty, price float64, entryIndicators s
 		return
 	}
 
+	// Read before taking the lock — atrFor takes it itself. Only an add uses
+	// them (exits.RebaseOnAdd), but both are cheap.
+	exitCfg := e.ExitsConfig()
+	atr := e.atrFor(symbol)
+
 	e.mu.Lock()
 	// A buy means any earlier sell for this symbol has settled; drop a stale
 	// pending-sell marker so it can't block a future exit of the new position.
@@ -2041,6 +2443,10 @@ func (e *Engine) recordOpen(symbol string, qty, price float64, entryIndicators s
 
 	p, ok := e.openPos[symbol]
 	if !ok {
+		// A new position starts a new round trip; anything left over is
+		// from a record forgotten or dropped mid-exit (PR2-6).
+		delete(e.roundTrip, symbol)
+
 		p = &OpenPosition{
 			Symbol:          symbol,
 			EntryPrice:      price,
@@ -2050,10 +2456,23 @@ func (e *Engine) recordOpen(symbol string, qty, price float64, entryIndicators s
 		}
 		e.openPos[symbol] = p
 	} else {
+		oldEntry := p.EntryPrice
+
 		newQty := p.Qty + qty
 		if newQty > 0 {
 			p.EntryPrice = (p.EntryPrice*p.Qty + price*qty) / newQty // weighted entry
 		}
+
+		// The add moved the average cost under a peak reached against the old
+		// one; re-base it and keep the pre-add trail as a floor, the rule the
+		// backtester applies too. Without it a scale-in could arm the tight
+		// trail above the price and sell the whole position at a loss on the
+		// next check (EX2-1).
+		peak := max(p.Peak, e.peaks[symbol])
+		floor := exits.FloorFor(exitCfg, p.TrailFloor, p.TrailFloorKey)
+		p.Peak, p.TrailFloor = exits.RebaseOnAdd(exitCfg, oldEntry, peak, floor, atr, p.EntryPrice, price)
+		p.TrailFloorKey = exits.TrailKey(exitCfg)
+		e.peaks[symbol] = p.Peak
 
 		p.Adds++ // a pyramid or scale-in step, capped by scale_in.max_adds
 	}
@@ -2080,12 +2499,9 @@ func (e *Engine) recordOpen(symbol string, qty, price float64, entryIndicators s
 		e.peaks[symbol] = price
 	}
 
-	snap := *p
 	e.mu.Unlock()
 
-	if err := e.store.SaveOpenPosition(snap); err != nil {
-		e.log.Warn("persist open position failed", "symbol", symbol, "err", err)
-	}
+	e.persistOpenPosition(symbol, "open position")
 }
 
 // recordClose reduces (or closes) an open position after a sell fills and
@@ -2109,27 +2525,21 @@ func (e *Engine) recordClose(symbol string, qty float64) {
 
 	p.Qty -= qty
 
-	closed := p.Qty <= 1e-9
+	// sellDustQty, not 1e-9: a residual between the two (a fractional
+	// broker's booked buy vs sold quantity differing in the 7th decimal) is
+	// something nothing ever sells, so the record stayed open for good — the
+	// protections never judged the trade, and the next buy ADDED to the
+	// stale record, carrying its loss into an unrelated trade (PR3-1).
+	closed := p.Qty <= sellDustQty
 
 	if closed {
 		delete(e.openPos, symbol)
 		delete(e.peaks, symbol)
 	}
 
-	snap := *p
 	e.mu.Unlock()
 
-	var err error
-
-	if closed {
-		err = e.store.DeleteOpenPosition(symbol)
-	} else {
-		err = e.store.SaveOpenPosition(snap)
-	}
-
-	if err != nil {
-		e.log.Warn("persist open position failed", "symbol", symbol, "err", err)
-	}
+	e.persistOpenPosition(symbol, "open position") // a delete once closed
 }
 
 // pendingFillGrace bounds how long pendingExposure will keep overlaying an
@@ -2207,16 +2617,20 @@ func (e *Engine) pendingExposure(snap portfolio.Snapshot) portfolio.Snapshot {
 			continue // stale drift, not a fill still settling — see pendingFillGrace
 		}
 
-		existing, held := snap.Holding(sym)
+		existing, _ := snap.Holding(sym)
 
 		price := p.EntryPrice
 		if cached, ok := e.prices.Get(sym); ok && cached > 0 {
 			price = cached
 		}
 
-		if held {
-			snap.Invested -= existing.MarketValue
-		} else {
+		// A zero-qty or dust row (a broker still reporting the position just
+		// closed) is not a position, so the overlay turning it into one must
+		// count it — otherwise max_open_positions admits one symbol too many
+		// (PF2-3). Its value is replaced either way.
+		snap.Invested -= existing.MarketValue // zero when not held
+
+		if !existing.Held() { // a missing row reads as the zero Holding
 			snap.OpenPositions++
 		}
 
@@ -2320,17 +2734,24 @@ func (e *Engine) ForgetOpenPosition(symbol string) bool {
 
 	if delta := beforeEquity - afterEquity; delta > 0 {
 		e.Protections().LowerPeak(delta)
+		// Saved at once: a restart that restored the old, phantom-inflated
+		// peak would trip exactly the false halt LowerPeak just prevented.
+		e.persistProtectionsIfChanged(true)
 	}
 
-	if err := e.store.DeleteOpenPosition(symbol); err != nil {
-		e.log.Warn("delete open position failed", "symbol", symbol, "err", err)
-	}
+	e.persistOpenPosition(symbol, "forgotten open position")
 
 	e.log.Info("open position forgotten (closed outside the bot)",
 		"symbol", symbol, "qty", qty)
 
 	return true
 }
+
+// ErrNotAdoptable and ErrOrderInFlight are AdoptHeldPosition's refusals.
+var (
+	ErrNotAdoptable  = errors.New("not held at the broker, or already tracked")
+	ErrOrderInFlight = errors.New("a buy of it is still working or unconfirmed at the broker — wait for it to resolve")
+)
 
 // AdoptHeldPosition creates a durable record for a position the broker
 // reports but the bot has none for — the mirror case to ForgetOpenPosition,
@@ -2362,14 +2783,30 @@ func (e *Engine) ForgetOpenPosition(symbol string) bool {
 // for reasons unrelated to this specific position and trip an immediate,
 // unwarranted trailing stop.
 //
-// It returns false when the symbol is not held at the broker, or a record
-// already exists — this is only for the "held, not tracked" row; a
-// quantity mismatch where the bot already has a (wrong) record is a
-// different kind of drift, not handled here.
-func (e *Engine) AdoptHeldPosition(symbol string) bool {
+// It returns ErrNotAdoptable when the symbol is not held at the broker (dust
+// counts as not held, PF3-4), or a record already exists — this is only for
+// the "held, not tracked" row; a quantity mismatch where the bot already has
+// a (wrong) record is a different kind of drift, not handled here.
+//
+// And ErrOrderInFlight while a buy of the symbol is still working or
+// unconfirmed. A partly filled resting limit buy shows as "held, not
+// tracked", and adopting it put its filled part in openPos — which
+// filledWhileResting reads as "nothing filled while resting", so at the
+// timeout the market fallback re-bought the WHOLE clip: 100 ordered, 60
+// filled, 160 bought (AP3-2). The automatic adopter waits out a grace for the
+// same reason.
+func (e *Engine) AdoptHeldPosition(symbol string) error {
 	h, held := e.pf.Holding(symbol)
-	if !held || h.Qty <= 0 {
-		return false
+	if !held || !h.Held() {
+		return ErrNotAdoptable
+	}
+
+	e.mu.RLock()
+	resting := e.restingWatchers[symbol] > 0
+	e.mu.RUnlock()
+
+	if resting || e.hasUnconfirmedBuy(symbol) || e.rm.HasReservation(symbol) {
+		return ErrOrderInFlight
 	}
 
 	price := h.LastPrice
@@ -2395,21 +2832,19 @@ func (e *Engine) AdoptHeldPosition(symbol string) bool {
 	if _, tracked := e.openPos[symbol]; tracked {
 		e.mu.Unlock()
 
-		return false
+		return ErrNotAdoptable
 	}
 
 	e.openPos[symbol] = pos
 	e.peaks[symbol] = pos.Peak
 	e.mu.Unlock()
 
-	if err := e.store.SaveOpenPosition(*pos); err != nil {
-		e.log.Warn("persist adopted open position failed", "symbol", symbol, "err", err)
-	}
+	e.persistOpenPosition(symbol, "adopted open position")
 
 	e.log.Info("open position adopted (held at the broker, not previously tracked)",
 		"symbol", symbol, "qty", pos.Qty, "entry_price", pos.EntryPrice)
 
-	return true
+	return nil
 }
 
 // OpenPositions returns the bot's durable open-position records, sorted.
@@ -2428,7 +2863,15 @@ func (e *Engine) OpenPositions() []OpenPosition {
 }
 
 // persistSpend records the current rolling daily spend after a buy fill.
+//
+// Not while test mode is active: a simulated buy's spend is not real, and a
+// restart later the same day would restore it and refuse real buys against
+// it (SG3-1). EndTestMode persists the restored real figure.
 func (e *Engine) persistSpend() {
+	if e.inTestMode() {
+		return
+	}
+
 	if err := e.store.SaveDailySpend(today(), e.rm.SpentToday()); err != nil {
 		e.log.Warn("persist daily spend failed", "err", err)
 	}
@@ -2464,6 +2907,29 @@ func (e *Engine) syncPortfolioIfStale(ctx context.Context) {
 	e.syncPortfolio(ctx)
 }
 
+// syncPrice picks the price a synced holding is marked at. A live tick beats
+// the broker's last price only while it is FRESH. Taking any cached tick,
+// however old, overwrote the broker's current price with a frozen one whenever
+// the feed stalled — and checkExits' stale-tick fallback reads h.LastPrice,
+// i.e. this same frozen tick, so the fallback could never reach the broker's
+// price at all. A stop at 90 with the broker at 80 and a 30-minute-old tick at
+// 120 never fired (PF2-1). e.prices holds prices already converted to the
+// preferred currency (ingest applies fxRateFor before caching), consistent
+// with the broker's Current/AvgPrice — no further conversion needed.
+func (e *Engine) syncPrice(symbol string, brokerPx float64) float64 {
+	if cached, ok := e.prices.GetFresh(symbol, maxExitPriceAge); ok && cached > 0 {
+		return cached
+	}
+
+	if brokerPx <= 0 {
+		if cached, ok := e.prices.Get(symbol); ok && cached > 0 {
+			return cached // the broker gave no price at all: an old tick beats none
+		}
+	}
+
+	return brokerPx
+}
+
 // syncPortfolio refreshes cash and positions from the broker and marks prices.
 func (e *Engine) syncPortfolio(ctx context.Context) {
 	defer func() {
@@ -2491,26 +2957,24 @@ func (e *Engine) syncPortfolio(ctx context.Context) {
 		return
 	}
 
+	conflicted := conflictingFXRates(positions)
+
 	hs := make([]portfolio.Holding, len(positions))
 	for i, p := range positions {
 		// Positions carry the most current, broker-authoritative FX rate for
 		// their symbol; refresh the engine's cache from it opportunistically
 		// so ingest() converts live ticks correctly even between
-		// refreshFXRates' hourly full-watchlist passes.
-		if p.FXRate != 0 {
-			e.fxMu.Lock()
-			e.fxRates[p.Symbol] = p.FXRate
-			e.fxMu.Unlock()
+		// refreshFXRates' hourly full-watchlist passes — unless rows that
+		// merge into this symbol disagree on the rate (see
+		// conflictingFXRates).
+		if p.FXRate != 0 && !conflicted[portfolio.Normalize(p.Symbol)] {
+			// Through setFXRate, not a bare map write: a rate arriving here
+			// for the first time must re-scale the bars that were built
+			// without it, exactly as one arriving via resolveFXRates does.
+			e.setFXRate(p.Symbol, p.FXRate)
 		}
 
-		px := p.Current
-		if cached, ok := e.prices.Get(p.Symbol); ok {
-			// e.prices holds prices already converted to the preferred
-			// currency (ingest applies fxRateFor before caching), consistent
-			// with p.Current/AvgPrice from the broker — no further conversion
-			// needed here.
-			px = cached
-		}
+		px := e.syncPrice(p.Symbol, p.Current)
 
 		hs[i] = portfolio.Holding{
 			Symbol: p.Symbol, Qty: p.Qty, AvgPrice: p.AvgPrice, LastPrice: px,
@@ -2518,13 +2982,31 @@ func (e *Engine) syncPortfolio(ctx context.Context) {
 		}
 	}
 
-	e.pf.SyncPositions(hs)
+	for sym := range conflicted {
+		errlog.RecordOncef("broker", "%s: positions that map to this symbol are in different currencies; "+
+			"their FX rates are not applied to its live ticks, which would otherwise be converted "+
+			"by whichever listing the broker reported last — check the symbol mapping", sym)
+	}
+
+	// Rows that collapse onto one key were merged, not dropped (PF2-2), but
+	// a collision means the broker → symbol mapping is ambiguous, which the
+	// operator should know about. Once per symbol: this runs every eval.
+	for _, sym := range e.pf.SyncPositions(hs) {
+		errlog.RecordOncef("broker", "%s: the broker reported several positions that map to this one symbol; "+
+			"they are merged, so a full exit sends their SUM through one listing — which the broker "+
+			"may reject, or on a margin account fill partly short; check the symbol mapping", sym)
+	}
+
 	e.adoptUntrackedHoldings(hs)
 
 	// Drop trailing-stop peaks for positions no longer held.
+	// Keyed normalised, like the peaks themselves (checkExits writes them under
+	// the snapshot's normalised keys, EN-6): a raw broker symbol in another
+	// case never matched, so its trailing-stop peak was deleted on every sync
+	// and the trail re-seeded from scratch (EN2-11).
 	held := make(map[string]struct{}, len(hs))
 	for _, h := range hs {
-		held[h.Symbol] = struct{}{}
+		held[portfolio.Normalize(h.Symbol)] = struct{}{}
 	}
 
 	e.mu.Lock()
@@ -2590,6 +3072,17 @@ func (e *Engine) checkDrawdown() {
 	if reason := p.ObserveEquity(equity); reason != "" {
 		e.haltFromProtections(reason)
 	}
+
+	e.persistProtectionsIfChanged(false)
+}
+
+// ProtectedEquity is the account equity exactly as checkDrawdown measures it —
+// the broker snapshot with pending fills overlaid. Resume re-bases the
+// protections on it so the baseline and every later measurement agree.
+func (e *Engine) ProtectedEquity() float64 {
+	snap := e.pendingExposure(e.pf.Snapshot())
+
+	return snap.Cash + snap.Invested
 }
 
 // PersistProtectionState saves the protections' halt/peak/day-equity state so
@@ -2604,9 +3097,7 @@ func (e *Engine) PersistProtectionState() {
 		return
 	}
 
-	if err := e.store.SaveProtectionState(p.ExportState()); err != nil {
-		e.log.Warn("persist protection state failed", "err", err)
-	}
+	e.saveProtectionState(p.ExportState())
 }
 
 // RestoreProtectionState loads previously-persisted halt/peak/day-equity
@@ -2656,6 +3147,7 @@ func (e *Engine) StrategyConfig() config.StrategyConfig {
 // SetStrategyConfig rebuilds the strategy from new settings at runtime.
 func (e *Engine) SetStrategyConfig(cfg config.StrategyConfig) {
 	s := strategy.New(cfg)
+	e.reportWarmup("strategy", s)
 
 	e.mu.Lock()
 
@@ -2788,7 +3280,12 @@ func (e *Engine) sizeBuy(symbol string, price float64) risk.BuySize {
 	}
 	e.mu.RUnlock()
 
-	return e.rm.SizeBuy(symbol, price, e.pf.Snapshot(), cfg, e.atrFor(symbol))
+	// The pending-exposure overlay, the same view every caller then hands
+	// Authorize. Sizing from the raw broker snapshot applied the risk ratio to
+	// headroom that fills not yet reported had already used, and Authorize then
+	// clamped the result to the real headroom — so a wide-stop trade went out
+	// at full headroom instead of its risk-scaled fraction (EN2-10).
+	return e.rm.SizeBuy(symbol, price, e.pendingExposure(e.pf.Snapshot()), cfg, e.atrFor(symbol))
 }
 
 // Sizing returns the current order-sizing settings.

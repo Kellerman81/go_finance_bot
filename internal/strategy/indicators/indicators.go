@@ -172,8 +172,17 @@ func RSILast(values []float64, period int) (float64, bool) {
 }
 
 // rsiFrom converts average gain/loss into the 0–100 RSI value.
+//
+// No movement at all (both averages 0) is neutral, 50 — not 100. Reading it
+// as maximally overbought made the RSI detector vote a full-strength SELL on
+// any halted or frozen instrument (IN2-2). A window with gains and no losses
+// is still 100.
 func rsiFrom(avgGain, avgLoss float64) float64 {
 	if avgLoss == 0 {
+		if avgGain == 0 {
+			return 50
+		}
+
 		return 100
 	}
 

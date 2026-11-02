@@ -156,8 +156,14 @@ func (d *trendDetector) Detect(s series) (Action, float64, string) {
 	// fraction of the current price catches both, anchored to something that
 	// scales with the instrument instead of a hardcoded epsilon. See
 	// CODE_REVIEW_FINDINGS.md's trend-formula-singularity finding.
+	//
+	// Not |base|, though: a NEGATIVE intercept is no anchor at all, however
+	// large. The magnitude test let one below -1% of the price through as the
+	// denominator, which flips the sign of the move — 80 flat bars at 1 then a
+	// ramp to 21 read "SELL -471%", and the default trend gate blocked the BUY
+	// (ST2-2). Any base under 1% of the price, negative included, falls back.
 	base := intercept
-	if math.Abs(base) < 0.01*s.close[n-1] {
+	if base < 0.01*s.close[n-1] {
 		base = s.close[n-1]
 	}
 

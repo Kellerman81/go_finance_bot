@@ -78,8 +78,10 @@ type Measures struct {
 	MaxDrawdownPct float64
 
 	// RoundTripCostPct is what one complete trade costs in this instrument —
-	// its spread paid twice, plus commission — as a fraction of price.
-	// TypicalMovePct is the median bar range over the same window.
+	// its spread paid once (half on each fill), plus commission and slippage
+	// on both legs — as a fraction of price (SC2-5; this comment still said
+	// "paid twice" until SC3-8). TypicalMovePct is the median absolute
+	// close-to-close move over the same window.
 	//
 	// Their ratio is the only screening number that decides whether an
 	// instrument can be profitable AT ALL: something that moves 0.1% a bar
@@ -221,6 +223,14 @@ var filters = map[string]Filter{
 				return ""
 			}
 
+			// A genuinely measured zero move — a stale listing whose close
+			// never changes (SC2-6) — is refused for the right reason: it
+			// was reported as "unmeasurable", which sends an operator
+			// looking for a broken feed (SC3-8).
+			if m.SpreadOK && m.RoundTripCostPct > 0 && m.TypicalMovePct == 0 {
+				return "no price movement measured (typical move 0%) — cannot clear any round-trip cost"
+			}
+
 			if !m.CostOK {
 				return "round-trip cost unmeasurable, refused rather than assumed cheap"
 			}
@@ -254,7 +264,7 @@ var filters = map[string]Filter{
 			}
 
 			if m.SpreadPct > cfg.MaxSpreadPct {
-				return fmt.Sprintf("spread %.3f%% above max %.3f%% (paid twice per round trip)",
+				return fmt.Sprintf("spread %.3f%% above max %.3f%% (paid once per round trip, half on each fill)",
 					m.SpreadPct*100, cfg.MaxSpreadPct*100)
 			}
 
@@ -312,7 +322,7 @@ func measure(cols series) Measures {
 		}
 	}
 
-	if s, ok := indicators.HighLowSpread(cols.high, cols.low); ok {
+	if s, ok := indicators.HighLowSpreadAdjusted(cols.high, cols.low, cols.closes); ok {
 		m.SpreadPct = s
 		m.SpreadOK = true
 	}
@@ -331,14 +341,23 @@ func measure(cols series) Measures {
 // measureCost fills the round-trip cost fields. It is separate from measure
 // because it is the only measurement that needs to know the commission model,
 // which is configured outside the screener.
-func (m *Measures) measureCost(cols series, commissionPct float64) {
+func (m *Measures) measureCost(cols series, costs config.CostsConfig) {
 	if m.Price <= 0 || !m.SpreadOK {
 		return
 	}
 
-	// The spread is crossed twice — once in, once out — and commission is
-	// charged on both legs too. This is the real cost of one complete trade.
-	m.RoundTripCostPct = 2*m.SpreadPct + 2*commissionPct
+	// The cost of one complete trade, charged the way the backtester and the
+	// simulated broker charge it: Corwin-Schultz S is the FULL spread, and
+	// each fill pays half of it, so a round trip pays S once — "2×spread"
+	// demanded twice the move it should have (SC2-5). Slippage and commission
+	// are paid on both legs. The configured spread_pct stays a floor, as in
+	// CostsFor — but the measured spread always counts, measure_spread or not:
+	// judging each instrument's own spread is what this filter is for.
+	// (Flat/minimum commission depends on order size, unknown here.)
+	m.RoundTripCostPct = math.Max(
+		m.SpreadPct,
+		costs.SpreadPct,
+	) + 2*(costs.CommissionPct+costs.SlippagePct)
 	m.TypicalMovePct = medianAbsReturn(cols.closes)
 	m.CostOK = m.RoundTripCostPct > 0 && m.TypicalMovePct > 0
 }
@@ -450,9 +469,11 @@ func medianAbsReturn(closes []float64) float64 {
 			continue
 		}
 
-		if r := math.Abs(closes[i]/closes[i-1] - 1); r > 0 {
-			moves = append(moves, r)
-		}
+		// Unchanged bars count: they are exactly what a stale, illiquid
+		// listing produces, and dropping them inflated its "typical move" —
+		// 80% unchanged bars and 20% at ±0.5% read as 0.5% instead of 0
+		// (SC2-6). A median of 0 trips the cost filter's fail-closed path.
+		moves = append(moves, math.Abs(closes[i]/closes[i-1]-1))
 	}
 
 	if len(moves) == 0 {

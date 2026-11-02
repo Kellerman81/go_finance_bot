@@ -11,12 +11,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	_ "time/tzdata" // bundle the IANA tz database, same as cmd/bot — see CODE_REVIEW_FINDINGS.md's tzdata finding
 
 	"github.com/Kellerman81/go_finance_bot/internal/backtest"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
+	"github.com/Kellerman81/go_finance_bot/internal/storage"
 	"github.com/Kellerman81/go_finance_bot/internal/strategy"
 )
 
@@ -33,6 +35,7 @@ type options struct {
 	ruin       *float64
 	seed       *int64
 	jsonOut    *bool
+	dbPath     *string
 }
 
 // parseFlags declares and parses the command line.
@@ -56,6 +59,9 @@ func parseFlags() options {
 			"drawdown treated as ruin when reporting -montecarlo probabilities"),
 		seed:    flag.Int64("seed", 1, "random seed (reproducible -montecarlo runs)"),
 		jsonOut: flag.Bool("json", false, "emit full result (incl. trades) as JSON"),
+		dbPath: flag.String("db", "",
+			"bot database (a COPY is safest; opened read-only) to take the auto-learned "+
+				"asset classes and sectors from, so portfolio caps bucket symbols as live does"),
 	}
 
 	flag.Parse()
@@ -152,10 +158,28 @@ func main() {
 	// now a cap to search or probe under, not the target it used to be.
 	size := *orderSize
 
+	if *opts.dbPath != "" {
+		sectors, classes, err := storage.ReadLearnedLabels(*opts.dbPath)
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "read -db:", err)
+
+			os.Exit(1)
+		}
+
+		cfg.Sectors = layerLabels(sectors, cfg.Sectors)
+		cfg.AssetClasses = layerLabels(classes, cfg.AssetClasses)
+	}
+
+	for _, w := range unbucketedWarnings(cfg, data) {
+		_, _ = fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+
 	res := backtesterFor(cfg, *cash, size).Run(data)
 
 	if *montecarlo > 0 {
-		res.MonteCarlo = backtest.Bootstrap(res.RoundTrips, *cash, *montecarlo, *ruin, *seed)
+		// Closed trips, not tranches: a scale-out ladder's rungs are one trade,
+		// not independent draws (BT3-2).
+		res.MonteCarlo = backtest.Bootstrap(res.Trips, *cash, *montecarlo, *ruin, *seed)
 	}
 
 	if *jsonOut {
@@ -191,6 +215,7 @@ func backtesterFor(cfg config.Config, cash, orderSize float64) *backtest.Backtes
 		KeepInterval:     cfg.Engine.KeepInterval,
 		MaxRiskSizeUSD:   cfg.Engine.MaxRiskSizeUSD,
 		MinOrderSizeUSD:  cfg.Engine.MinOrderSizeUSD,
+		MinPositions:     cfg.Engine.MinPositions,
 		Portfolio:        cfg.Portfolio,
 		Sectors:          cfg.Sectors,
 		AssetClasses:     cfg.AssetClasses,
@@ -225,6 +250,11 @@ func printReport(r backtest.Result, data map[string][]market.Candle) {
 	fmt.Println("================ BACKTEST REPORT ================")
 	fmt.Printf("Symbols          : %s\n", strings.Join(syms, ", "))
 	fmt.Printf("Bars             : %d\n", r.Bars)
+
+	if r.Misaligned != "" {
+		fmt.Printf("WARNING          : symbols' bars do not line up in time (%s)\n", r.Misaligned)
+	}
+
 	fmt.Printf("Starting cash    : %12.2f\n", r.StartingCash)
 	fmt.Printf("Final equity     : %12.2f\n", r.FinalEquity)
 
@@ -294,6 +324,72 @@ func splitSymbols(s string) []string {
 			out = append(out, p)
 		}
 	}
+
+	return out
+}
+
+// layerLabels puts the hand-written map over the learned one — config wins,
+// the same order the live engine layers them in.
+func layerLabels(learned, hand map[string]string) map[string]string {
+	out := make(map[string]string, len(learned)+len(hand))
+	for k, v := range learned {
+		out[strings.ToUpper(strings.TrimSpace(k))] = v
+	}
+
+	for k, v := range hand {
+		out[strings.ToUpper(strings.TrimSpace(k))] = v
+	}
+
+	return out
+}
+
+// unbucketedWarnings names the backtested symbols a portfolio cap cannot see.
+// Live layers the auto-learned classes and sectors under config.yaml's maps;
+// this command has only the hand-written ones unless -db is given, so with
+// classes left to the classifier every symbol fell in "unclassified" and ran
+// uncapped and unslotted — sizing and exposure that live never allows, with
+// nothing saying so (CM2-4).
+func unbucketedWarnings(cfg config.Config, data map[string][]market.Candle) []string {
+	if !cfg.Portfolio.Enabled {
+		return nil
+	}
+
+	var out []string
+
+	classCapped := len(cfg.Portfolio.MaxPctPerAssetClass) > 0 ||
+		len(cfg.Portfolio.MinPositionsPerAssetClass) > 0
+	if missing := unlabelled(data, cfg.AssetClasses); classCapped && len(missing) > 0 {
+		out = append(
+			out,
+			fmt.Sprintf("asset-class caps are on but %d symbol(s) have no class here (%s) "+
+				"— they count as unclassified, which live would not; pass -db with a copy of the bot "+
+				"database or list them under asset_classes:", len(missing), strings.Join(missing, ", ")),
+		)
+	}
+
+	sectorCapped := cfg.Portfolio.MaxPerSector > 0 || cfg.Portfolio.MaxPositionsPerSector > 0
+	if missing := unlabelled(data, cfg.Sectors); sectorCapped && len(missing) > 0 {
+		out = append(
+			out,
+			fmt.Sprintf("sector caps are on but %d symbol(s) have no sector here (%s) "+
+				"— pass -db or list them under sectors:", len(missing), strings.Join(missing, ", ")),
+		)
+	}
+
+	return out
+}
+
+// unlabelled lists, sorted, the symbols of data that labels has no entry for.
+func unlabelled(data map[string][]market.Candle, labels map[string]string) []string {
+	var out []string
+
+	for sym := range data {
+		if _, ok := labels[strings.ToUpper(strings.TrimSpace(sym))]; !ok {
+			out = append(out, sym)
+		}
+	}
+
+	slices.Sort(out)
 
 	return out
 }

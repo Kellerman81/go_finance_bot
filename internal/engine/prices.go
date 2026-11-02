@@ -3,6 +3,9 @@ package engine
 import (
 	"sync"
 	"time"
+
+	"github.com/Kellerman81/go_finance_bot/internal/broker"
+	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
 )
 
 // priceEntry is one symbol's last known price plus when it was recorded, so
@@ -35,6 +38,21 @@ func (c *PriceCache) Set(symbol string, price float64) {
 
 	c.m[symbol] = priceEntry{price: price, at: time.Now()}
 	c.mu.Unlock()
+}
+
+// Rescale multiplies symbol's cached price by factor and KEEPS its timestamp.
+// A currency rescale changes the units, not when the price was observed: going
+// through Set re-stamped a 30-minute-old tick as fresh, and for the next
+// maxExitPriceAge checkExits and syncPrice trusted a frozen price over the
+// broker's — a stop at 90 with the broker at 80 did not fire (PF3-1).
+func (c *PriceCache) Rescale(symbol string, factor float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if e, ok := c.m[symbol]; ok {
+		e.price *= factor
+		c.m[symbol] = e
+	}
 }
 
 // Get returns the latest price for a symbol and whether one exists, with no
@@ -113,6 +131,32 @@ func (c *PriceCache) Snapshot() map[string]float64 {
 	out := make(map[string]float64, len(c.m))
 	for k, v := range c.m {
 		out[k] = v.price
+	}
+
+	return out
+}
+
+// conflictingFXRates returns the normalised symbols whose broker rows report
+// DIFFERENT FX rates — two listings (Saxo SAP:xetr in EUR, SAP:xnys in USD)
+// that merge into one symbol (PF2-2). Each row wrote its own rate into the one
+// fxRates entry, so the last row listed won: the feed quotes ONE listing, and
+// if the winner was the other one every tick was converted by EUR/USD — the
+// FX-1 mispricing — and could flip with the broker's row order (PF3-3).
+func conflictingFXRates(positions []broker.Position) map[string]bool {
+	rates := make(map[string]float64, len(positions))
+	out := map[string]bool{}
+
+	for _, p := range positions {
+		if p.FXRate == 0 {
+			continue
+		}
+
+		key := portfolio.Normalize(p.Symbol)
+		if r, seen := rates[key]; seen && r != p.FXRate {
+			out[key] = true
+		}
+
+		rates[key] = p.FXRate
 	}
 
 	return out

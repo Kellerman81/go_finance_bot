@@ -5,7 +5,6 @@ import (
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
-	"github.com/Kellerman81/go_finance_bot/internal/risk"
 )
 
 // config.yaml's sectors: block is the explicit override layer — an
@@ -62,8 +61,9 @@ func TestSectorsSurviveARestartAndConfigStillWins(t *testing.T) {
 	// this time config.yaml already has an opinion on MSFT that disagrees
 	// with what was auto-learned before the restart.
 	second := nameEngine(st, nil)
-	second.portCfg = config.PortfolioConfig{Enabled: true}
-	second.sectors = map[string]string{"MSFT": "software"} // config.yaml's own entry
+	// config.yaml's own entry, applied the way startup applies it — the
+	// hand-written layer is held apart from the learned one (SG2-2).
+	second.SetPortfolioConfig(config.PortfolioConfig{Enabled: true}, map[string]string{"MSFT": "software"}, nil)
 
 	second.restoreSectors()
 
@@ -83,9 +83,8 @@ func TestSetAutoSectorRebuildsTheGuardsDecision(t *testing.T) {
 	t.Parallel()
 
 	e := nameEngine(&nameStore{}, nil)
-	e.portCfg = config.PortfolioConfig{Enabled: true, MaxPositionsPerSector: 1}
-	e.sectors = map[string]string{"AAPL": "technology"}
-	e.SetPortfolioGuard(risk.NewPortfolioGuard(e.portCfg, e.sectors, e.assetClasses, nil))
+	e.SetPortfolioConfig(config.PortfolioConfig{Enabled: true, MaxPositionsPerSector: 1},
+		map[string]string{"AAPL": "technology"}, nil)
 
 	snap := portfolio.Snapshot{Holdings: map[string]portfolio.Holding{
 		"AAPL": {Symbol: "AAPL", Qty: 1, MarketValue: 100},

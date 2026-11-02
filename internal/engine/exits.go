@@ -81,8 +81,12 @@ func growColumns(c columns, n int) columns {
 }
 
 // heldFor returns how long the position in symbol has been open, from the bot's
-// durable open-position record. Zero when the entry time is unknown, which
-// disables the ROI ladder for that position rather than guessing its age.
+// durable open-position record. Zero when the entry time is unknown — which
+// does NOT disable the ROI ladder, as this comment used to say (EX2-5): it pins
+// the ladder to its "0s" rung, the strictest target, and keeps max_hold from
+// ever firing for that position. Both are the conservative reading of "age
+// unknown" (never decay a target or force an exit on a guessed age); an adopted
+// or restored position gets a real entry time, so this is rare.
 func (e *Engine) heldFor(symbol string) time.Duration {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -154,11 +158,8 @@ func (e *Engine) checkExits(ctx context.Context) {
 		e.mu.Lock()
 
 		peak := e.peaks[sym]
-		rose := false
-
 		if price > peak {
 			peak = price
-			rose = true
 		}
 
 		if entry > peak {
@@ -168,30 +169,45 @@ func (e *Engine) checkExits(ctx context.Context) {
 		e.peaks[sym] = peak
 
 		var (
-			posSnap OpenPosition
-			persist bool
+			persist    bool
+			trailFloor float64
 		)
 
-		if op, ok := e.openPos[sym]; ok && peak > op.Peak {
-			op.Peak = peak
-			posSnap, persist = *op, true
+		if op, ok := e.openPos[sym]; ok {
+			trailFloor = exits.FloorFor(cfg, op.TrailFloor, op.TrailFloorKey)
+
+			if peak > op.Peak {
+				op.Peak = peak
+				persist = true
+			}
 		}
 
 		e.mu.Unlock()
 
 		// Persist a new trailing-stop high-water mark so it survives restarts.
-		if persist && rose {
-			if err := e.store.SaveOpenPosition(posSnap); err != nil {
-				e.log.Warn("persist open position peak failed", "symbol", sym, "err", err)
-			}
+		// Not gated on this price being the rise: ingest ratchets the peak
+		// between evaluations (EX2-3), and persist is already "above the
+		// record's peak".
+		if persist {
+			e.persistOpenPosition(sym, "open position peak")
 		}
 
 		// The same rule engine the backtester uses, so a stop that fires here
 		// fires there — including the ATR-adaptive stops and the ROI ladder.
-		levels := exits.Compute(cfg, entry, peak, e.atrFor(sym), e.heldFor(sym))
+		levels := exits.Compute(cfg, entry, peak, e.atrFor(sym), e.heldFor(sym)).
+			WithTrailFloor(cfg, trailFloor)
 
 		if reason := levels.Triggered(price); reason != "" {
-			e.exitPosition(ctx, sym, h.Qty, price, reason, e.tradingOn(), cfg.BypassTradingHalt, snap)
+			e.exitPosition(
+				ctx,
+				sym,
+				h.Qty,
+				price,
+				reason,
+				e.tradingOn(),
+				cfg.BypassTradingHalt,
+				snap,
+			)
 
 			continue
 		}
@@ -242,7 +258,10 @@ func (e *Engine) checkPartialExit(
 		orig = held
 	}
 
-	part, due := exits.NextPartial(e.exits, price/entry-1, taken)
+	// cfg, never e.exits: this runs without the lock, and SetExitsConfig
+	// replaces e.exits wholesale — the bare read was a data race (EX2-2), and
+	// could pair a rung index from one ladder with the tranche of another.
+	part, due := exits.NextPartial(cfg, price/entry-1, taken)
 	if !due {
 		return
 	}
@@ -258,7 +277,26 @@ func (e *Engine) checkPartialExit(
 		return
 	}
 
-	if e.exitPosition(ctx, symbol, qty, price, part.Reason, e.tradingOn(), cfg.BypassTradingHalt, snap) {
+	// An unconfirmed rung counts as taken. Left un-taken, the rung was due
+	// again the moment the unknown order did fill — the holding dropped below
+	// the pending-sell marker and the guard opened — and the second tranche,
+	// sized against OrigQty, usually took the whole remainder: a 50% scale-out
+	// became a full exit (EX3-1). If the order in fact never filled, the
+	// position keeps one tranche it meant to shed, and every downside rule
+	// still covers it; that is the safe side of an unknown.
+	before := e.countUnconfirmed(symbol, broker.Sell)
+	sold := e.exitPosition(
+		ctx,
+		symbol,
+		qty,
+		price,
+		part.Reason,
+		e.tradingOn(),
+		cfg.BypassTradingHalt,
+		snap,
+	)
+
+	if sold || e.countUnconfirmed(symbol, broker.Sell) > before {
 		e.markPartialTaken(symbol, part.Rung)
 	}
 }
@@ -277,12 +315,9 @@ func (e *Engine) markPartialTaken(symbol string, rung int) {
 
 	p.PartialsTaken = rung + 1
 
-	snap := *p
 	e.mu.Unlock()
 
-	if err := e.store.SaveOpenPosition(snap); err != nil {
-		e.log.Warn("persist partial-exit progress failed", "symbol", symbol, "err", err)
-	}
+	e.persistOpenPosition(symbol, "partial-exit progress")
 }
 
 // exitPosition sells qty of a held position via a market order, passing through
@@ -295,7 +330,7 @@ func (e *Engine) markPartialTaken(symbol string, rung int) {
 // must not be marked as taken when the sell was a dry run, was refused, or
 // errored at the broker.
 //
-//nolint:cyclop // a linear sequence of guards, each with one way to decline
+//nolint:cyclop,funlen // a linear sequence of guards, each with one way to decline
 func (e *Engine) exitPosition(
 	ctx context.Context,
 	symbol string,
@@ -308,8 +343,22 @@ func (e *Engine) exitPosition(
 	// position is unconfirmed at the broker (async fill), the holding still
 	// shows up in the snapshot and the exit would trigger again every
 	// evaluation — don't stack duplicate sell orders.
-	if pending, ok := e.pendingSellQty(symbol); ok && qty >= pending {
-		return false
+	//
+	// It compares the HOLDING with the marker, exactly as act does, never the
+	// quantity about to be sold. "qty >= pending" let every scale-out tranche
+	// through — a tranche is always smaller than the holding the marker
+	// records — so an unconfirmed rung was re-sent every 30 s, each with an
+	// "unknown order" alert, selling far past its tranche if they filled
+	// (EN2-2).
+	if pending, ok := e.pendingSellQty(symbol); ok {
+		held := qty
+		if h, found := snap.Holding(symbol); found {
+			held = h.Qty
+		}
+
+		if held >= pending {
+			return false
+		}
 	}
 
 	// A closed venue cannot fill anything, so an exit sent to one is waste at
@@ -346,7 +395,15 @@ func (e *Engine) exitPosition(
 	tag := "EXIT " + reason
 
 	if !tradingEnabled && !bypassHalt {
-		e.record(TradeRecord{
+		// Once per condition: a halt can last days, and a position through
+		// its stop recorded a dry run on every checkExits — 2,880 rows per
+		// symbol per day, flushing real fills out of the trade history
+		// (EX3-3, invariant 2). Cleared when an exit next goes out — and
+		// only then, on purpose: while trading stays off, a position that
+		// recovers and breaches again for the same kind of reason stays
+		// silent, the standing condition "trading is off and this position
+		// is past its exit" never having ended.
+		e.recordOnce(exitDryRunKey(symbol), tag, TradeRecord{
 			Time: now(), Symbol: symbol, Side: broker.Sell, Qty: authOrder.Qty,
 			Price: price, Value: decision.EstValue, Status: "dry-run", Reason: tag,
 			Indicators: indSnap,
@@ -355,9 +412,14 @@ func (e *Engine) exitPosition(
 		return false
 	}
 
-	if !e.guardOrderRate(true) {
-		return false // circuit breaker tripped
-	}
+	e.clearBlockedOnce(exitDryRunKey(symbol))
+
+	// Counted, never refused: a protective exit is not gated by the
+	// order-rate breaker, bypass_trading_halt or not. Refusing it here left
+	// every stop past the 20th of a crash-day minute unsold, and each refusal
+	// re-announced the halt (NT3-1). The manual and fallback sell paths
+	// already count without refusing.
+	e.guardOrderRate(false)
 
 	res, err := e.brk.SubmitOrder(ctx, authOrder)
 	if err != nil {
@@ -387,7 +449,13 @@ func (e *Engine) exitPosition(
 
 	sold, confirmed := settledQty(res)
 	if !confirmed {
-		e.flagUnconfirmed(symbol, broker.Sell, authOrder.Qty, res, tag+" | broker did not confirm this order's outcome")
+		e.flagUnconfirmed(
+			symbol,
+			broker.Sell,
+			authOrder.Qty,
+			res,
+			tag+" | broker did not confirm this order's outcome",
+		)
 		e.syncPortfolio(ctx)
 
 		return false
@@ -438,8 +506,29 @@ func (e *Engine) exitPosition(
 
 	outcome.apply(&rec)
 	e.record(rec)
-	e.recordClose(symbol, sold) // reduces, or removes the record once fully sold — the confirmed qty, not the requested one
+	e.recordClose(
+		symbol,
+		sold,
+	) // reduces, or removes the record once fully sold — the confirmed qty, not the requested one
+
+	// The rest of a partly filled order is still working: report it, and
+	// keep the guard on the holding left after the fill so the next
+	// evaluation does not sell it a second time (EN3-3).
+	if rem := workingRemainder(authOrder, res, sold); rem > 0 {
+		e.markPendingSell(symbol, heldAtSubmit-sold)
+		e.flagUnconfirmed(
+			symbol,
+			broker.Sell,
+			rem,
+			res,
+			tag+" | partly filled at the broker's wait deadline; the rest is still working or its outcome is unknown",
+		)
+	}
+
 	e.syncPortfolio(ctx)
 
 	return true
 }
+
+// exitDryRunKey keys an exit's dry-run record in the announce-once state.
+func exitDryRunKey(symbol string) string { return "exit-dry-run:" + symbol }

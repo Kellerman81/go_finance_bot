@@ -153,6 +153,9 @@ type OpenOrder struct {
 	Price    float64 `json:"price"`
 	Status   string  `json:"status"`
 	Duration string  `json:"duration"`
+	// Currency is set only when Price could not be converted into the
+	// reporting currency and is still in the instrument's own (BR3-8).
+	Currency string `json:"currency,omitempty"`
 }
 
 // Capability interfaces — brokers implement the subset they support, and

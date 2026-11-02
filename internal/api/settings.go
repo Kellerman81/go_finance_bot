@@ -2,9 +2,9 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -136,66 +136,29 @@ func (w protectionsWire) unwrap() (config.ProtectionsConfig, error) {
 	return out, err
 }
 
-// exitsWire is ExitsConfig with its max-hold duration as a string, and with
-// json names for the fields the config file spells in snake_case.
+// exitsWire is ExitsConfig with its max-hold duration as a string.
 //
-// ExitsConfig itself carries no json tags — GET/PUT /api/exits has served Go
-// field names since before this endpoint existed, and re-tagging it would break
-// that form. The names live here instead.
+// It EMBEDS ExitsConfig and shadows only max_hold, the screenerWire pattern.
+// It used to restate the fields one by one, and when bypass_trading_halt was
+// added to ExitsConfig and to the form it never reached this list: the form
+// always read "No", and every exits save turned the setting off in the live
+// engine and in config.yaml — an operator who wanted stops to keep firing
+// through a drawdown halt lost that on any exits edit (AP2-1). A field added to
+// ExitsConfig now reaches the wire with nothing to forget.
 type exitsWire struct {
-	Enabled         bool    `json:"enabled"`
-	StopLossPct     float64 `json:"stop_loss_pct"`
-	TrailingStopPct float64 `json:"trailing_stop_pct"`
-	TakeProfitPct   float64 `json:"take_profit_pct"`
+	config.ExitsConfig
 
-	ATRPeriod    int     `json:"atr_period"`
-	ATRStopMult  float64 `json:"atr_stop_mult"`
-	ATRTrailMult float64 `json:"atr_trail_mult"`
-
-	TrailingOffsetPct       float64 `json:"trailing_offset_pct"`
-	TrailingTightPct        float64 `json:"trailing_tight_pct"`
-	TrailingOnlyAfterOffset bool    `json:"trailing_only_after_offset"`
-
-	MaxHold           string               `json:"max_hold"`
-	ROI               map[string]float64   `json:"roi"`
-	PartialTakeProfit []config.PartialExit `json:"partial_take_profit"`
+	MaxHold string `json:"max_hold"`
 }
 
 // wrapExits converts to the wire form.
 func wrapExits(c config.ExitsConfig) exitsWire {
-	return exitsWire{
-		Enabled:                 c.Enabled,
-		StopLossPct:             c.StopLossPct,
-		TrailingStopPct:         c.TrailingStopPct,
-		TakeProfitPct:           c.TakeProfitPct,
-		ATRPeriod:               c.ATRPeriod,
-		ATRStopMult:             c.ATRStopMult,
-		ATRTrailMult:            c.ATRTrailMult,
-		TrailingOffsetPct:       c.TrailingOffsetPct,
-		TrailingTightPct:        c.TrailingTightPct,
-		TrailingOnlyAfterOffset: c.TrailingOnlyAfterOffset,
-		MaxHold:                 durStr(c.MaxHold),
-		ROI:                     c.ROI,
-		PartialTakeProfit:       c.PartialTakeProfit,
-	}
+	return exitsWire{ExitsConfig: c, MaxHold: durStr(c.MaxHold)}
 }
 
 // unwrap converts back, rejecting an unparseable max_hold.
 func (w exitsWire) unwrap() (config.ExitsConfig, error) {
-	out := config.ExitsConfig{
-		Enabled:                 w.Enabled,
-		StopLossPct:             w.StopLossPct,
-		TrailingStopPct:         w.TrailingStopPct,
-		TakeProfitPct:           w.TakeProfitPct,
-		ATRPeriod:               w.ATRPeriod,
-		ATRStopMult:             w.ATRStopMult,
-		ATRTrailMult:            w.ATRTrailMult,
-		TrailingOffsetPct:       w.TrailingOffsetPct,
-		TrailingTightPct:        w.TrailingTightPct,
-		TrailingOnlyAfterOffset: w.TrailingOnlyAfterOffset,
-		ROI:                     w.ROI,
-		PartialTakeProfit:       w.PartialTakeProfit,
-	}
+	out := w.ExitsConfig
 
 	var err error
 
@@ -456,6 +419,135 @@ func presentJSONKeys(c *gin.Context) (map[string]bool, error) {
 	return present, nil
 }
 
+// bindMerged binds the JSON body ONTO dst, which the caller has filled with the
+// settings currently in force, so a key the body does not mention keeps its
+// live value instead of being reset to zero.
+//
+// Binding into an empty struct is what let a form wipe every setting it does
+// not declare: the strategy form has no htf_* fields, so saving it — unchanged —
+// switched the higher-timeframe gate off, live and in config.yaml (AP2-2), and
+// the screener form dropped by_asset_class/universe_by_asset_class from the
+// running engine and wrote probe.bars as 0 (AP2-3). A map the body DOES mention
+// is replaced rather than merged into — json would otherwise keep keys the
+// body removed, and deleting one would silently not happen.
+//
+// dst is deep-copied first. The live config getters return shallow copies
+// whose slices, maps and pointers are the engine's own, and encoding/json
+// decodes a JSON array into an existing backing array in place: a REJECTED
+// save would otherwise already have rewritten the running engine's scale-out
+// ladder or detector list, with no lock held while it did.
+func bindMerged(c *gin.Context, dst any) error {
+	var raw map[string]json.RawMessage
+
+	if err := c.ShouldBindBodyWithJSON(&raw); err != nil {
+		return err
+	}
+
+	v := reflect.ValueOf(dst).Elem()
+	v.Set(deepCopy(v))
+
+	clearPresentMaps(v, raw)
+
+	return c.ShouldBindBodyWithJSON(dst)
+}
+
+// deepCopy returns a copy of v that shares no slice, map or pointer target
+// with it. Unexported struct fields are copied by value.
+func deepCopy(v reflect.Value) reflect.Value {
+	//nolint:exhaustive // only the reference-holding kinds need copying; the rest are values
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+
+		n := reflect.New(v.Elem().Type())
+		n.Elem().Set(deepCopy(v.Elem()))
+
+		return n
+
+	case reflect.Slice:
+		return copySlice(v)
+
+	case reflect.Map:
+		return copyMap(v)
+
+	case reflect.Struct:
+		return copyStruct(v)
+
+	default:
+		return v
+	}
+}
+
+// copySlice deep-copies a slice for deepCopy.
+func copySlice(v reflect.Value) reflect.Value {
+	if v.IsNil() {
+		return v
+	}
+
+	n := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+	for i := range v.Len() {
+		n.Index(i).Set(deepCopy(v.Index(i)))
+	}
+
+	return n
+}
+
+// copyMap deep-copies a map's values for deepCopy (keys are values already).
+func copyMap(v reflect.Value) reflect.Value {
+	if v.IsNil() {
+		return v
+	}
+
+	n := reflect.MakeMapWithSize(v.Type(), v.Len())
+
+	for it := v.MapRange(); it.Next(); {
+		n.SetMapIndex(it.Key(), deepCopy(it.Value()))
+	}
+
+	return n
+}
+
+// copyStruct deep-copies a struct's exported fields for deepCopy.
+func copyStruct(v reflect.Value) reflect.Value {
+	n := reflect.New(v.Type()).Elem()
+	n.Set(v)
+
+	for i := range v.NumField() {
+		if n.Field(i).CanSet() {
+			n.Field(i).Set(deepCopy(v.Field(i)))
+		}
+	}
+
+	return n
+}
+
+// clearPresentMaps zeroes every map field of the struct v whose json key is in
+// present, descending into embedded structs (whose fields json promotes).
+func clearPresentMaps(v reflect.Value, present map[string]json.RawMessage) {
+	t := v.Type()
+
+	for i := range t.NumField() {
+		f := t.Field(i)
+
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			clearPresentMaps(v.Field(i), present)
+
+			continue
+		}
+
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "" {
+			name = f.Name
+		}
+
+		if _, ok := present[name]; ok && f.Type.Kind() == reflect.Map && v.Field(i).CanSet() {
+			v.Field(i).Set(reflect.Zero(f.Type))
+		}
+	}
+}
+
 // unredactOmitted is unredact, but first checks whether the client's request
 // mentioned this field at all: if not, the stored value is kept untouched
 // regardless of what the (zero-valued) bound struct field says. See
@@ -553,8 +645,8 @@ func (s *Server) applyCosts(c *gin.Context) error {
 		return err
 	}
 
-	if in.CommissionPct < 0 || in.SpreadPct < 0 || in.SlippagePct < 0 {
-		return errors.New("costs cannot be negative")
+	if err := in.Validate(); err != nil {
+		return err
 	}
 
 	s.eng.SetCostsConfig(in)
@@ -564,9 +656,9 @@ func (s *Server) applyCosts(c *gin.Context) error {
 
 // applyExits validates and applies the protective exit rules.
 func (s *Server) applyExits(c *gin.Context) error {
-	var w exitsWire
+	w := wrapExits(s.eng.ExitsConfig())
 
-	if err := c.ShouldBindJSON(&w); err != nil {
+	if err := bindMerged(c, &w); err != nil {
 		return err
 	}
 
@@ -619,12 +711,10 @@ func (s *Server) applyProtections(c *gin.Context) error {
 		return err
 	}
 
-	if in.MaxDrawdownPct < 0 || in.MaxDrawdownPct > 1 {
-		return errors.New("max_drawdown_pct must be a fraction in 0..1")
-	}
-
-	if in.MaxDailyLossPct < 0 || in.MaxDailyLossPct > 1 {
-		return errors.New("max_daily_loss_pct must be a fraction in 0..1")
+	// The same rules config.Load runs — this used to check two of the three
+	// limits and none of the guards (PR2-4/PR2-5).
+	if err := in.Validate(); err != nil {
+		return err
 	}
 
 	s.eng.SetProtectionsConfig(in)
@@ -649,10 +739,20 @@ func (s *Server) applyPortfolio(c *gin.Context) error {
 		return err
 	}
 
+	// The cross-section rule the loader applies, before anything is applied
+	// (AP3-5): see config.ValidatePositionSlots.
+	minPos, _, _ := s.eng.Sizing()
+	if err := config.ValidatePositionSlots(in.PortfolioConfig, minPos); err != nil {
+		return err
+	}
+
 	// Absent means "leave the map alone"; an explicit {} clears it. Both maps
 	// are read from one call so a request that sends neither cannot pick up a
 	// half-updated pair from a concurrent write.
-	_, sectors, assetClasses := s.eng.PortfolioConfig()
+	// The hand-written layer, not the merged view: PortfolioConfig also
+	// returns what the bot learned, and handing that back here made every
+	// learned entry a hand-written one (SG2-2).
+	sectors, assetClasses := s.eng.PortfolioOverrides()
 
 	if in.Sectors != nil {
 		sectors = in.Sectors
@@ -685,9 +785,9 @@ func normalizeAssetClasses(in map[string]string) map[string]string {
 // applyScreener applies the universe filters, reporting that a changed interval
 // needs a restart rather than silently ignoring it.
 func (s *Server) applyScreener(c *gin.Context) (string, error) {
-	var w screenerWire
+	w := wrapScreener(s.eng.ScreenerConfig())
 
-	if err := c.ShouldBindJSON(&w); err != nil {
+	if err := bindMerged(c, &w); err != nil {
 		return "", err
 	}
 
@@ -855,8 +955,23 @@ func (s *Server) applyML(c *gin.Context) error {
 		return err
 	}
 
-	ml.Configure(in, ml.ParamsFor(s.eng.StrategyConfig()))
-	s.eng.SetStrategyConfig(s.eng.StrategyConfig())
+	prev := ml.Default().Config()
+	params := ml.ParamsFor(s.eng.StrategyConfig())
+
+	ml.Configure(in, params)
+	s.eng.RebuildStrategies() // overrides too: they bind the predictor at build (ML3-4)
+
+	// A train_bars past ~2,830 (default periods) needs more history than the engine keeps: the
+	// whole live strategy would vote HOLD forever, every detector of every
+	// symbol, while a backtest kept trading (ML3-3). Rolled back, so the
+	// rejected save is wholly rejected.
+	if need := s.eng.StrategyWarmup(); need > engine.MaxHistoryBars {
+		ml.Configure(prev, params)
+		s.eng.RebuildStrategies()
+
+		return fmt.Errorf("ml: the strategy would need %d bars of warmup, but the engine keeps %d — "+
+			"lower train_bars", need, engine.MaxHistoryBars)
+	}
 
 	return nil
 }

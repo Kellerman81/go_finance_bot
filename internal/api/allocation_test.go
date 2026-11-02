@@ -279,3 +279,50 @@ func TestAllocationBucketsAHandWrittenClassMapLikeTheGuard(t *testing.T) {
 		t.Fatal("guard allowed a buy at the cap; the fixture no longer pins the disagreement")
 	}
 }
+
+// AP2-7: with portfolio.enabled false the guard is nil and enforces nothing,
+// yet the panel showed every configured ceiling and flagged classes "at cap"
+// — a limit described as binding that does not bind.
+func TestAllocationPanelShowsNoCapsWhilePortfolioLimitsAreOff(t *testing.T) {
+	s := newTestServer(t)
+	s.pf.SetCash(600)
+	s.pf.SyncPositions([]portfolio.Holding{{Symbol: "IWDA", Qty: 1, MarketValue: 400}})
+	s.eng.SetPortfolioConfig(config.PortfolioConfig{
+		Enabled: false, MaxPctPerAssetClass: map[string]float64{"etf": 0.30},
+	}, nil, map[string]string{"IWDA": "etf"})
+
+	code, body := do(t, s, "GET", "/v2/f/positions", "")
+	if code != 200 {
+		t.Fatalf("status %d", code)
+	}
+
+	if strings.Contains(body, "at cap") || strings.Contains(body, "30.00 %") {
+		t.Error("the panel shows a 30% cap and at-cap while portfolio limits are disabled")
+	}
+}
+
+// AP2-7's edge: at equity <= 0 the guard allows everything, but "Value >= 0"
+// marked every capped row at its cap.
+func TestAllocationIsNotAtCapWithoutEquity(t *testing.T) {
+	rows := allocation(portfolio.Snapshot{Holdings: map[string]portfolio.Holding{}},
+		nil, map[string]float64{"etf": 0.3})
+
+	if rowFor(t, rows, "etf").AtCap {
+		t.Error("an empty account reports a class at its cap")
+	}
+}
+
+// PF3-4: the guard stopped counting dust rows as positions (RK3-2); the panel
+// that mirrors it must not count one either, or the two disagree about a
+// class's position count.
+func TestAllocationIgnoresDust(t *testing.T) {
+	snap := portfolio.Snapshot{Cash: 1000, Equity: 1000, Holdings: map[string]portfolio.Holding{
+		"IWDA": {Symbol: "IWDA", Qty: 5e-7, MarketValue: 0.0001},
+	}}
+
+	rows := allocation(snap, map[string]string{"IWDA": "etf"}, map[string]float64{"etf": 0.3})
+
+	if etf := rowFor(t, rows, "etf"); etf.Positions != 0 {
+		t.Errorf("a dust row counted as %d etf position(s)", etf.Positions)
+	}
+}

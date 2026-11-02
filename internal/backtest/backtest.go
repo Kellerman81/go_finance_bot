@@ -11,6 +11,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Kellerman81/go_finance_bot/internal/ai"
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/engine"
@@ -57,6 +58,14 @@ type Backtester struct {
 
 	MaxRiskSizeUSD  float64
 	MinOrderSizeUSD float64
+	// MinPositions mirrors engine.min_positions: the investable pot is cut
+	// into this many slots and no single position may exceed one. The live
+	// engine sets it on its risk.Manager at construction; without it a replay
+	// sized every buy at about min_positions times what the live bot would
+	// buy (CM2-1). Leave it 0 for an isolated single-symbol run on a
+	// synthetic budget (the optimizer's relaxed-limits mode, autotune), where
+	// a slot of THAT budget is not the live slot either.
+	MinPositions int
 
 	// Portfolio, Sectors and AssetClasses configure the same concentration
 	// caps the live engine applies (asset-class allocation, sector exposure,
@@ -233,12 +242,13 @@ func (bt *Backtester) measureSpreads(data map[string][]market.Candle) map[string
 
 		high := make([]float64, len(candles))
 		low := make([]float64, len(candles))
+		closes := make([]float64, len(candles))
 
 		for i, c := range candles {
-			high[i], low[i] = c.High, c.Low
+			high[i], low[i], closes[i] = c.High, c.Low, c.Close
 		}
 
-		if s, ok := indicators.HighLowSpread(high, low); ok {
+		if s, ok := indicators.HighLowSpreadAdjusted(high, low, closes); ok {
 			out[sym] = s
 		}
 	}
@@ -287,10 +297,15 @@ type Result struct {
 	Sortino          float64 `json:"sortino"` // like Sharpe but only downside deviation
 	Calmar           float64 `json:"calmar"`  // CAGR / max drawdown
 	ProfitFactor     float64 `json:"profit_factor"`
-	ExpectancyPct    float64 `json:"expectancy_pct"` // mean P&L per trade, % of entry
-	AvgWinPct        float64 `json:"avg_win_pct"`
-	AvgLossPct       float64 `json:"avg_loss_pct"`
-	ExposurePct      float64 `json:"exposure_pct"` // share of bar-slots holding something
+	// ClosedTrades is how many trades were closed (Wins + Losses): what a
+	// min_trades gate means. NumTrades counts FILLS — every buy, sell,
+	// scale-in add and scale-out rung — so a gate reading it was cleared by
+	// half as many trades as it promised (BT2-3).
+	ClosedTrades  int     `json:"closed_trades"`
+	ExpectancyPct float64 `json:"expectancy_pct"` // mean P&L per trade, % of entry
+	AvgWinPct     float64 `json:"avg_win_pct"`
+	AvgLossPct    float64 `json:"avg_loss_pct"`
+	ExposurePct   float64 `json:"exposure_pct"` // share of bar-slots holding something
 	// SpanDays is the wall-clock length of the run. The annualised figures above
 	// are only meaningful over a decent span: scaling a six-hour result up to a
 	// year produces impressive-looking nonsense.
@@ -301,16 +316,65 @@ type Result struct {
 
 	// The breakdowns. The aggregates above say whether the strategy made money;
 	// these say which parts of it did, which is what actually changes a config.
-	RoundTrips []RoundTrip    `json:"round_trips"`
-	BySymbol   []SymbolResult `json:"by_symbol"`
-	ByExit     []ExitResult   `json:"by_exit"`
-	ByMonth    []PeriodReturn `json:"by_month"`
-	Hold       HoldStats      `json:"hold"`
+	RoundTrips []RoundTrip `json:"round_trips"` // one per sell fill: scale-out tranches separately
+	// Trips is one record per CLOSED position — its tranches summed. Win rate,
+	// profit factor, expectancy, ClosedTrades and the Monte Carlo bootstrap
+	// count these: a two-rung ladder made one trade look like three — three
+	// "wins" from one round trip — so every min_trades gate was up to
+	// (rungs+1)x weaker than documented and the win-rate objectives favoured
+	// configs with a ladder (BT3-2).
+	Trips    []RoundTrip    `json:"trips"`
+	BySymbol []SymbolResult `json:"by_symbol"`
+	ByExit   []ExitResult   `json:"by_exit"`
+	ByMonth  []PeriodReturn `json:"by_month"`
+	Hold     HoldStats      `json:"hold"`
 	// MonteCarlo is populated only when a bootstrap was requested.
 	MonteCarlo *MonteCarlo `json:"monte_carlo,omitempty"`
 	// HaltedAt records the first time a protection would have stopped the live
 	// bot, if any. A curve that continues past this point is fiction.
 	HaltedAt string `json:"halted_at,omitempty"`
+	// Misaligned names the first bar at which the symbols' timestamps
+	// disagree, if any. The replay steps every symbol by bar INDEX, so bar i
+	// of each must be the same moment; different holidays, sessions, listing
+	// dates or gaps break that, and cash, the caps and the correlations then
+	// mix bars that did not happen together. Reported rather than hidden
+	// (BT2-4) — the package doc states the assumption, nothing checked it.
+	Misaligned string `json:"misaligned,omitempty"`
+}
+
+// firstMisalignment returns where the symbols' bar timestamps first disagree
+// at the same index, or "" when every index lines up.
+func firstMisalignment(data map[string][]market.Candle, symbols []string, maxLen int) string {
+	if len(symbols) < 2 {
+		return ""
+	}
+
+	for i := range maxLen {
+		var (
+			ref    time.Time
+			refSym string
+		)
+
+		for _, sym := range symbols {
+			c := data[sym]
+			if i >= len(c) {
+				continue
+			}
+
+			if refSym == "" {
+				ref, refSym = c[i].Time, sym
+
+				continue
+			}
+
+			if !c[i].Time.Equal(ref) {
+				return fmt.Sprintf("bar %d: %s is at %s, %s at %s — the replay steps by index, so these are treated as simultaneous",
+					i, refSym, ref.Format(time.RFC3339), sym, c[i].Time.Format(time.RFC3339))
+			}
+		}
+	}
+
+	return ""
 }
 
 // Run executes the backtest over per-symbol candle series.
@@ -331,14 +395,34 @@ type Result struct {
 //
 //nolint:cyclop,funlen // the bar-by-bar simulation loop mirrors the live engine's flow
 func (bt *Backtester) Run(data map[string][]market.Candle) Result {
-	// The process-wide ML predictor (see internal/ml.Default, installed by
-	// ConfigureAI once before an optimizer's whole trial loop) is otherwise
-	// shared across every trial: without this, only the first trial ever
-	// actually fits a model, and every later trial — regardless of what
-	// strategy/indicator parameters it's testing — silently reuses it. See
-	// CODE_REVIEW_FINDINGS.md CRIT-7. A nil predictor (ML not configured) is a
-	// no-op.
-	ml.Default().Reset()
+	// Every replay trains into its OWN predictor, with the process-wide one's
+	// settings. Sharing that one across trials let only the first trial ever
+	// fit a model (CRIT-7) — and the earlier fix, resetting it here, did so
+	// from inside the live bot too: every autotune pass, screener probe and
+	// optimize click deleted the models the live loop trades on, and the probe
+	// then trained replacements into the live map from the screener's bars
+	// (ML2-3). Every Backtester builds its strategies with strategy.New, never
+	// shares the engine's, so rebinding them here touches nothing live.
+	if fresh := ml.Default().Fresh(); fresh != nil {
+		strategy.UsePredictor(bt.Strategy, fresh)
+
+		for _, s := range bt.SymbolStrategies {
+			strategy.UsePredictor(s, fresh)
+		}
+	}
+
+	// The same for the LLM advisor: each replay asks the model through its
+	// own cache. On the process-wide one a replayed bar got today's live
+	// verdict and a due refresh fed historical features overwrote the
+	// verdict the live loop trades on — reachable from the strategy tab's
+	// field optimizer, which no autotune-style guard covered (ST3-1, AI3-2).
+	if fresh := ai.Default().Fresh(); fresh != nil {
+		strategy.UseAdvisor(bt.Strategy, fresh)
+
+		for _, s := range bt.SymbolStrategies {
+			strategy.UseAdvisor(s, fresh)
+		}
+	}
 
 	ctx := context.Background()
 	symbols := make([]string, 0, len(data))
@@ -359,7 +443,13 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	// window must cover the most history any detector can use, so long-lookback
 	// detectors (e.g. trend, which reads up to a week) see the same data they
 	// would live; otherwise changing their period would not affect results.
-	lookback := max(bt.maxLookbackOf(), 100)
+	//
+	// And never more than the live engine keeps: a higher-timeframe gate
+	// sized the window at (trend_period+2) × htf_multiple — 29,280 bars at a
+	// multiple of 15 — so the backtest's HTF trend regressed over up to 1,950
+	// aggregated bars where live, holding 3,000, regressed over 200. The gate
+	// vetoed on a different trend in the two (ST3-4).
+	lookback := min(max(bt.maxLookbackOf(), 100), engine.MaxHistoryBars)
 
 	bt.spreads = bt.measureSpreads(data)
 
@@ -375,6 +465,8 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 
 	pf := portfolio.New()
 	rm := risk.New(bt.Limits, bt.Costs)
+	rm.SetMinPositions(bt.MinPositions)
+
 	// Concentration caps, measured only on history that existed at each bar.
 	retsAt := &barReturnsAt{data: data}
 	guard := risk.NewPortfolioGuard(bt.Portfolio, bt.Sectors, bt.AssetClasses, retsAt)
@@ -385,6 +477,9 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	rm.SetPortfolioGuard(guard)
 
 	peaks := make(map[string]float64)
+	// trailFloor is the trailing-stop floor an add leaves behind, per symbol —
+	// the live OpenPosition.TrailFloor, set by the same exits.RebaseOnAdd.
+	trailFloor := make(map[string]float64)
 	streaks := make(map[string]btStreak)
 	entryTime := make(map[string]time.Time) // opening-buy bar time per held symbol
 	origQty := make(map[string]float64)     // largest size reached, for the scale-out ladder
@@ -399,7 +494,23 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	// CODE_REVIEW_FINDINGS.md's "Round-trip P&L re-charges the entry
 	// commission on every scale-out rung".
 	entryCommission := make(map[string]float64)
-	adds := make(map[string]int)                   // scale-in adds already taken, per symbol
+	adds := make(map[string]int) // scale-in adds already taken, per symbol
+	// tripPnL / tripStopped accumulate a position's exit tranches, so the
+	// protections judge the round trip's net, not its last slice — the same
+	// rule as the live engine's closeTranche (PR2-6).
+	// addedOn is the bar index of each symbol's latest scale-in add, so the
+	// exit pass that follows it on the same bar knows the peak was re-based.
+	addedOn := make(map[string]int)
+	// addedAt is the price this bar's add filled at, for the exit pass that
+	// follows it (BT3-1).
+	addedAt := make(map[string]float64)
+	tripPnL := make(map[string]float64)
+	tripStopped := make(map[string]bool)
+	// tripBasis / tripQty / tripProceeds sum a position's tranches into the
+	// one closed trip the trade statistics count (BT3-2).
+	tripBasis := make(map[string]float64)
+	tripQty := make(map[string]float64)
+	tripProceeds := make(map[string]float64)
 	lastSignal := make(map[string]strategy.Action) // most recently evaluated action, per symbol
 	pending := make(map[string]pendingOrder)       // decided on this bar, filled at the next open
 	exposed := 0                                   // bar-symbol slots spent holding something
@@ -408,8 +519,10 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	var (
 		trades       []engine.TradeRecord
 		wins, losses int
-		roundTrips   []RoundTrip // one record per closed entry-to-exit cycle
+		roundTrips   []RoundTrip // one record per sell fill (tranches separately)
+		trips        []RoundTrip // one record per closed position (BT3-2)
 		ts           time.Time
+		barIdx       int // index of the bar being replayed, for exec's ATR read
 	)
 
 	// Protections, driven by the simulated clock rather than the wall clock —
@@ -473,7 +586,12 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			return false
 		}
 
-		avgCost := snap.Holdings[order.Symbol].AvgPrice
+		// Through Snapshot.Holding, not a raw index: a non-canonical symbol
+		// would read AvgPrice 0 and Qty 0 — a fake huge win on every sell
+		// (PF2-6). Every entry point upper-cases today; this keeps it so.
+		cur, _ := snap.Holding(order.Symbol)
+		avgCost := cur.AvgPrice
+		qtyBefore := cur.Qty
 
 		res, err := brk.SubmitOrder(ctx, authOrder)
 		if err != nil {
@@ -493,9 +611,26 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 				entryTime[order.Symbol] = ts
 			}
 
+			// An add (scale-in or pyramid) re-bases the trailing stop exactly
+			// as the live engine's recordOpen does — see exits.RebaseOnAdd
+			// (EX2-1). The ATR is the prior bar's, as the exit check uses.
+			if qtyBefore > 0 && res.FilledQty > 0 {
+				// Every add counts against scale_in.max_adds, a pyramid buy as
+				// much as a scale-in step — as the live recordOpen counts it.
+				// Only scale-in steps were counted here, so with both on, the
+				// backtest kept adding after live had stopped (BT3-3).
+				adds[order.Symbol]++
+
+				newAvg := (avgCost*qtyBefore + fillPx*res.FilledQty) / (qtyBefore + res.FilledQty)
+
+				peaks[order.Symbol], trailFloor[order.Symbol] = exits.RebaseOnAdd(
+					bt.Exits, avgCost, math.Max(peaks[order.Symbol], avgCost), trailFloor[order.Symbol],
+					bt.atrAt(data[order.Symbol], barIdx-1), newAvg, fillPx)
+			}
+
 			// The scale-out ladder sizes its rungs against the largest the
 			// position has been, so adding to one re-bases them.
-			if q := snap.Holdings[order.Symbol].Qty + res.FilledQty; q > origQty[order.Symbol] {
+			if q := cur.Qty + res.FilledQty; q > origQty[order.Symbol] {
 				origQty[order.Symbol] = q
 			}
 
@@ -516,7 +651,7 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			// Commission(avgCost*qty) call, which would re-apply any flat/
 			// minimum commission component once per rung instead of once for
 			// the whole position.
-			qtyBeforeSell := snap.Holdings[order.Symbol].Qty
+			qtyBeforeSell := cur.Qty
 
 			var entryShare float64
 			if qtyBeforeSell > 0 {
@@ -528,15 +663,9 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 			cost := bt.Costs.Commission(val) + entryShare
 			net := (fillPx-avgCost)*res.FilledQty - cost
 
-			if net >= 0 {
-				wins++
-			} else {
-				losses++
-			}
-
-			// One record per closed cycle. The aggregates (profit factor,
-			// expectancy) come from these, and so do the per-symbol and
-			// per-exit-reason breakdowns that say *which* part worked.
+			// One record per sell fill: the per-exit-reason breakdown says
+			// which part worked, a rung or a stop. The trade statistics count
+			// the closed trip instead (see Result.Trips).
 			trip := RoundTrip{
 				Symbol: order.Symbol, Entry: entryTime[order.Symbol], Exit: ts,
 				EntryPx: avgCost, ExitPx: fillPx, Qty: res.FilledQty,
@@ -552,15 +681,62 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 
 			roundTrips = append(roundTrips, trip)
 
+			tripPnL[order.Symbol] += net
+			tripBasis[order.Symbol] += basis
+			tripQty[order.Symbol] += res.FilledQty
+			tripProceeds[order.Symbol] += fillPx * res.FilledQty
+
+			if trip.ExitKind == ExitStopLoss || trip.ExitKind == ExitTrailingStop {
+				tripStopped[order.Symbol] = true
+			}
+
+			// The realized-drawdown halt is a running sum of every realised
+			// tranche, as live feeds it. The backtest never called it, so a
+			// config live would halt on realized give-back reported a full
+			// curve and passed autotune's gates (PR2-7).
+			if why := prot.ObserveRealizedClose(net); why != "" && haltedAt == "" {
+				haltedAt = fmt.Sprintf("%s: %s", ts.Format("2006-01-02 15:04"), why)
+			}
+
 			// A scale-out rung realizes P&L but does not end the trade: the
 			// per-symbol state (trailing peak, entry time, ladder progress) has to
 			// survive it, and the protections must judge completed trades rather
 			// than tranches of one.
-			if snap.Holdings[order.Symbol].Qty-res.FilledQty <= 1e-9 {
-				prot.RecordClose(order.Symbol, net,
-					trip.ExitKind == ExitStopLoss || trip.ExitKind == ExitTrailingStop)
+			if cur.Qty-res.FilledQty <= 1e-9 {
+				sym := order.Symbol
+				pnl := tripPnL[sym]
+
+				prot.RecordClose(sym, pnl, tripStopped[sym])
+
+				if pnl >= 0 {
+					wins++
+				} else {
+					losses++
+				}
+
+				closed := RoundTrip{
+					Symbol: sym, Entry: trip.Entry, Exit: ts, EntryPx: avgCost,
+					Qty: tripQty[sym], PnL: pnl, ExitKind: trip.ExitKind, ExitLabel: reason,
+					Held: trip.Held,
+				}
+				if closed.Qty > 0 {
+					closed.ExitPx = tripProceeds[sym] / closed.Qty
+				}
+
+				if tripBasis[sym] > 0 {
+					closed.PnLPct = pnl / tripBasis[sym] * 100
+				}
+
+				trips = append(trips, closed)
+
+				delete(tripPnL, sym)
+				delete(tripStopped, sym)
+				delete(tripBasis, sym)
+				delete(tripQty, sym)
+				delete(tripProceeds, sym)
 
 				delete(peaks, order.Symbol)
+				delete(trailFloor, order.Symbol)
 				// Without this a re-entry inherits the FIRST entry's timestamp, so
 				// the ROI ladder and max_hold measure the age of a position that
 				// closed long ago — and max_hold would exit the new one at once.
@@ -589,6 +765,8 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 	syncPF() // initialise cash/positions from the broker before the run
 
 	for i := range maxLen {
+		barIdx = i
+
 		// ----- 1. The open: fill what the previous bar decided -----
 		for _, sym := range symbols {
 			c := data[sym]
@@ -618,18 +796,148 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 
 			switch po.side {
 			case broker.Buy:
-				if bt.AllowPyramiding || pf.PositionQty(sym) <= 0 {
-					exec(broker.Order{
-						Symbol: sym, Side: broker.Buy,
-						Qty: po.notional / price, Type: broker.Market,
-					}, po.reason)
+				if !bt.AllowPyramiding && pf.PositionQty(sym) > 0 {
+					continue
 				}
+
+				// Re-checked at the fill, against the book as it stands after
+				// every earlier fill of this bar. The decision-time checks saw
+				// a snapshot that could not know about the other buys queued
+				// on the same bar: two ETFs under a 600 class cap both filled,
+				// 999.99 of exposure (BT2-2), where live's act handles one
+				// symbol at a time against pendingExposure and refuses the
+				// second. Likewise a halt that tripped at the deciding bar's
+				// close must stop the buy it queued (BT2-5) — live checks
+				// drawdown before acting.
+				retsAt.bar = max(i-1, 0) // at the open only the prior bar's returns exist
+
+				if ok, _ := guard.AllowEntry(sym, pf.Snapshot(), po.notional); !ok {
+					continue
+				}
+
+				if ok, _ := prot.AllowEntry(sym); !ok {
+					continue
+				}
+
+				exec(broker.Order{
+					Symbol: sym, Side: broker.Buy,
+					Qty: po.notional / price, Type: broker.Market,
+				}, po.reason)
 
 			case broker.Sell:
 				if held := pf.PositionQty(sym); held > 0 {
 					exec(broker.Order{
 						Symbol: sym, Side: broker.Sell, Qty: held, Type: broker.Market,
 					}, po.reason)
+				}
+			}
+		}
+
+		// ----- 2a. During the bar: scale in on further drawdown -----
+		//
+		// BEFORE the exits, when the add's threshold sits above every
+		// downside level: a falling bar crosses it first, and live — which
+		// evaluates on ticks — adds there and then judges the stop against
+		// the re-based average, which may not fire at all. Running the exits
+		// first stopped the position out on the old average and never added
+		// (BT2-7). When the open, or the threshold itself, is already at or
+		// through a stop or trail, the exit comes first — live's first tick
+		// there runs checkExits before checkScaleIn — so the add is skipped
+		// and the exit pass below fires as before.
+		//
+		// Uses the bar's low and fills at the threshold price (or the open,
+		// if the open itself already gapped past it) — the same
+		// resting-order convention exitFill uses.
+		if bt.ScaleIn.Enabled && bt.ScaleIn.MaxAdds > 0 &&
+			bt.ScaleIn.StepPct > 0 && bt.ScaleIn.SizePct > 0 {
+			for _, sym := range symbols {
+				c := data[sym]
+				if i >= len(c) {
+					continue
+				}
+
+				h, isHeld := pf.Holding(sym)
+				if !isHeld || h.Qty <= 0 || h.AvgPrice <= 0 {
+					continue
+				}
+
+				if adds[sym] >= bt.ScaleIn.MaxAdds {
+					continue
+				}
+
+				bar := c[i]
+				threshold := h.AvgPrice * (1 - bt.ScaleIn.StepPct)
+
+				if bar.Low > threshold {
+					continue
+				}
+
+				if bt.Exits.Enabled {
+					age := time.Duration(0)
+					if et, ok := entryTime[sym]; ok {
+						age = bar.Time.Sub(et)
+					}
+
+					lv := exits.Compute(bt.Exits, h.AvgPrice, math.Max(peaks[sym], h.AvgPrice),
+						bt.atrAt(c, i-1), age).WithTrailFloor(bt.Exits, trailFloor[sym])
+
+					// Anything that fires AT THE OPEN — a gap through a stop
+					// or trail, a target already reached, a max_hold already
+					// due — closes the position on live's first tick, before
+					// checkScaleIn runs; adding first would buy inside the bar
+					// and sell at its earlier open, a profit that cannot exist
+					// (found by the verify-change pass). And a threshold at or
+					// below a downside level is reached after it.
+					down := math.Max(lv.Stop, lv.Trail)
+					if lv.Triggered(barOpen(bar)) != "" || (down > 0 && threshold <= down) {
+						continue // the exit is reached first; the pass below takes it
+					}
+				}
+
+				// The strategy's action as of the PRIOR bar's close — the
+				// only signal known without looking ahead into this bar.
+				if bt.ScaleIn.RequireSignal && lastSignal[sym] != strategy.Buy {
+					continue
+				}
+
+				if ok, _ := prot.AllowEntry(sym); !ok {
+					continue
+				}
+
+				fill := gapAdjusted(barOpen(bar), threshold, true)
+				if fill <= 0 {
+					continue
+				}
+
+				// Sized at the price the add fills at, with the ATR as of the
+				// prior close — c[i].Close and atrAt(c, i) are both this bar's
+				// END, unknown at the moment the threshold is touched (BT2-1).
+				add := rm.SizeBuy(
+					sym, fill, pf.Snapshot(), bt.sizingConfig(), bt.atrAt(c, i-1))
+				if !add.OK {
+					continue
+				}
+
+				size := add.Notional * bt.ScaleIn.SizePct
+
+				// The returns as of the PRIOR bar's close, as the open-fill
+				// path reads them: bar i's own close is not known when the
+				// threshold is touched intrabar (BT3-4).
+				retsAt.bar = max(i-1, 0)
+
+				if ok, _ := guard.AllowEntry(sym, pf.Snapshot(), size); !ok {
+					continue
+				}
+
+				prices[sym] = fill
+
+				filled := exec(broker.Order{
+					Symbol: sym, Side: broker.Buy, Qty: size / fill, Type: broker.Market,
+				}, fmt.Sprintf("SCALE-IN add %d/%d", adds[sym]+1, bt.ScaleIn.MaxAdds))
+
+				if filled { // exec counted the add (BT3-3)
+					addedOn[sym] = i
+					addedAt[sym] = fill
 				}
 			}
 		}
@@ -672,11 +980,33 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 					age = bar.Time.Sub(et)
 				}
 
+				// The ATR as of the PREVIOUS bar's close. atrAt(c, i) folds
+				// bar i's own high and low into the range, so a crashing bar
+				// widened its own stop just before being tested against it
+				// ("wider wins") — a stop at 98 that a low of 97 should hit
+				// moved to 96.67 and nothing exited (BT2-1). Live sees only
+				// the range up to the current tick.
+				// After an add on this bar the levels are rebuilt from the NEW,
+				// lower average — and the bar's open and high came before the
+				// add. Testing the lowered target and rungs against them sold
+				// at a price already gone: an add at 97, then the whole
+				// position "sold" at the 101 open for a profit that cannot
+				// exist (BT3-1). From the add on, only the add's own price and
+				// the close are known: the open becomes the add price, the high
+				// the better of the two. The low stands — a fall after the add
+				// is still possible, and the downside is what it is for.
+				judged := bar
+				if at, ok := addedOn[sym]; ok && at == i {
+					judged.Open = addedAt[sym]
+					judged.High = max(addedAt[sym], bar.Close)
+				}
+
 				if fill, reason := bt.exitFill(
-					bar,
+					judged,
 					entry,
 					peak,
-					bt.atrAt(c, i),
+					trailFloor[sym],
+					bt.atrAt(c, i-1),
 					age,
 				); reason != "" {
 					prices[sym] = fill // the exit fills at its trigger, not at the close
@@ -691,14 +1021,24 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 				// Only now, having tested against the pre-bar peak, does this
 				// bar's high get folded in — so it can ratchet the trail for
 				// bars from here on, without having been used to judge itself.
-				peaks[sym] = math.Max(peak, bar.High)
+				//
+				// Not after an add on this bar: the add re-based the peak at
+				// the threshold, low in the bar, and the bar's high most
+				// likely came BEFORE it. Folding it in re-armed the very
+				// tight trail RebaseOnAdd exists to prevent; the close is
+				// the one post-add price known for certain (BT2-7).
+				if at, ok := addedOn[sym]; ok && at == i {
+					peaks[sym] = math.Max(peak, bar.Close)
+				} else {
+					peaks[sym] = math.Max(peak, bar.High)
+				}
 
 				// Only once no full exit fired, exactly as the live engine orders
 				// them: a trailing stop on the way down from a rung closes the
 				// position rather than shaving it.
 				orig := max(origQty[sym], h.Qty)
 
-				qty, fill, reason, nextTaken := bt.partialFill(bar, entry, h.Qty, orig, partials[sym])
+				qty, fill, reason, nextTaken := bt.partialFill(judged, entry, h.Qty, orig, partials[sym])
 				if reason == "" {
 					continue
 				}
@@ -709,80 +1049,6 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 				exec(broker.Order{
 					Symbol: sym, Side: broker.Sell, Qty: qty, Type: broker.Market,
 				}, "EXIT "+reason)
-			}
-		}
-
-		// ----- 2b. During the bar: scale in on further drawdown -----
-		//
-		// A separate pass from the exits above, on purpose: it fires below
-		// entry rather than against it, so the two never compete for the
-		// same bar's fill, and this mirrors the live engine's checkScaleIn
-		// being a wholly separate pass from the exit check. Uses the bar's
-		// low, like the stop-loss/trailing-stop check above, and fills at
-		// the threshold price (or the open, if the open itself already
-		// gapped past it) — the same resting-order convention exitFill uses.
-		if bt.ScaleIn.Enabled && bt.ScaleIn.MaxAdds > 0 &&
-			bt.ScaleIn.StepPct > 0 && bt.ScaleIn.SizePct > 0 {
-			for _, sym := range symbols {
-				c := data[sym]
-				if i >= len(c) {
-					continue
-				}
-
-				h, isHeld := pf.Holding(sym)
-				if !isHeld || h.Qty <= 0 || h.AvgPrice <= 0 {
-					continue
-				}
-
-				if adds[sym] >= bt.ScaleIn.MaxAdds {
-					continue
-				}
-
-				bar := c[i]
-				threshold := h.AvgPrice * (1 - bt.ScaleIn.StepPct)
-
-				if bar.Low > threshold {
-					continue
-				}
-
-				// The strategy's action as of the PRIOR bar's close — the
-				// only signal known without looking ahead into this bar.
-				if bt.ScaleIn.RequireSignal && lastSignal[sym] != strategy.Buy {
-					continue
-				}
-
-				if ok, _ := prot.AllowEntry(sym); !ok {
-					continue
-				}
-
-				add := rm.SizeBuy(
-					sym, c[i].Close, pf.Snapshot(), bt.sizingConfig(), bt.atrAt(c, i))
-				if !add.OK {
-					continue
-				}
-
-				size := add.Notional * bt.ScaleIn.SizePct
-
-				retsAt.bar = i
-
-				if ok, _ := guard.AllowEntry(sym, pf.Snapshot(), size); !ok {
-					continue
-				}
-
-				fill := gapAdjusted(barOpen(bar), threshold, true)
-				if fill <= 0 {
-					continue
-				}
-
-				prices[sym] = fill
-
-				filled := exec(broker.Order{
-					Symbol: sym, Side: broker.Buy, Qty: size / fill, Type: broker.Market,
-				}, fmt.Sprintf("SCALE-IN add %d/%d", adds[sym]+1, bt.ScaleIn.MaxAdds))
-
-				if filled {
-					adds[sym]++
-				}
 			}
 		}
 
@@ -902,10 +1168,14 @@ func (bt *Backtester) Run(data map[string][]market.Candle) Result {
 		}
 	}
 
-	return bt.metrics(data, symbols, equity, runStats{
+	res := bt.metrics(data, symbols, equity, runStats{
 		trades: trades, wins: wins, losses: losses, bars: maxLen,
-		roundTrips: roundTrips, exposed: exposed, slots: slots, haltedAt: haltedAt,
+		roundTrips: roundTrips, trips: trips, exposed: exposed, slots: slots, haltedAt: haltedAt,
 	})
+
+	res.Misaligned = firstMisalignment(data, symbols, maxLen)
+
+	return res
 }
 
 // runStats carries the raw tallies a completed run hands to metrics.
@@ -914,6 +1184,7 @@ type runStats struct {
 	wins, losses   int
 	bars           int
 	roundTrips     []RoundTrip
+	trips          []RoundTrip
 	exposed, slots int
 	haltedAt       string
 }
@@ -940,32 +1211,44 @@ func barOpen(c market.Candle) float64 {
 // that touched both the stop and the target counts as the stop.
 func (bt *Backtester) exitFill(
 	bar market.Candle,
-	entry, peak, atr float64,
+	entry, peak, trailFloor, atr float64,
 	held time.Duration,
 ) (float64, string) {
-	lv := exits.Compute(bt.Exits, entry, peak, atr, held)
+	lv := exits.Compute(bt.Exits, entry, peak, atr, held).WithTrailFloor(bt.Exits, trailFloor)
 	open := barOpen(bar)
 
-	if lv.Stop > 0 && bar.Low <= lv.Stop {
-		return gapAdjusted(open, lv.Stop, true),
-			fmt.Sprintf("stop-loss %.2f<=%.2f", lv.Stop, entry)
+	// held is the age at the bar's START, so a due time barrier was already
+	// due at the open — where live, on its first tick past max_hold, exits.
+	// Nothing later in the bar can happen to the position; only a level the
+	// OPEN is already through names the exit instead (live checks the same
+	// downside-first order on that tick). Filling at the close held one bar
+	// of extra exposure and took the bar's end price (BT2-6).
+	if lv.TimeExit != "" {
+		return open, lv.Triggered(open) // never empty: TimeExit is its last case
 	}
 
-	if lv.Trail > 0 && bar.Low <= lv.Trail {
+	// Of the two downside levels the HIGHER is reached first by a falling
+	// price, and it is what fills — live sells on the first tick at or below
+	// the trail. Testing the stop first booked a bar through both at the
+	// deeper stop, labelled "stop-loss": with stop 95 and trail 98.94 a bar
+	// to 94 filled at 95 where live got ~98.9, biasing every comparison
+	// against tight trails (EX3-2).
+	stopHit := lv.Stop > 0 && bar.Low <= lv.Stop
+	trailHit := lv.Trail > 0 && bar.Low <= lv.Trail
+
+	if trailHit && (!stopHit || lv.Trail >= lv.Stop) {
 		return gapAdjusted(open, lv.Trail, true),
 			fmt.Sprintf("trailing-stop %.2f<=peak %.2f", lv.Trail, peak)
+	}
+
+	if stopHit {
+		return gapAdjusted(open, lv.Stop, true),
+			fmt.Sprintf("stop-loss %.2f<=%.2f", lv.Stop, entry)
 	}
 
 	if lv.Target > 0 && bar.High >= lv.Target {
 		return gapAdjusted(open, lv.Target, false),
 			fmt.Sprintf("%s %.2f>=%.2f", lv.TargetReason, lv.Target, entry)
-	}
-
-	// The time barrier last, and at the close: it has no price level to fill at,
-	// and a bar that also broke a price level has already returned above with the
-	// more accurate fill.
-	if lv.TimeExit != "" {
-		return bar.Close, lv.TimeExit
 	}
 
 	return 0, ""
@@ -1117,7 +1400,7 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 ) Result {
 	r := Result{
 		StartingCash: bt.Cash, Bars: st.bars, Trades: st.trades, Equity: equity,
-		NumTrades: len(st.trades), Wins: st.wins, Losses: st.losses,
+		NumTrades: len(st.trades), Wins: st.wins, Losses: st.losses, ClosedTrades: st.wins + st.losses,
 	}
 	if len(equity) > 0 {
 		r.FinalEquity = equity[len(equity)-1].Equity
@@ -1158,14 +1441,16 @@ func (bt *Backtester) metrics(data map[string][]market.Candle, symbols []string,
 		r.Calmar = r.CAGRPct / r.MaxDrawdownPct
 	}
 
-	r.ProfitFactor = profitFactor(pnlSeries(st.roundTrips))
-	r.ExpectancyPct, r.AvgWinPct, r.AvgLossPct = tradeQuality(pctSeries(st.roundTrips))
+	// Per closed trip, not per tranche (BT3-2).
+	r.ProfitFactor = profitFactor(pnlSeries(st.trips))
+	r.ExpectancyPct, r.AvgWinPct, r.AvgLossPct = tradeQuality(pctSeries(st.trips))
 
 	r.RoundTrips = st.roundTrips
-	r.BySymbol = bySymbol(st.roundTrips)
-	r.ByExit = byExitKind(st.roundTrips)
+	r.Trips = st.trips
+	r.BySymbol = bySymbol(st.trips)
+	r.ByExit = byExitKind(st.roundTrips) // which exit fired: per tranche
 	r.ByMonth = monthlyReturns(equity, bt.Cash)
-	r.Hold = holdStats(st.roundTrips)
+	r.Hold = holdStats(st.trips)
 	r.HaltedAt = st.haltedAt
 
 	return r

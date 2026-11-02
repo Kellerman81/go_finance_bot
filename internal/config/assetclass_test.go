@@ -80,20 +80,26 @@ func TestNormalizedAssetClassCaps(t *testing.T) {
 }
 
 // The slot counts normalise like the caps they divide — same hand-written
-// file, same case and whitespace mistakes — and a count that cannot split
-// anything (0, 1, negative) is dropped rather than carried as a live setting.
+// file, same case and whitespace mistakes — and a count that cannot bind (0,
+// negative, or 1 on a class whose own budget already caps it) is dropped
+// rather than carried as a live setting. 1 on a class WITHOUT a budget is a
+// real ceiling and stays (RK2-4: dropping it left such a class uncapped).
 func TestNormalizedAssetClassSlots(t *testing.T) {
 	t.Parallel()
 
-	got := PortfolioConfig{MinPositionsPerAssetClass: map[string]int{
-		" Stock ": 2,
-		"ETF":     3,
-		"bond":    1,  // the whole budget in one position: no split
-		"crypto":  0,  // absent, spelled out
-		"fund":    -1, // nonsense
-	}}.NormalizedAssetClassSlots()
+	got := PortfolioConfig{
+		MaxPctPerAssetClass: map[string]float64{"bond": 0.2},
+		MinPositionsPerAssetClass: map[string]int{
+			" Stock ": 2,
+			"ETF":     3,
+			"bond":    1,  // the whole budget in one position: no split
+			"crypto":  1,  // no budget: one position's share of the leftover
+			"cash":    0,  // absent, spelled out
+			"fund":    -1, // nonsense
+		},
+	}.NormalizedAssetClassSlots()
 
-	want := map[string]int{"stock": 2, "etf": 3}
+	want := map[string]int{"stock": 2, "etf": 3, "crypto": 1}
 	if len(got) != len(want) {
 		t.Fatalf("slots = %v, want %v", got, want)
 	}
@@ -109,6 +115,7 @@ func TestNormalizedAssetClassSlots(t *testing.T) {
 	}
 
 	if got := (PortfolioConfig{
+		MaxPctPerAssetClass:       map[string]float64{"etf": 0.5},
 		MinPositionsPerAssetClass: map[string]int{"etf": 1},
 	}).NormalizedAssetClassSlots(); got != nil {
 		t.Errorf("slots from an all-no-op config = %v, want nil", got)

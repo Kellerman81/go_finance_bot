@@ -112,7 +112,7 @@ func (e *Engine) noteRealizedClose(t TradeRecord) {
 		return
 	}
 
-	if !e.lossTuneCooldownPassed(t.Symbol, cfg.OnLoss.Cooldown) {
+	if !e.LossTuneCooldownPassed(t.Symbol, cfg.OnLoss.Cooldown) {
 		e.log.Info("autotune on_loss: streak reached but symbol is in cooldown",
 			"symbol", t.Symbol, "streak", streak, "cooldown", cfg.OnLoss.Cooldown)
 
@@ -132,13 +132,13 @@ func (e *Engine) noteRealizedClose(t TradeRecord) {
 	}
 }
 
-// lossTuneCooldownPassed reports whether enough time has passed since autotune
+// LossTuneCooldownPassed reports whether enough time has passed since autotune
 // last applied a change to symbol. A cooldown of 0 disables the check.
 //
 // It measures from the last APPLY rather than the last request: a request that
 // found nothing worth changing did not rewrite the symbol's config, so it is
 // no reason to stop looking again.
-func (e *Engine) lossTuneCooldownPassed(symbol string, cooldown time.Duration) bool {
+func (e *Engine) LossTuneCooldownPassed(symbol string, cooldown time.Duration) bool {
 	if cooldown <= 0 {
 		return true
 	}

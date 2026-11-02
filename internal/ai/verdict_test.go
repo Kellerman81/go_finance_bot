@@ -43,7 +43,13 @@ func TestParseVerdictShapes(t *testing.T) {
 			0.3,
 		},
 		{"conf over 1", `{"action":"SELL","confidence":5,"reason":"x"}`, Sell, 0.05},
-		{"missing conf", `{"action":"BUY","reason":"x"}`, Buy, 0},
+		// AI2-2: a "%" value is always a percentage. Divided only when it
+		// exceeded 1, "1%" read as full confidence and "0.5%" as half.
+		{"one percent", `{"action":"BUY","confidence":"1%","reason":"x"}`, Buy, 0.01},
+		{"half percent", `{"action":"BUY","confidence":"0.5%","reason":"x"}`, Buy, 0.005},
+		{"seventy percent", `{"action":"BUY","confidence":"70 %","reason":"x"}`, Buy, 0.7},
+		// A HOLD needs no confidence.
+		{"hold without conf", `{"action":"HOLD","reason":"x"}`, Hold, 0},
 	}
 
 	for _, tc := range cases {
@@ -77,6 +83,10 @@ func TestParseVerdictRejects(t *testing.T) {
 		`{"action":"MOON","confidence":1}`,
 		`{"confidence":0.9,"reason":"no action field"}`,
 		`{"action":`,
+		// AI2-3: a BUY/SELL with no readable confidence is not a vote. Kept,
+		// it counted in full in majority/unanimous mode at min_confidence 0.
+		`{"action":"BUY","reason":"x"}`,
+		`{"action":"SELL","confidence":"high","reason":"x"}`,
 	} {
 		if v, err := parseVerdict(raw); err == nil {
 			t.Errorf("parseVerdict(%q) = %+v, want error", raw, v)

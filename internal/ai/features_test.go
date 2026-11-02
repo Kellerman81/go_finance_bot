@@ -147,3 +147,39 @@ func TestParamsWithDefaults(t *testing.T) {
 		t.Errorf("WarmupBars %d < slow MA %d", p.WarmupBars(), p.SlowMA)
 	}
 }
+
+// TestTrendFeatureOfAConvexRallyIsPositive is ST2-2's copy in the feature
+// vector the ml and ai detectors share: a fitted intercept far below zero was
+// accepted as the denominator, flipping the sign, so a long flat stretch and a
+// steep breakout fed the model a large NEGATIVE TrendPct.
+func TestTrendFeatureOfAConvexRallyIsPositive(t *testing.T) {
+	t.Parallel()
+
+	p := Params{}.WithDefaults()
+
+	n := p.WarmupBars() + 100
+	closes := make([]float64, n)
+
+	for i := range closes {
+		closes[i] = 1
+		if i >= n-20 {
+			closes[i] = 1 + float64(i-(n-20)+1)
+		}
+	}
+
+	high, low, vol := make([]float64, n), make([]float64, n), make([]float64, n)
+	for i, c := range closes {
+		high[i], low[i], vol[i] = c*1.001, c*0.999, 1000
+	}
+
+	p.TrendPeriod = n
+
+	f, ok := BuildFeatures("X", high, low, closes, vol, p)
+	if !ok || !f.trendOK {
+		t.Fatal("trend feature undefined")
+	}
+
+	if f.TrendPct <= 0 {
+		t.Errorf("TrendPct = %.2f for a rally from 1 to 21, want positive", f.TrendPct)
+	}
+}

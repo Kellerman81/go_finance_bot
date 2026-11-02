@@ -2,6 +2,7 @@ package screener
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -238,5 +239,54 @@ func TestProbeIsInertWhenOffOrAbsent(t *testing.T) {
 
 	if len(prober.calls) != 0 {
 		t.Errorf("probed %v with probing off", prober.calls)
+	}
+}
+
+// TestProbedWinnersOutrankUnprobedCandidates is the regression for SC2-1 (the
+// same defect AT2-1 found from the autotune side). After the probe stage one
+// class's survivors carried two kinds of rank: a probed winner's Score (a
+// return %, here 50) and everyone else's cheap rank — AvgVol under the default
+// rank: volume, around a million. Sorted together, every unprobed name came
+// first: with four volume-ranked winners, max_candidates 2 and max_symbols 2,
+// the pass selected [C D] — the two it never measured — and dropped A and B.
+func TestProbedWinnersOutrankUnprobedCandidates(t *testing.T) {
+	series := map[string][]market.Candle{}
+	results := map[string]Probe{}
+
+	for i, sym := range []string{"A", "B", "C", "D"} {
+		series[sym] = trending(300, 100, 0.05, 0.01, float64(1_000_000-1000*i)) // A > B > C > D by volume
+		results[sym] = Probe{Source: "backtest", Trades: 30, ExpectancyPct: 0.5, Score: 50}
+	}
+
+	cfg := probeCfg(config.ScreenerProbeConfig{Enabled: true, Backtest: true, MaxCandidates: 2}, keysOf(series))
+	cfg.Rank = "volume"
+	cfg.MaxSymbols = 2
+
+	s := New(cfg, fakeHistory{series: series}, market.Res1Min, Options{Prober: &fakeProber{results: results}})
+	res := s.Screen(context.Background(), Inputs{})
+
+	if !slices.Equal(res.Selected, []string{"A", "B"}) {
+		t.Errorf("selected %v, want [A B] — the two candidates the probe measured as winners", res.Selected)
+	}
+}
+
+// AT3-3: with both probe legs on, a candidate carries a "backtest" probe only
+// when its search could not run — the run slot was held by an autotune pass.
+// Ranked in the higher tier, those collisions outranked every candidate that
+// was actually searched, whatever the scores: timing decided adoption. A
+// searched candidate ranks first.
+func TestASearchedCandidateOutranksABacktestFallback(t *testing.T) {
+	t.Parallel()
+
+	v := []Verdict{
+		{Symbol: "FALLBACK", Rank: 50, rankTier: rankTierOf("backtest")},
+		{Symbol: "SEARCHED", Rank: 2, rankTier: rankTierOf("autotune")},
+	}
+
+	sortByRank(v)
+
+	if v[0].Symbol != "SEARCHED" {
+		t.Errorf("order = %s, %s: the candidate whose search was skipped outranks the searched one",
+			v[0].Symbol, v[1].Symbol)
 	}
 }

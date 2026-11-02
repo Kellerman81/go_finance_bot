@@ -438,7 +438,7 @@ func TestCostMultipleSeparatesMovementFromSpread(t *testing.T) {
 	measureOf := func(c []market.Candle) Measures {
 		cols := columns(c)
 		m := measure(cols)
-		m.measureCost(cols, 0.001)
+		m.measureCost(cols, config.CostsConfig{CommissionPct: 0.001})
 
 		return m
 	}
@@ -461,7 +461,7 @@ func TestCostMultipleSeparatesMovementFromSpread(t *testing.T) {
 	// An unmeasurable spread must not read as a cheap one.
 	var none Measures
 	none.Price = 100
-	none.measureCost(columns(walk(50, 100, 0.01, 0.0005, 1)), 0.001)
+	none.measureCost(columns(walk(50, 100, 0.01, 0.0005, 1)), config.CostsConfig{CommissionPct: 0.001})
 
 	if none.CostOK {
 		t.Error("cost was reported measurable with no spread estimate")
@@ -628,5 +628,35 @@ func TestGlobalSuggestSeedsEveryClass(t *testing.T) {
 				t.Fatalf("pool is missing %q from class %q", want, class)
 			}
 		}
+	}
+}
+
+// TestSuggestionsReturnsACopyOfEveryPool guards the settings UI's "what
+// should I put in here?" listing: it must cover every class SuggestedClasses
+// names, and hand out COPIES — a caller that appended to or sorted a returned
+// slice in place would otherwise rewrite the curated pool every later screener
+// pass seeds from.
+func TestSuggestionsReturnsACopyOfEveryPool(t *testing.T) {
+	t.Parallel()
+
+	all := Suggestions()
+
+	for _, class := range SuggestedClasses() {
+		pool, ok := all[class]
+		if !ok || len(pool) == 0 {
+			t.Errorf("Suggestions has no pool for %q", class)
+
+			continue
+		}
+
+		pool[0] = "MUTATED"
+
+		if SuggestedUniverse(class)[0] == "MUTATED" {
+			t.Errorf("mutating Suggestions()[%q] changed the curated pool", class)
+		}
+	}
+
+	if len(all) != len(SuggestedClasses()) {
+		t.Errorf("Suggestions has %d classes, SuggestedClasses %d", len(all), len(SuggestedClasses()))
 	}
 }

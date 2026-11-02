@@ -120,6 +120,9 @@ func TestOpenPositionRoundTrip(t *testing.T) {
 		EntryTime:       entry,
 		Peak:            155,
 		EntryIndicators: `[{"name":"rsi"}]`,
+		// The trailing-stop floor an add leaves behind (EX2-1). Lost on a
+		// restart, the trail would drop back below where it already stood.
+		TrailFloor: 148.5,
 	}
 	if err := db.SaveOpenPosition(p); err != nil {
 		t.Fatalf("save: %v", err)
@@ -130,7 +133,7 @@ func TestOpenPositionRoundTrip(t *testing.T) {
 		t.Fatalf("load: %v len=%d", err, len(got))
 	}
 	if got[0].Symbol != "AAPL" || got[0].Qty != 2 || got[0].Peak != 155 ||
-		!got[0].EntryTime.Equal(entry) ||
+		!got[0].EntryTime.Equal(entry) || got[0].TrailFloor != 148.5 ||
 		got[0].EntryIndicators != p.EntryIndicators {
 		t.Errorf("round-trip mismatch: %+v", got[0])
 	}
@@ -587,5 +590,88 @@ func TestSQLiteMigratesLegacyColumns(t *testing.T) {
 	if got[0].PnL == nil || *got[0].PnL != 5 || got[0].Win == nil || !*got[0].Win ||
 		got[0].Indicators != tr.Indicators {
 		t.Errorf("post-migration round-trip mismatch: %+v", got[0])
+	}
+}
+
+// TestTradeStatsCutoffWorksAcrossUTCOffsets is the regression for SG2-1. The
+// fixed-width ts column only orders correctly when every row and the cutoff
+// share one offset. Trade times and cutoffs came from local time — and DST
+// moves the offset twice a year — so a close at 10:00Z stored as
+// "12:00+02:00" sorted after an 11:00Z cutoff and was counted, and a UTC row
+// against a cutoff written in +02:00 was dropped. Autotune's track-record
+// baselines read these counts.
+func TestTradeStatsCutoffWorksAcrossUTCOffsets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.db")
+
+	db, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plus2 := time.FixedZone("CEST", 2*3600)
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+
+	if err := db.SaveTrade(engine.TradeRecord{
+		Time: at.In(plus2), Symbol: "AAPL", Side: broker.Sell, Qty: 1, Price: 1,
+		Status: "filled", PnL: ptrF(1), PnLPct: ptrF(1), Win: ptrB(true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if s, _ := db.TradeStats(at.Add(time.Hour)); s.Trades != 0 {
+		t.Errorf("a 10:00Z close counted against an 11:00Z cutoff: %d trades", s.Trades)
+	}
+
+	if s, _ := db.TradeStats(at.Add(-time.Hour).In(plus2)); s.Trades != 1 {
+		t.Errorf("a 10:00Z close missed against a 09:00Z cutoff given in +02:00: %d trades", s.Trades)
+	}
+
+	// A row written before the fix, in local time, is rewritten at open.
+	if _, err := db.db.Exec(`UPDATE trades SET ts = ?`, at.In(plus2).Format(tsLayout)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = db.Close()
+
+	db, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if s, _ := db.TradeStats(at.Add(time.Hour)); s.Trades != 0 {
+		t.Errorf("an old +02:00 row still counted against a later cutoff after reopening: %d trades", s.Trades)
+	}
+}
+
+// TestAPruneFailureIsNotAFailedSave is the regression for SG2-4: the periodic
+// prune of old noise rows ran inside SaveTrade and its error was returned as
+// SaveTrade's, so the engine logged and errlogged "persist trade failed" for
+// a trade that had been written.
+func TestAPruneFailureIsNotAFailedSave(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Enough noise rows that the prune has something to delete, and a trigger
+	// that makes deleting fail.
+	for i := range maxNoiseTrades + 1 {
+		if _, err := db.db.Exec(`INSERT INTO trades (ts, symbol, side, qty, price, value, status)
+			VALUES (?, 'X', 'buy', 1, 1, 1, 'blocked')`, time.Unix(int64(i), 0).UTC().Format(tsLayout)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := db.db.Exec(`CREATE TRIGGER no_prune BEFORE DELETE ON trades BEGIN SELECT RAISE(FAIL, 'no'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.saveCount.Store(pruneEvery - 1) // the next save runs the prune
+
+	err = db.SaveTrade(engine.TradeRecord{Time: time.Now(), Symbol: "AAPL", Side: broker.Buy, Status: "filled"})
+	if err != nil {
+		t.Errorf("SaveTrade reported %v though the row was written; only the prune failed", err)
 	}
 }

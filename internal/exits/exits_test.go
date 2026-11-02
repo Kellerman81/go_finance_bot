@@ -289,3 +289,103 @@ func TestRungProfitPctIndexesTheUsableLadder(t *testing.T) {
 			part.Rung, part.Reason, got)
 	}
 }
+
+// readmeTrail is the README's two-stage trailing stop: loose 10% below a 5%
+// gain, tight 2% at or above it.
+var readmeTrail = config.ExitsConfig{
+	Enabled: true, TrailingStopPct: 0.10, TrailingOffsetPct: 0.05, TrailingTightPct: 0.02,
+}
+
+// TestRebaseOnAddAveragingDownKeepsTheTrailBelowThePrice is EX2-1's
+// averaging-down case. Buy at 100, peak 104.5, loose trail 94.05; at 95 an
+// equal add makes the average 97.5. Judged against 97.5, the 104.5 peak reads
+// as +7.2% — the tight stage — and the trail sat at 102.41, above the 95
+// price: the whole enlarged position sold at a loss on the next check.
+func TestRebaseOnAddAveragingDownKeepsTheTrailBelowThePrice(t *testing.T) {
+	t.Parallel()
+
+	peak, floor := RebaseOnAdd(readmeTrail, 100, 104.5, 0, 0, 97.5, 95)
+
+	lv := Compute(readmeTrail, 97.5, peak, 0, 0).WithTrailFloor(readmeTrail, floor)
+	if lv.Trail >= 95 {
+		t.Fatalf("trail after averaging down = %.2f, at or above the 95 price — "+
+			"the next check sells the enlarged position", lv.Trail)
+	}
+
+	if math.Abs(lv.Trail-94.05) > 1e-9 {
+		t.Errorf("trail = %.2f, want the 94.05 in force before the add, kept as the floor", lv.Trail)
+	}
+
+	if r := lv.Triggered(95); r != "" {
+		t.Errorf("Triggered(95) = %q right after the add, want nothing", r)
+	}
+}
+
+// TestRebaseOnAddPyramidingUpNeverLowersTheTrail is the other direction of
+// EX2-1. Buy at 100, peak 110 (+10%, tight trail 107.80); a pyramid at 110
+// raises the average to 105. Against 105 the gain reads +4.8% — back under
+// the offset — so the trail fell to the loose 99, or vanished under
+// trailing_only_after_offset. A trailing stop must not move down.
+func TestRebaseOnAddPyramidingUpNeverLowersTheTrail(t *testing.T) {
+	t.Parallel()
+
+	for _, onlyAfter := range []bool{false, true} {
+		cfg := readmeTrail
+		cfg.TrailingOnlyAfterOffset = onlyAfter
+
+		peak, floor := RebaseOnAdd(cfg, 100, 110, 0, 0, 105, 110)
+
+		lv := Compute(cfg, 105, peak, 0, 0).WithTrailFloor(cfg, floor)
+		if lv.Trail < 107.8-1e-9 {
+			t.Errorf("only_after_offset=%v: trail after a pyramid = %.2f, below the 107.80 it already was",
+				onlyAfter, lv.Trail)
+		}
+	}
+}
+
+// TestTrailFloorLapsesWithTheTrail: a floor an add left behind is part of the
+// trailing stop, so switching every trailing distance off must switch it off
+// too — found in verification of the EX2-1 fix, where a disabled trail kept
+// firing for exactly the positions that had been added to.
+func TestTrailFloorLapsesWithTheTrail(t *testing.T) {
+	t.Parallel()
+
+	off := config.ExitsConfig{Enabled: true, StopLossPct: 0.05}
+
+	if lv := Compute(off, 100, 110, 0, 0).WithTrailFloor(off, 107.8); lv.Trail != 0 {
+		t.Errorf("trail = %.2f with trailing switched off, want 0", lv.Trail)
+	}
+}
+
+// EX2-4 pins a decision rather than a fix: past the offset, the ATR trail
+// still overrides trailing_tight_pct when it is wider. The README and the
+// example config now say so; this test exists so changing it is a decision
+// someone makes on purpose, not a side effect.
+func TestATRTrailBoundsTheTightStage(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.ExitsConfig{
+		Enabled: true, TrailingStopPct: 0.10, TrailingOffsetPct: 0.05,
+		TrailingTightPct: 0.02, ATRTrailMult: 3,
+	}
+
+	if got := Compute(cfg, 100, 110, 1.5, 0).Trail; !closeTo(got, 105.50) {
+		t.Errorf("trail = %.2f, want 105.50 (3 ATR wider than the 2%% tight stage)", got)
+	}
+
+	if got := Compute(cfg, 100, 110, 0.1, 0).Trail; !closeTo(got, 107.80) {
+		t.Errorf("trail = %.2f, want 107.80: a small ATR must leave the tight stage in force", got)
+	}
+}
+
+// EX3-2, the live label: with the trail above the stop, a gap below both was
+// named a stop-loss, though the trail is the level a falling price reached.
+func TestTriggeredNamesTheNearerDownsideLevel(t *testing.T) {
+	t.Parallel()
+
+	lv := Compute(config.ExitsConfig{Enabled: true, StopLossPct: 0.05, TrailingStopPct: 0.03}, 100, 102, 0, 0)
+
+	if r := lv.Triggered(94); !strings.HasPrefix(r, "trailing-stop") {
+		t.Errorf("a gap below trail %.2f and stop %.2f was named %q", lv.Trail, lv.Stop, r)
+	}
+}

@@ -3,7 +3,9 @@ package market
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"sync"
@@ -37,6 +39,9 @@ type YahooHistory struct {
 	// cooldownUntil, while in the future, makes fetch fail immediately with
 	// no network calls at all — see coolDown.
 	cooldownUntil time.Time
+	// cooldownNoted is set once the current cooldown has been recorded — see
+	// noteCooldownOnce.
+	cooldownNoted bool
 
 	// base overrides the upstream host. Empty in production, where the two
 	// interchangeable Yahoo hosts are used; a test points it at a local server.
@@ -112,18 +117,27 @@ func (y *YahooHistory) wait(ctx context.Context) error {
 // requested (typically 1-minute) interval has no data — common for illiquid
 // instruments with little intraday activity — it falls back to progressively
 // coarser intervals (hourly, then daily) so warmup still gets bars.
+//
+//nolint:cyclop // one branch per fallback interval outcome
 func (y *YahooHistory) Candles(
 	ctx context.Context,
 	symbol string,
 	res Resolution,
-	_, _ time.Time, // Yahoo serves fixed ranges per interval; the window is implied
+	from, to time.Time,
 ) ([]Candle, error) {
-	interval, rng := yahooParams(res)
-	attempts := [][2]string{{interval, rng}}
+	interval, defRange := yahooParams(res)
 
+	attempts := [][2]string{{interval, rangeFor(interval, defRange, from)}}
+
+	// Only STRICTLY coarser intervals. The list used to be added whenever it
+	// differed by name, so a daily request with few bars fell back to HOURLY
+	// ones — finer, not coarser: young ETFs passed min_history_bars and were
+	// judged on hourly bars against daily thresholds while the verdict said
+	// "D" (MK2-2) — and "60m" never matched "1h", so an hourly request fetched
+	// the same data twice (MK2-3).
 	for _, fb := range [][2]string{{"1h", "3mo"}, {"1d", "2y"}} {
-		if fb[0] != interval {
-			attempts = append(attempts, fb)
+		if yahooIntervalMinutes(fb[0]) > yahooIntervalMinutes(interval) {
+			attempts = append(attempts, [2]string{fb[0], rangeFor(fb[0], fb[1], from)})
 		}
 	}
 
@@ -134,21 +148,54 @@ func (y *YahooHistory) Candles(
 	var (
 		best    []Candle
 		lastErr error
+		// bestInterval is the interval best came from.
+		bestInterval string
 	)
 
 	for i, a := range attempts {
 		candles, err := y.fetch(ctx, symbol, a[0], a[1])
 		if err != nil {
 			lastErr = err
+
+			if errors.Is(err, errYahooThrottled) {
+				break // the coarser attempts hit the same host and would fail the same way
+			}
+
 			continue
 		}
 
+		// The REQUESTED interval is windowed to what was asked for: Yahoo
+		// serves whole ranges, and a caller's lookback_days was otherwise
+		// silently whatever the range happened to cover (MK2-6). A coarser
+		// fallback is not: it is a substitution that exists to supply
+		// history the fine interval lacks (and is recorded as one below),
+		// and cutting it to warmup's 9-day window left an illiquid symbol
+		// ~60 hourly bars where it used to get three months — found by the
+		// verify-change pass.
+		//
+		// Whether the interval has ENOUGH bars is judged on what Yahoo
+		// serves at it, not on the window: the coarser fallback exists for
+		// illiquid instruments, not for a short window. Judging the window
+		// sent venuePrice's 2-day 1m request to hourly bars every Monday
+		// morning (the weekend is empty), and venuePrice then refused every
+		// entry until 60 one-minute bars of the new session existed — found
+		// by the verify-change pass.
+		served := len(candles)
+
+		if i == 0 {
+			candles = sliceByTime(candles, from, to)
+
+			if served >= enough {
+				return candles, nil
+			}
+		}
+
 		if len(candles) > len(best) {
-			best = candles
+			best, bestInterval = candles, a[0]
 		}
 
 		if len(best) >= enough {
-			if i > 0 {
+			if bestInterval != interval {
 				// A caller asked for interval (the first attempt) and silently
 				// got a[0] instead. venuePrice treats the last candle as "the
 				// venue's current price" for order sizing and the deviation
@@ -158,8 +205,7 @@ func (y *YahooHistory) Candles(
 				// the best available and warmup genuinely wants it), but it
 				// makes the substitution visible instead of silent. See
 				// CODE_REVIEW_FINDINGS.md's Yahoo-granularity finding.
-				errlog.Recordf("yahoo", "%s: requested %s bars, serving %s (only %d bars available at the finer interval)",
-					symbol, interval, a[0], len(best))
+				noteSubstitution(symbol, interval, bestInterval)
 			}
 
 			return best, nil
@@ -167,6 +213,13 @@ func (y *YahooHistory) Candles(
 	}
 
 	if len(best) > 0 {
+		// No interval reached `enough`, and the most bars may still have come
+		// from a fallback: that substitution was served with no note — 40
+		// hourly bars for a 1m request, silently (MK3-4).
+		if bestInterval != interval {
+			noteSubstitution(symbol, interval, bestInterval)
+		}
+
 		return best, nil
 	}
 
@@ -175,6 +228,18 @@ func (y *YahooHistory) Candles(
 	}
 
 	return nil, fmt.Errorf("yahoo: no data for %s at any interval", symbol)
+}
+
+// noteSubstitution records, once while it stands, that symbol's requested
+// interval was served by a coarser one. It is a property of the instrument,
+// not an event, and venuePrice asks on every evaluation: recorded per call —
+// with the varying bar count in the text, so no two lines matched — one
+// illiquid symbol filled Yahoo's 100-entry share in 50 minutes and evicted
+// the real 429 an operator needed (EL3-1, the errlog side of VP-1).
+func noteSubstitution(symbol, requested, served string) {
+	errlog.RecordOncef("yahoo",
+		"%s: requested %s bars, serving %s (too few bars at the finer interval)",
+		symbol, requested, served)
 }
 
 // throttled reports whether fetch is in a post-exhaustion cooldown (see
@@ -191,7 +256,35 @@ func (y *YahooHistory) throttled() bool {
 func (y *YahooHistory) coolDown() {
 	y.mu.Lock()
 	y.cooldownUntil = time.Now().Add(yahooCooldown)
+	y.cooldownNoted = false
 	y.mu.Unlock()
+}
+
+// errYahooThrottled is returned for a request refused locally while a
+// cooldown is in force — no request was sent.
+var errYahooThrottled = errors.New("yahoo: cooling down after repeated throttling")
+
+// noteCooldownOnce records the cooldown in errlog once per cooldown window.
+//
+// Each refused request used to record its own entry — three per Candles call
+// (1m, 1h, 1d attempts) for 30 s — so about 34 calls filled yahoo's 100-entry
+// share of the ring and evicted the real 429 or 5xx that started the
+// cooldown: the diagnostics tab showed 100 identical "cooling down" lines and
+// no cause (EL2-1).
+func (y *YahooHistory) noteCooldownOnce() {
+	y.mu.Lock()
+
+	first := !y.cooldownNoted
+	until := y.cooldownUntil
+
+	y.cooldownNoted = true
+
+	y.mu.Unlock()
+
+	if first {
+		errlog.Recordf("yahoo", "cooling down after repeated throttling: requests refused until %s",
+			until.Format(time.TimeOnly))
+	}
 }
 
 // clearCooldown ends an active cooldown once a request actually succeeds —
@@ -206,19 +299,22 @@ func (y *YahooHistory) clearCooldown() {
 // fetch retrieves one symbol/interval/range from Yahoo's chart endpoint,
 // pacing via the shared limiter and retrying on 429/5xx with exponential
 // backoff. It tries query1 then query2 on each attempt.
+//
+//nolint:cyclop // retry loop with cooldown, backoff and host rotation
 func (y *YahooHistory) fetch(
 	ctx context.Context,
 	symbol, interval, rng string,
 ) (_ []Candle, err error) {
 	defer func() {
-		if err != nil {
+		if err != nil && !errors.Is(err, errYahooThrottled) {
 			errlog.Recordf("yahoo", "%s (%s): %s", symbol, interval, err.Error())
 		}
 	}()
 
 	if y.throttled() {
-		return nil, fmt.Errorf(
-			"yahoo: cooling down after repeated throttling; not retrying %s yet", symbol)
+		y.noteCooldownOnce()
+
+		return nil, fmt.Errorf("%w; not retrying %s yet", errYahooThrottled, symbol)
 	}
 
 	backoff := 400 * time.Millisecond
@@ -360,10 +456,15 @@ func (y *YahooHistory) fetchOnce(
 	q := r.Indicators.Quote[0]
 	out := make([]Candle, 0, len(r.Timestamp))
 
-	for i, ts := range r.Timestamp {
+	// Bounded by the SHORTEST of the arrays, not by Close alone: Yahoo emits
+	// ragged arrays around corporate actions and partial days, and indexing
+	// Open/High/Low past their end panicked — on the engine goroutine that
+	// is caught by runSupervised, which disarms trading (MK2-7).
+	rows := min(len(r.Timestamp), len(q.Close), len(q.Open), len(q.High), len(q.Low))
+
+	for i, ts := range r.Timestamp[:rows] {
 		// Skip gaps where Yahoo returns null OHLC (market closed minutes).
-		if i >= len(q.Close) || q.Close[i] == nil || q.Open[i] == nil || q.High[i] == nil ||
-			q.Low[i] == nil {
+		if q.Close[i] == nil || q.Open[i] == nil || q.High[i] == nil || q.Low[i] == nil {
 			continue
 		}
 
@@ -389,6 +490,85 @@ func (y *YahooHistory) fetchOnce(
 
 // yahooParams maps a resolution to Yahoo's interval + a range that comfortably
 // covers indicator warmup.
+// yahooIntervalMinutes is an interval's length, for ordering intervals.
+func yahooIntervalMinutes(interval string) int {
+	switch interval {
+	case "1m":
+		return 1
+	case "5m":
+		return 5
+	case "15m":
+		return 15
+	case "60m", "1h":
+		return 60
+	case "1d":
+		return 1440
+	}
+
+	return 0
+}
+
+// yahooRanges lists, per interval, the range values Yahoo accepts for it
+// (shortest first) with the days each covers. The last entry is the
+// interval's ceiling: Yahoo refuses intraday ranges past ~60 days (1m: ~7).
+var yahooRanges = map[string][]struct {
+	rng  string
+	days int
+}{
+	"1m":  {{"1d", 1}, {"5d", 5}},
+	"5m":  {{"1d", 1}, {"5d", 5}, {"1mo", 31}},
+	"15m": {{"1d", 1}, {"5d", 5}, {"1mo", 31}},
+	"60m": {{"1mo", 31}, {"3mo", 92}, {"6mo", 183}, {"1y", 366}, {"2y", 731}},
+	"1h":  {{"1mo", 31}, {"3mo", 92}, {"6mo", 183}, {"1y", 366}, {"2y", 731}},
+	"1d": {
+		{"1mo", 31},
+		{"3mo", 92},
+		{"6mo", 183},
+		{"1y", 366},
+		{"2y", 731},
+		{"5y", 1827},
+		{"10y", 3653},
+		{"max", 1 << 30},
+	},
+}
+
+// rangeFor widens interval's default range until it covers from — never
+// narrows the range string; the screener's lookback_days used to be silently
+// whatever the fixed range covered (90 days at "15" gave 30) (MK2-6). A
+// lookback longer than Yahoo serves at that interval is capped at the
+// ceiling. Not recorded in errlog: engine warmup asks for 9 days at 1m on
+// every start, which would be a standing diagnostics entry about a constant
+// the operator cannot change; the ceilings are documented instead (README,
+// config.example.yaml, the lookback_days help).
+func rangeFor(interval, def string, from time.Time) string {
+	if from.IsZero() {
+		return def
+	}
+
+	need := int(math.Ceil(time.Since(from).Hours() / 24))
+	opts := yahooRanges[interval]
+
+	have := 0
+
+	for _, o := range opts {
+		if o.rng == def {
+			have = o.days
+		}
+	}
+
+	if need <= have || len(opts) == 0 {
+		return def
+	}
+
+	for _, o := range opts {
+		if o.days >= need {
+			return o.rng
+		}
+	}
+
+	return opts[len(opts)-1].rng
+}
+
 func yahooParams(res Resolution) (interval, rng string) {
 	switch res {
 	case Res5Min:

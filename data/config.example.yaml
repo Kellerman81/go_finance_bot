@@ -53,8 +53,11 @@ alpaca:
   key_id: ""                        # API key ID     (or set ALPACA_KEY_ID)
   secret_key: ""                    # API secret key (or set ALPACA_SECRET_KEY)
   base_url: "https://paper-api.alpaca.markets"  # paper trading endpoint
-  paper: true
-  use_sim: true                     # true => internal simulator, no Alpaca calls
+  paper: true                       # must agree with base_url: paper: true with a
+                                    # non-paper endpoint is refused at load
+  use_sim: true                     # true => internal simulator, no Alpaca calls.
+                                    # Only with broker unset/sim: with broker:
+                                    # alpaca it does nothing, and startup warns
   sim_cash: 100000                  # starting cash for the simulator
   preferred_currency: ""            # empty = report in the account's native currency
 
@@ -201,6 +204,7 @@ strategy:
   combine_sell: ""
   # Minimum combined confidence (0..1) required to BUY; weaker => HOLD.
   # Higher = fewer, higher-conviction trades (fewer losses). 0.30 ~ very selective.
+  # Outside 0..1 is refused at load (25 meant as 25% would never buy).
   min_strength: 0.25
   # Minimum confidence to SELL. -1 => same as min_strength. A lower value lets
   # the bot exit on a weaker signal than it needs to enter.
@@ -365,8 +369,10 @@ engine:
     # a market-order endpoint, so against it "limit" still crosses the spread
     # and limit_offset_pct/limit_timeout/market_fallback below do nothing; the
     # adapter records a note in the diagnostics tab's API-errors list when it
-    # happens. Alpaca and Saxo place real limit orders; the simulated broker
-    # fills one only when it is already marketable.
+    # happens. It also needs a broker that can LIST and CANCEL a resting order,
+    # or the timeout and fallback have nothing to act on: only Saxo can. On
+    # Alpaca and on the simulated broker (test mode) "limit" falls back to
+    # market orders, noted once per broker in the same list.
     type: "market"            # "market" or "limit"
     limit_offset_pct: 0.0005  # place the limit this far inside the touch (5 bps)
     limit_timeout: 2m         # give up on an unfilled limit order after this
@@ -486,7 +492,9 @@ exits:
   # that a winner isn't handed back - contradictory, so it is two. 0 = single
   # stage, exactly as before.
   trailing_offset_pct: 0      # e.g. 0.05 = once up 5%...
-  trailing_tight_pct: 0       # ...trail this much below the peak instead
+  trailing_tight_pct: 0       # ...trail this much below the peak instead. atr_trail_mult
+                              # still applies past the offset and the WIDER trail wins, so
+                              # a volatile instrument trails at max(this, atr_trail_mult x ATR)
   trailing_only_after_offset: false  # true = no trail at all below the offset (stop-loss only)
 
   # Time barrier (the third barrier of the triple-barrier method). The roi ladder
@@ -509,7 +517,9 @@ exits:
   # Time-decaying profit ladder, keyed by how long the position has been held.
   # Demand a lot early, settle for less as a trade goes stale: an entry that has
   # not worked in six hours probably is not going to. Whichever is nearer — this
-  # or take_profit_pct — wins. Empty (the default) disables it.
+  # or take_profit_pct — wins. Empty (the default) disables it. Keys are Go
+  # durations without a dot ("90m", not "1.5h" - refused at load: the settings
+  # form could never save it).
   # roi:
   #   "0s":  0.10             # 10% straight away
   #   "30m": 0.05             # after 30 minutes, 5% is enough
@@ -554,7 +564,9 @@ ai:
   api_key: ""                        # bearer token for "openai" (or BOT_AI_API_KEY)
   timeout: 20s                       # per request
   refresh_interval: 15m              # min time between calls for the same symbol
-  max_age: 1h                        # verdicts older than this are not used
+  max_age: 1h                        # verdicts older than this are not used; must
+                                     # not be shorter than refresh_interval
+                                     # (refused at load: a HOLD gap each cycle)
   blocking: false                     # false = never wait for the model (correct
                                       # for live trading). true = wait — only for
                                       # a deliberate, slow backtest of the advisor
@@ -584,6 +596,9 @@ protections:
   stop_guard_lock: 4h         # ...locks that symbol for this long
   max_drawdown_pct: 0.20      # halt ALL automated trading below this % off the peak (unrealized + realized)
   max_daily_loss_pct: 0.08    # halt after losing this much of the day's starting equity
+  # Both read ANY equity change as P&L: a withdrawal can trip them (safe), and a
+  # same-day deposit hides that day's trading losses from max_daily_loss_pct
+  # (not safe). Move money with trading off; see the README.
 
   # Same idea as max_drawdown_pct, but counting ONLY cumulative REALIZED P&L
   # (closed trades) against its own peak — ignores unrealized mark-to-market
@@ -656,8 +671,9 @@ screener:
   # time, after you have already paid for the feed subscription and the warmup
   # history. Set it to that same number, or a little above so a closing
   # position has a replacement ready. Counted across all asset classes (the
-  # guard does not care which class a position is in either); held and pinned
-  # symbols are exempt. 0 = no cap.
+  # guard does not care which class a position is in either). Held positions
+  # SPEND the budget, because the guard counts them too (they are never
+  # dropped); pinned symbols you do not hold spend nothing. 0 = no cap.
   max_symbols_per_sector: 0
   rank: "volume"              # volume | volatility | momentum | trend | cost
   min_price: 5                # skip penny stocks
@@ -667,15 +683,19 @@ screener:
   max_volatility_pct: 8       # ...too wild is unsurvivable
   min_history_bars: 100       # never trade something the strategy can't warm up on
   # Estimated bid-ask spread (Corwin-Schultz, computed from the bars themselves -
-  # no free candle feed reports one). It is paid TWICE per round trip and is
-  # invisible on a chart, so an instrument can look perfectly tradeable and still
-  # be unable to clear its own cost of entry. 0 = no bound.
+  # no free candle feed reports one). A round trip pays it once - half on each
+  # fill - and it is invisible on a chart, so an instrument can look perfectly
+  # tradeable and still be unable to clear its own cost of entry. 0 = no bound.
   max_spread_pct: 0           # e.g. 0.005 = 50 bps
   # The filter chain, in the order it runs. Evaluation stops at the first failure
   # so a verdict names the binding constraint rather than listing everything.
   # Empty = every filter, default order. Remove a name to drop that filter
   # outright instead of hunting for the value that means "no bound".
   filters: []                 # e.g. [history, price, volume, volatility, trend, drawdown, spread, cost]
+  # Held symbols - open positions, unconfirmed buys, resting orders, broker
+  # holdings not yet adopted - are never dropped and are re-added if missing,
+  # whatever this says; it only changes how a held, failing symbol's verdict
+  # reads.
   keep_held: true
   # Make the screener purely additive. With this on, the symbols you listed in
   # `watchlist:` above (and anything you add through the web interface) are never
@@ -696,7 +716,10 @@ screener:
   lookback_days: 30           # must be long enough that `resolution` yields
                                # more than min_history_bars - daily bars over
                                # 30 days is ~20 observations, which supports
-                               # neither an ATR nor a trend fit
+                               # neither an ATR nor a trend fit. Yahoo caps
+                               # the window by bar size (1m: 5 days, 5/15m: a
+                               # month, 60m: two years, D: none); a longer
+                               # lookback is cut there
 
   # --- what "good" means -------------------------------------------------
   #
@@ -813,7 +836,11 @@ screener:
     max_candidates: 10        # per asset class, best-first. Beyond the cutoff
                                # a candidate keeps its ranking - not probed is
                                # not the same as probed badly
-    min_trades: 5             # ignore a result built on fewer trades than this
+    min_trades: 5             # ignore a result built on fewer trades than this.
+                               # The autotune search is held to it too: a
+                               # thinner winner leaves the backtest result.
+                               # Probes run on engine.bar_interval bars; a
+                               # profile with COARSER bars is not probed.
     min_expectancy_pct: 0     # reject below this expectancy per trade; 0 means
                                # "must at least break even", below -1 scores
                                # without ever rejecting
@@ -1151,12 +1178,22 @@ ml:
   train_bars: 1500            # rolling training window
   retrain_every: 250          # refit cadence, in BARS (so backtest == live)
   min_samples: 200            # fewest labelled rows needed to fit at all
-  buy_prob: 0.58              # probability at which it votes BUY...
-  sell_prob: 0.42             # ...and SELL. Deliberately not 0.5: a model at the
-                              # coin-flip line should not be trading
-  min_skill: 0.02             # required accuracy ABOVE the majority-class base
-                              # rate (2pp) before it may vote at all
-  max_strength: 0.5           # cap on the strength it contributes
+  buy_prob: 0.58              # votes BUY when p(up) is this far above 0.5 ABOVE
+  sell_prob: 0.42             # the window's rally rate, SELL this far below it
+                              # (0.58/0.42 = ±0.08 around the base rate). The
+                              # label is "rose by threshold or not", so with a
+                              # threshold that makes rallies rare the SELL line
+                              # falls below zero and the model never sells: it
+                              # cannot have learned a fall. 0 = 0.58 / 0.42.
+  min_skill: 0.02             # how far its votes must beat chance (2pp) before it
+                              # may vote at all. Measured OUT OF SAMPLE, at
+                              # buy_prob/sell_prob: a twin fitted on the older 3/4
+                              # of the window votes on the newest 1/4, and its hit
+                              # rate must beat a same-side vote by chance. Fewer
+                              # than 20 held-out votes = no skill. 0 = no check
+  max_strength: 0.5           # cap on the strength it contributes (0..1).
+                              # 0 = the default, 1 — NOT mute; outside 0..1 is
+                              # refused at load
   epochs: 300                 # fitting hyperparameters; l2 is the main brake on
   learning_rate: 0.05         # overfitting the window
   l2: 0.01

@@ -33,7 +33,10 @@ func TestOptimizeTrialsDropHeavyPerBarFields(t *testing.T) {
 		TakeProfit:   []float64{0.2},
 	}
 
-	trials := Optimize(context.Background(), config.Default(), data, grid, 50000, 3, ScoreBlend, false)
+	// minTrades 1, not 3: the gate now counts CLOSED trades rather than fills
+	// (BT2-3), and this short series closes fewer than it fills. Nothing here
+	// is about the gate — it only needs a surviving trial to inspect.
+	trials := Optimize(context.Background(), config.Default(), data, grid, 50000, 1, ScoreBlend, false)
 	if len(trials) == 0 {
 		t.Fatal("expected at least one valid trial")
 	}

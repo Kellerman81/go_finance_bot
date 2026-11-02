@@ -114,7 +114,17 @@ func (c *CachingHistory) Candles(
 	// asking for data reaching further forward than what's actually
 	// cached — silently truncated results instead of a fresh fetch. See
 	// CODE_REVIEW_FINDINGS.md's CachingHistory finding.
-	fresh := ok && time.Since(e.fetchedAt) < c.ttl && !from.Before(e.from) && !to.After(e.to)
+	//
+	// The upper bound allows the TTL itself as slack. Every real caller asks
+	// for a window ending at time.Now(), so a later call's `to` is always past
+	// the cached one and "!to.After(e.to)" never held: the cache never hit in
+	// production, and every warmup, venue-price and screener read went to
+	// Yahoo — 429s, then the cooldown, then "venue price unavailable" blocking
+	// entries (MK2-1). An entry younger than the TTL cannot be missing more
+	// than the TTL's worth of bars past its own `to`, which is what the TTL
+	// already accepts as fresh enough.
+	fresh := ok && time.Since(e.fetchedAt) < c.ttl && !from.Before(e.from) &&
+		!to.After(e.to.Add(c.ttl))
 	c.mu.Unlock()
 
 	if fresh {
@@ -124,6 +134,16 @@ func (c *CachingHistory) Candles(
 		// exactly this) would otherwise silently corrupt what every other
 		// caller reads from this cache within the TTL — see
 		// CODE_REVIEW_FINDINGS.md's CachingHistory finding.
+		//
+		// A substituted COARSER series is returned whole, as the miss path
+		// returns it (MK2-6): sliced on a hit, the same warmup request got
+		// three months of a fallback's hourly bars on a miss and nine days
+		// of them on a hit — 400 bars or 216, decided by whether someone
+		// fetched the symbol in the last 15 s (MK3-3).
+		if gap, ok := FinestBarGap(e.candles); ok && gap > resolutionDuration(res)*3/2 {
+			return cloneCandles(e.candles), nil
+		}
+
 		return cloneCandles(sliceByTime(e.candles, from, to)), nil
 	}
 
@@ -131,6 +151,14 @@ func (c *CachingHistory) Candles(
 	if err != nil {
 		return nil, err
 	}
+
+	// The miss path returns the source's answer whole, deliberately (MK2-6,
+	// decided after the verify-change pass). Yahoo now windows the interval
+	// it was asked for itself, so what can lie outside [from, to] here is a
+	// coarser FALLBACK's history — exactly what warmup wants, and what
+	// trimming here cut to ~60 hourly bars for an illiquid symbol. A hit
+	// within the TTL still slices, as it always has: a narrower sub-window
+	// served from a wider fetch.
 
 	c.mu.Lock()
 
@@ -176,7 +204,8 @@ func (c *CachingHistory) Invalidate(symbol string, res Resolution) {
 }
 
 // sliceByTime returns the candles whose Time is within [from, to]. The input is
-// assumed chronologically ordered; the result shares the backing array.
+// assumed chronologically ordered; the result shares the backing array. A zero
+// bound is open: "no window" must not read as "nothing after year 1".
 func sliceByTime(candles []Candle, from, to time.Time) []Candle {
 	lo := 0
 	for lo < len(candles) && candles[lo].Time.Before(from) {
@@ -184,7 +213,7 @@ func sliceByTime(candles []Candle, from, to time.Time) []Candle {
 	}
 
 	hi := len(candles)
-	for hi > lo && candles[hi-1].Time.After(to) {
+	for !to.IsZero() && hi > lo && candles[hi-1].Time.After(to) {
 		hi--
 	}
 

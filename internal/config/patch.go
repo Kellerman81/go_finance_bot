@@ -71,12 +71,89 @@ func Patch(file, section string, value any) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 
-	out, err := patchBytes(src, section, value)
+	if err := refuseAliases(src, section); err != nil {
+		return err
+	}
+
+	out, err := patchBytes(src, section, value, true)
 	if err != nil {
 		return err
 	}
 
+	if err := stillLoads(src, out, file); err != nil {
+		return err
+	}
+
 	return writeAtomic(file, out)
+}
+
+// refuseAliases refuses a section that uses a YAML alias or merge key
+// (`<<: *base`). Splicing through one would edit the anchor's source and so
+// every other user of it, and verify, which re-reads only the section, cannot
+// resolve the anchor anyway: every save of such a section failed with "cannot
+// find anchor by alias name" — a message about the patcher's internals, not
+// about the file (CF3-6). The refusal now names the cause and the fix.
+func refuseAliases(src []byte, section string) error {
+	doc, err := parser.ParseBytes(src, 0)
+	if err != nil {
+		return nil //nolint:nilerr // an unparsable file is reported by the patch itself
+	}
+
+	p, err := yaml.PathString("$." + section)
+	if err != nil {
+		return nil //nolint:nilerr // a section path that cannot be built is the patch's to report
+	}
+
+	node, err := p.FilterFile(doc)
+	if err != nil || node == nil {
+		return nil //nolint:nilerr // an absent section has no alias
+	}
+
+	found := &aliasFinder{}
+	ast.Walk(found, node)
+
+	if found.hit {
+		return fmt.Errorf("config.yaml's %s: uses a YAML alias or merge key (<<: *anchor), which the "+
+			"settings form cannot save without changing every other user of the anchor — write the "+
+			"section out in full to save it from the UI", section)
+	}
+
+	return nil
+}
+
+// aliasFinder records whether a walked subtree contains an alias or a merge
+// key.
+type aliasFinder struct{ hit bool }
+
+func (a *aliasFinder) Visit(n ast.Node) ast.Visitor {
+	if t := n.Type(); t == ast.AliasType || t == ast.MergeKeyType {
+		a.hit = true
+
+		return nil
+	}
+
+	return a
+}
+
+// stillLoads refuses a write that would leave a file the bot cannot start
+// from. Each settings handler checks its own section, but the rules that
+// decide whether the bot starts span sections: zeroed money ceilings saved
+// while the kill switch was off, against a file with trading_enabled: true;
+// per-class slots above an edited min_positions; fast/slow MAs cleared to 0/0.
+// Each returned 200 and left a config.yaml that failed to load — so the next
+// restart did not start, and ran no exits (AP2-4). The patched bytes now go
+// through the same load path as a restart. A file that already did not load
+// is not this save's doing, and does not block it.
+func stillLoads(before, after []byte, file string) error {
+	if _, err := loadFrom(after, true, file); err != nil {
+		if _, prev := loadFrom(before, true, file); prev != nil {
+			return nil //nolint:nilerr // the file already did not load; this save is not what broke it
+		}
+
+		return fmt.Errorf("refusing to write: config.yaml would no longer load: %w", err)
+	}
+
+	return nil
 }
 
 // SymbolOverrideFields is the subset of StrategyConfig a caller has decided
@@ -214,8 +291,14 @@ func PatchSymbolOverride(file, symbol string, fields SymbolOverrideFields) error
 		return err
 	}
 
-	out, err := patchBytes(src, "strategy_overrides."+quotePathSegment(symbol), fields)
+	// Not exhaustive: an override names only the fields it changes, and the
+	// rest of the symbol's block must stay as it is.
+	out, err := patchBytes(src, "strategy_overrides."+quotePathSegment(symbol), fields, false)
 	if err != nil {
+		return err
+	}
+
+	if err := stillLoads(src, out, file); err != nil {
 		return err
 	}
 
@@ -358,7 +441,12 @@ var (
 // middle of an unrelated comment. Rather than carry that correction through
 // every calculation, the edit happens in LF space and the file's original line
 // ending is restored on the way out.
-func patchBytes(src []byte, section string, value any) ([]byte, error) {
+// exhaustive says value is the WHOLE section: any key of the section's own
+// the value no longer has is deleted from the file (see deleteStale). A
+// partial value — PatchSymbolOverride's — only writes what it names.
+//
+//nolint:cyclop // normalise, delete, replace/insert rounds, verify — one pipeline
+func patchBytes(src []byte, section string, value any, exhaustive bool) ([]byte, error) {
 	leaves, err := leavesOf(value)
 	if err != nil {
 		return nil, err
@@ -373,8 +461,18 @@ func patchBytes(src []byte, section string, value any) ([]byte, error) {
 		out = bytes.ReplaceAll(src, crlfBytes, lfBytes)
 	}
 
+	removed := false
+
+	if exhaustive {
+		var err error
+
+		if out, removed, err = deleteStale(out, section, value, leaves); err != nil {
+			return nil, err
+		}
+	}
+
 	leaves = changedOnly(out, section, value, leaves)
-	if len(leaves) == 0 {
+	if len(leaves) == 0 && !removed {
 		return src, nil // nothing to do; hand back the original bytes
 	}
 
@@ -395,7 +493,7 @@ func patchBytes(src []byte, section string, value any) ([]byte, error) {
 	// backstop for every rendering asymmetry, known or not — goccy re-renders an
 	// embedded newline in a double-quoted scalar as a space, which would quietly
 	// rewrite ai.system_prompt.
-	if err := verify(out, section, value); err != nil {
+	if err := verify(out, section, value, exhaustive); err != nil {
 		return nil, err
 	}
 
@@ -404,6 +502,58 @@ func patchBytes(src []byte, section string, value any) ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+// sectionBaseline returns a pointer to section's value as config.Load builds
+// it BEFORE the file's own section is read: Default(), under the active
+// profile (the file's profile: key, or BOT_PROFILE, which wins as it does in
+// loadFrom). The file's section is then read over it, so a comparison sees
+// what the file LOADS to — a key the file omits reads as the default or the
+// profile's value, not as zero.
+//
+// Compared against zero, every value the profile or Default() set and the
+// file did not name looked "changed", and the first save of a section wrote
+// them all out: after one exits save under profile: aggressive, switching to
+// conservative moved strategy and protections but left exits at the
+// aggressive 8% stop and 12% trail (CF3-2), and later changes to the
+// defaults never reached a file saved once. A section that is not a
+// top-level Config key (a strategy_overrides entry) keeps the zero baseline.
+func sectionBaseline(src []byte, section string, typ reflect.Type) reflect.Value {
+	zero := reflect.New(typ)
+
+	base := Default()
+
+	profile := strings.TrimSpace(os.Getenv("BOT_PROFILE"))
+	if profile == "" {
+		var doc struct {
+			Profile string `yaml:"profile"`
+		}
+
+		if err := yaml.Unmarshal(src, &doc); err == nil {
+			profile = doc.Profile
+		}
+	}
+
+	if withProfile, err := ApplyProfile(base, profile); err == nil {
+		base = withProfile
+	}
+
+	body, err := yaml.Marshal(base)
+	if err != nil {
+		return zero
+	}
+
+	p, err := yaml.PathString("$." + section)
+	if err != nil {
+		return zero
+	}
+
+	out := reflect.New(typ)
+	if err := p.Read(bytes.NewReader(body), out.Interface()); err != nil {
+		return zero
+	}
+
+	return out
 }
 
 // changedOnly drops leaves the file already agrees with.
@@ -419,7 +569,7 @@ func patchBytes(src []byte, section string, value any) ([]byte, error) {
 // value and matches a zero-valued leaf, which is why an absent optional block
 // stays absent.
 func changedOnly(src []byte, section string, value any, want []leaf) []leaf {
-	current := reflect.New(reflect.TypeOf(value))
+	current := sectionBaseline(src, section, reflect.TypeOf(value))
 
 	p, err := yaml.PathString("$." + section)
 	if err != nil {
@@ -548,8 +698,12 @@ func lineStarts(src []byte) []int {
 // characters instead of replacing them (`exclude_symbols: [AMZN]` -> `[]`
 // produced `[]AMZN]`, not `[]`). See replaceFlowSequenceEdit.
 func replaceEdit(src []byte, lines []int, node ast.Node, text string) (edit, error) {
-	if seq, ok := node.(*ast.SequenceNode); ok && seq.IsFlowStyle {
-		return replaceFlowSequenceEdit(src, lines, seq, text)
+	if seq, ok := node.(*ast.SequenceNode); ok {
+		if seq.IsFlowStyle {
+			return replaceFlowSequenceEdit(src, lines, seq, text)
+		}
+
+		return replaceBlockSequenceEdit(src, lines, seq, text)
 	}
 
 	tok := node.GetToken()
@@ -623,6 +777,42 @@ func replaceFlowSequenceEdit(src []byte, lines []int, seq *ast.SequenceNode, tex
 	// proven surprising once (GetToken() alone).
 	if start < 0 || end > len(src) || end <= start || src[start] != '[' || src[end-1] != ']' {
 		return edit{}, fmt.Errorf("cannot locate %s in the source", seq.GetPath())
+	}
+
+	return edit{start: start, end: end, text: text}, nil
+}
+
+// replaceBlockSequenceEdit computes the span of a block-style sequence — from
+// its first "-" to the end of its last element's last line — so a list the
+// file writes one item per line is replaced as a whole by the flow text the
+// list fields marshal to.
+//
+// Without it, a block-style list went through the scalar path: the first "-"
+// token was spliced with the whole new list, producing `detectors: - adx` on
+// one line plus the old items, which verify refused — so EVERY save of a
+// changed list setting (detectors, screener universe/filters, notify events,
+// the scale-out ladder) failed with "applied, but not saved", and the next
+// restart reverted it (CF2-1). The list fields carry ",flow" so the text is a
+// single-line `[a, b]`, valid wherever the block stood.
+func replaceBlockSequenceEdit(src []byte, lines []int, seq *ast.SequenceNode, text string) (edit, error) {
+	tok := seq.GetToken()
+	if tok == nil || tok.Position == nil {
+		return edit{}, fmt.Errorf("no position for %s", seq.GetPath())
+	}
+
+	line := tok.Position.Line - 1
+	if line < 0 || line >= len(lines) {
+		return edit{}, fmt.Errorf("line %d out of range for %s", tok.Position.Line, seq.GetPath())
+	}
+
+	start := lines[line] + tok.Position.Column - 1
+	if start < 0 || start >= len(src) || src[start] != '-' {
+		return edit{}, fmt.Errorf("cannot locate %s in the source", seq.GetPath())
+	}
+
+	end := lineEnd(src, lines, deepestLine(seq)-1)
+	if end <= start {
+		return edit{}, fmt.Errorf("cannot locate the end of %s in the source", seq.GetPath())
 	}
 
 	return edit{start: start, end: end, text: text}, nil
@@ -899,8 +1089,10 @@ func lineEnd(src []byte, lines []int, line int) int {
 }
 
 // verify re-reads section from out and reports any difference from want.
-func verify(out []byte, section string, want any) error {
-	fresh := reflect.New(reflect.TypeOf(want))
+//
+//nolint:cyclop // two leaf-set comparisons, each with an env-sourced exemption
+func verify(out []byte, section string, want any, exhaustive bool) error {
+	fresh := sectionBaseline(out, section, reflect.TypeOf(want))
 
 	p, err := yaml.PathString("$." + section)
 	if err != nil {
@@ -934,7 +1126,11 @@ func verify(out []byte, section string, want any) error {
 		gotText[lf.path] = lf.text
 	}
 
+	wantText := make(map[string]bool, len(wantLeaves))
+
 	for _, lf := range wantLeaves {
+		wantText[lf.path] = true
+
 		if EnvSourced(section, lf.path) {
 			continue
 		}
@@ -947,7 +1143,183 @@ func verify(out []byte, section string, want any) error {
 		}
 	}
 
+	// And nothing the value no longer has may survive in the file: checking
+	// only the wanted leaves let a removed map key stay, reported as saved
+	// (CF2-5). deleteStale removes such keys; this is the backstop.
+	for _, lf := range gotLeaves {
+		if exhaustive && !wantText[lf.path] && !EnvSourced(section, lf.path) {
+			return fmt.Errorf("refusing to write %s: %s was removed but would remain in the file", section, lf.path)
+		}
+	}
+
 	return nil
+}
+
+// deleteStale removes from src every key of section the new value no longer
+// has — a ROI rung, a strategy weight, a per-class cap or slot deleted in the
+// settings screen. Leaves only ever overwrote or inserted, so a removed key
+// stayed in the file while the save reported success, and came back at the
+// next restart (CF2-5).
+//
+// A path the file has and the value lacks is a real divergence, not an
+// omitempty artefact: both sides go through the same marshal, which omits
+// empty values from each alike. The highest key with nothing left under it is
+// deleted, whole lines, comments on them included. A key inside an inline
+// {...} map cannot be removed by line and is refused instead.
+//
+//nolint:cyclop // read, climb to the highest stale key, locate, splice — one pass
+func deleteStale(src []byte, section string, value any, want []leaf) ([]byte, bool, error) {
+	have, readable := sectionLeaves(src, section, value)
+	if !readable {
+		return src, false, nil // no readable section: nothing to delete
+	}
+
+	wanted := func(path string) bool {
+		for _, lf := range want {
+			if lf.path == path || strings.HasPrefix(lf.path, path+".") {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	targets := make(map[string]bool)
+
+	for _, lf := range have {
+		if wanted(lf.path) || EnvSourced(section, lf.path) {
+			continue
+		}
+
+		// Climb to the highest ancestor with nothing wanted under it.
+		path := lf.path
+		for {
+			parent, _, ok := cutLast(path)
+			if !ok || wanted(parent) {
+				break
+			}
+
+			path = parent
+		}
+
+		targets[path] = true
+	}
+
+	if len(targets) == 0 {
+		return src, false, nil
+	}
+
+	doc, err := parser.ParseBytes(src, parser.ParseComments)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse config: %w", err)
+	}
+
+	lines := lineStarts(src)
+	edits := make([]edit, 0, len(targets))
+
+	for path := range targets {
+		e, err := deleteKeyEdit(src, lines, doc, section, path)
+		if err != nil {
+			return nil, false, err
+		}
+
+		edits = append(edits, e)
+	}
+
+	return applyEdits(src, edits), true, nil
+}
+
+// sectionLeaves reads section from src into value's type and flattens it,
+// reporting false when the section cannot be read that way.
+func sectionLeaves(src []byte, section string, value any) ([]leaf, bool) {
+	current := reflect.New(reflect.TypeOf(value))
+
+	p, err := yaml.PathString("$." + section)
+	if err != nil {
+		return nil, false
+	}
+
+	if err := p.Read(bytes.NewReader(src), current.Interface()); err != nil {
+		return nil, false
+	}
+
+	have, err := leavesOf(current.Elem().Interface())
+
+	return have, err == nil
+}
+
+// cutLast splits a dotted leaf path into its parent and last key.
+func cutLast(path string) (parent, key string, ok bool) {
+	i := strings.LastIndexByte(path, '.')
+	if i < 0 {
+		return "", path, false
+	}
+
+	return path[:i], path[i+1:], true
+}
+
+// deleteKeyEdit returns the edit removing key path (relative to section) and
+// its value, as whole lines.
+//
+//nolint:cyclop // one guard per way a key can fail to be located
+func deleteKeyEdit(src []byte, lines []int, doc *ast.File, section, path string) (edit, error) {
+	parentPath, key, nested := cutLast(path)
+
+	full := "$." + section
+	if nested {
+		full += "." + parentPath
+	}
+
+	pp, err := yaml.PathString(full)
+	if err != nil {
+		return edit{}, fmt.Errorf("path %s: %w", path, err)
+	}
+
+	node, err := pp.FilterFile(doc)
+	if err != nil || node == nil {
+		return edit{}, fmt.Errorf("cannot locate %s to remove %s", full, key)
+	}
+
+	m, ok := node.(*ast.MappingNode)
+	if !ok {
+		mv, isValue := node.(*ast.MappingValueNode)
+		if !isValue {
+			return edit{}, fmt.Errorf("cannot remove %s.%s: its parent is not a mapping", section, path)
+		}
+
+		m = &ast.MappingNode{Values: []*ast.MappingValueNode{mv}}
+	}
+
+	if m.IsFlowStyle {
+		return edit{}, fmt.Errorf("cannot remove %s.%s from an inline {...} map — edit config.yaml by hand", section, path)
+	}
+
+	for _, v := range m.Values {
+		if v.Key.GetToken().Value != key {
+			continue
+		}
+
+		tok := v.Key.GetToken()
+		if tok == nil || tok.Position == nil {
+			break
+		}
+
+		first := tok.Position.Line - 1
+
+		last := deepestLine(v.Value)
+		if last < tok.Position.Line {
+			last = tok.Position.Line
+		}
+
+		end := len(src)
+		if last < len(lines) {
+			end = lines[last]
+		}
+
+		return edit{start: lines[first], end: end}, nil
+	}
+
+	return edit{}, fmt.Errorf("cannot locate %s.%s to remove it", section, path)
 }
 
 // leaf is one scalar to write, as a dotted path relative to the section and the

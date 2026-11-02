@@ -1,8 +1,10 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/Kellerman81/go_finance_bot/internal/config"
 	mlpkg "github.com/Kellerman81/go_finance_bot/internal/ml"
 	"github.com/gin-gonic/gin"
 )
@@ -96,11 +98,34 @@ func (s *Server) persistSection(name string) error {
 		return nil
 	}
 
+	var errs []error
+
 	if err := s.persist(sectionTarget(name), value); err != nil {
-		return fmt.Errorf("applied, but not saved to config.yaml: %w", err)
+		errs = append(errs, fmt.Errorf("applied, but not saved to config.yaml: %w", err))
 	}
 
-	return nil
+	// The portfolio form edits the hand-written sector and asset-class maps
+	// too, and nothing wrote them: a correction applied live, the form said
+	// "saved", and a restart reverted it (AP3-3). The hand layer only, never
+	// the merged view — see Engine.PortfolioOverrides (SG2-2).
+	if name == "portfolio" {
+		sectors, classes := s.eng.PortfolioOverrides()
+
+		// Their own blocks, written whatever became of the portfolio: one.
+		for _, key := range []string{"sectors", "asset_classes"} {
+			m := sectors
+			if key == "asset_classes" {
+				m = classes
+			}
+
+			if err := config.PatchLabelMap(s.configPath, key, m); err != nil {
+				errs = append(errs,
+					fmt.Errorf("applied, but %s not saved to config.yaml: %w", key, err))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // noteSave persists a form's section and, on failure, attaches the reason to

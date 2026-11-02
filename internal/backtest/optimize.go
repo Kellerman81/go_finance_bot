@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"slices"
@@ -147,6 +148,7 @@ func runTrialConfig(
 		KeepInterval:    t.KeepInterval,
 		MaxRiskSizeUSD:  base.Engine.MaxRiskSizeUSD,
 		MinOrderSizeUSD: base.Engine.MinOrderSizeUSD,
+		MinPositions:    minPositionsFor(base, respectLimits),
 		Portfolio:       base.Portfolio,
 		Sectors:         base.Sectors,
 		AssetClasses:    base.AssetClasses,
@@ -154,6 +156,18 @@ func runTrialConfig(
 	}
 
 	return dropHeavyFields(bt.Run(data))
+}
+
+// minPositionsFor is the min_positions a search run applies: the configured one
+// when it trades against the real limits (a portfolio-level replay, CM2-1), and
+// none on relaxed limits, where the run is one symbol on a synthetic budget and
+// a slot of that budget is not the live slot.
+func minPositionsFor(base config.Config, respectLimits bool) int {
+	if !respectLimits {
+		return 0
+	}
+
+	return base.Engine.MinPositions
 }
 
 // DefaultGrid returns a sensible, bounded search space (~1300 combos).
@@ -217,11 +231,45 @@ func ScoreSortino(r Result) float64 { return r.Sortino }
 
 // ScoreCalmar ranks by annual return per unit of worst drawdown — the objective
 // to use when surviving the equity curve matters as much as its endpoint.
-func ScoreCalmar(r Result) float64 { return r.Calmar }
+//
+// Scored as CAGR / (max drawdown + 1 point), not the raw ratio. Result.Calmar
+// is 0 when there was no drawdown (undefined), and scoring that as 0 ranked
+// the best possible incumbent as the worst: any worse candidate then cleared
+// autotune's "beats the baseline" gate and was applied unsupervised (AT2-4).
+// A bonus for "no drawdown" would invert the failure — a tiny flat return
+// would outrank a strong one with a shallow dip — so the denominator is
+// smoothed instead: finite for every result, ordered like Calmar wherever
+// drawdowns are material.
+func ScoreCalmar(r Result) float64 {
+	return r.CAGRPct / (math.Max(r.MaxDrawdownPct, 0) + 1)
+}
 
 // ScoreProfitFactor ranks by gross profit over gross loss, a pure trade-quality
 // objective that ignores how much capital was deployed.
-func ScoreProfitFactor(r Result) float64 { return r.ProfitFactor }
+//
+// Scored as a smoothed ratio, (gross win + m) / (gross loss + m) with m the
+// mean absolute P&L per trade, from the per-trade averages. Result.
+// ProfitFactor is 0 with no losing trade (undefined); scored as 0 that ranked a
+// never-losing incumbent below every candidate (AT2-4), and a flat "no loss"
+// bonus would rank ten tiny winners above a far more profitable record with
+// one small loss. The smoothing keeps both finite and in proportion: ten equal
+// winners score 11, and a record with one loss scores by how large it is.
+func ScoreProfitFactor(r Result) float64 {
+	n := float64(r.Wins + r.Losses)
+	if n == 0 {
+		return 0
+	}
+
+	gross := float64(r.Wins) * math.Max(r.AvgWinPct, 0)
+	loss := float64(r.Losses) * math.Abs(math.Min(r.AvgLossPct, 0))
+
+	m := (gross + loss) / n
+	if m == 0 {
+		return 0
+	}
+
+	return (gross + m) / (loss + m)
+}
 
 // ScoreExpectancy ranks by mean P&L per round trip, which is what actually
 // compounds: it rewards a modest win rate with large winners over a high win
@@ -357,6 +405,7 @@ func dropHeavyFields(res Result) Result {
 	res.Trades = nil
 	res.Equity = nil
 	res.RoundTrips = nil
+	res.Trips = nil
 
 	return res
 }
@@ -395,6 +444,7 @@ func runConfig(base config.Config, data map[string][]market.Candle, sc config.St
 		KeepInterval:     base.Engine.KeepInterval,
 		MaxRiskSizeUSD:   base.Engine.MaxRiskSizeUSD,
 		MinOrderSizeUSD:  base.Engine.MinOrderSizeUSD,
+		MinPositions:     minPositionsFor(base, respectLimits),
 		Portfolio:        base.Portfolio,
 		Sectors:          base.Sectors,
 		AssetClasses:     base.AssetClasses,
@@ -410,7 +460,7 @@ func runTrial(base config.Config, data map[string][]market.Candle, sc config.Str
 	frac, sl, ts, tp, cash float64, minTrades int, score Scorer, respectLimits bool,
 ) (Trial, bool) {
 	res := runConfig(base, data, sc, frac, sl, ts, tp, base.Costs, cash, respectLimits)
-	if res.NumTrades < minTrades {
+	if res.ClosedTrades < minTrades {
 		return Trial{}, false
 	}
 

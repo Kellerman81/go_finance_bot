@@ -1,6 +1,7 @@
 package autotune
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestRunSymbolOptimizeProducesABaselineAndAProposal(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
 
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if result.Symbol != "AAPL" {
 		t.Errorf("Symbol = %q, want AAPL", result.Symbol)
@@ -114,15 +115,15 @@ func TestRunSymbolOptimizeUsesTheRequestedObjective(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
 
-	if got := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "return", DefaultMinReturnPct).Objective; got != "return" {
+	if got := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "return", DefaultMinReturnPct).Objective; got != "return" {
 		t.Errorf("Objective = %q, want the requested \"return\"", got)
 	}
 
-	if got := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "not-a-real-objective", DefaultMinReturnPct).Objective; got != DefaultObjective {
+	if got := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "not-a-real-objective", DefaultMinReturnPct).Objective; got != DefaultObjective {
 		t.Errorf("Objective = %q, want the fallback %q for an unrecognized name", got, DefaultObjective)
 	}
 
-	if got := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "", DefaultMinReturnPct).Objective; got != DefaultObjective {
+	if got := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, "", DefaultMinReturnPct).Objective; got != DefaultObjective {
 		t.Errorf("Objective = %q, want the fallback %q for an empty name", got, DefaultObjective)
 	}
 }
@@ -148,7 +149,7 @@ func TestRunSymbolOptimizeNeverReportsImprovedWhenNotOverridable(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
 
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if !slices.Contains(result.NotOverridable, "exits_enabled") {
 		t.Fatalf("NotOverridable = %v, want it to include exits_enabled (base exits are disabled)", result.NotOverridable)
@@ -627,7 +628,7 @@ func TestRunSymbolOptimizeReportsBelowReturnFloor(t *testing.T) {
 	// An unreachably high floor: whatever the search finds, its return
 	// cannot possibly clear it, so BelowReturnFloor must be set and it
 	// must echo back the floor that was actually used.
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, 100000)
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, 100000)
 
 	if !result.BelowReturnFloor {
 		t.Errorf("BelowReturnFloor = false with an unreachable 100000%% floor and Best.Result.TotalReturnPct = %v",
@@ -644,7 +645,7 @@ func TestRunSymbolOptimizeReportsBelowReturnFloor(t *testing.T) {
 
 	// The same run against the default (0) floor: BelowReturnFloor must
 	// track that specific run's own floor, not some fixed value.
-	result = RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
+	result = RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 	if result.MinReturnPct != DefaultMinReturnPct {
 		t.Errorf("MinReturnPct = %v, want the default %v", result.MinReturnPct, DefaultMinReturnPct)
 	}
@@ -708,7 +709,7 @@ func TestRunSymbolOptimizeWindowsRealAgainstTheBacktestSpan(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
 
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if !result.HasReal {
 		t.Fatal("HasReal = false, want true — 7 real closed trades fall inside the backtest window")
@@ -781,7 +782,7 @@ func TestRunSymbolOptimizeProtectsARecentAutotuneWin(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
 
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"], DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if !result.HasRecentWin {
 		t.Fatal("HasRecentWin = false, want true — 3 real wins since the last autotune apply")
@@ -892,7 +893,7 @@ func TestRunSymbolOptimizeRefusesAnUnsearchableConfig(t *testing.T) {
 	eng.SetStrategyConfig(strat)
 
 	data := backtest.Generate([]string{"AAPL"}, 400)
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"],
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"],
 		DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if result.Improved {
@@ -945,7 +946,7 @@ func TestSearchNeverWinsOnAnAxisItCannotApply(t *testing.T) {
 
 	data := backtest.Generate([]string{"AAPL"}, 900)
 
-	result := RunSymbolOptimize(eng, rm, pf, "AAPL", data["AAPL"],
+	result := RunSymbolOptimize(context.Background(), eng, rm, pf, "AAPL", data["AAPL"],
 		DefaultMinTrades, DefaultObjective, DefaultMinReturnPct)
 
 	if len(result.NotOverridable) != 0 {

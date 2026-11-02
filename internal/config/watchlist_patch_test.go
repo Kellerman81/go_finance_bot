@@ -227,3 +227,41 @@ func TestCommentedConfigStillLoads(t *testing.T) {
 		t.Error("the commented entry lost the symbol or its reason")
 	}
 }
+
+// CF2-7, the key-line comment: "watchlist:   # my picks" is a block list
+// with a comment on its key. Read as inline style, drop_after_losses could
+// not persist a drop — the symbol came back at restart — and the error
+// blamed a style the file does not use.
+func TestCommentOutAcceptsACommentOnTheKeyLine(t *testing.T) {
+	t.Parallel()
+
+	src := []byte("watchlist:   # my picks\n  - AAPL\n  - SAP.DE\n")
+
+	out, changed, err := commentOutWatchlistBytes(src, "AAPL", "dropped")
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v, want a successful drop", changed, err)
+	}
+
+	if !strings.Contains(string(out), "# - AAPL") {
+		t.Errorf("AAPL not commented out:\n%s", out)
+	}
+}
+
+// CF2-7, duplicates: only the first match was commented, the duplicate stayed
+// live, and the caller was told the drop had persisted.
+func TestCommentOutCommentsEveryDuplicate(t *testing.T) {
+	t.Parallel()
+
+	src := []byte("watchlist:\n  - AAPL\n  - SAP.DE\n  - aapl\n")
+
+	out, changed, err := commentOutWatchlistBytes(src, "AAPL", "dropped")
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if item, ok := watchlistItem(line); ok && strings.EqualFold(item, "AAPL") {
+			t.Errorf("a duplicate entry is still active: %q", line)
+		}
+	}
+}

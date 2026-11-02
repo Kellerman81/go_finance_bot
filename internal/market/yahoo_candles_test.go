@@ -123,3 +123,93 @@ func TestYahooCandlesNoFallbackNeeded(t *testing.T) {
 		}
 	}
 }
+
+// TestYahooDailyRequestNeverFallsBackToFinerBars is the regression for MK2-2:
+// the "coarser" fallback list was hourly then daily, added whenever it merely
+// differed from the requested interval — so a daily request with few bars was
+// served HOURLY bars. A young ETF then passed min_history_bars, and its trend,
+// drawdown, volume and cost were judged on hourly bars against daily
+// thresholds while the verdict said "D".
+func TestYahooDailyRequestNeverFallsBackToFinerBars(t *testing.T) {
+	var asked []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Query().Get("interval"))
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Query().Get("interval") == "1h" {
+			_, _ = w.Write([]byte(chartBars(280)))
+
+			return
+		}
+
+		_, _ = w.Write([]byte(chartBars(40))) // a young listing: 40 daily bars
+	}))
+	t.Cleanup(srv.Close)
+
+	y := NewYahooHistory()
+	y.base = srv.URL
+	y.minInterval = 0
+
+	candles, err := y.Candles(context.Background(), "NEWETF", Res1Day, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("Candles: %v", err)
+	}
+
+	if len(candles) != 40 {
+		t.Errorf("a daily request got %d bars (asked %v), want the 40 daily ones", len(candles), asked)
+	}
+
+	for _, iv := range asked {
+		if iv == "1h" {
+			t.Errorf("a daily request asked Yahoo for hourly bars (%v)", asked)
+		}
+	}
+}
+
+// TestYahooCooldownDoesNotEvictItsOwnCause is the regression for EL2-1. While
+// a cooldown was in force every refused request recorded its own errlog entry,
+// three per Candles call (the 1m, 1h and 1d attempts), so about 34 calls filled
+// yahoo's 100-entry share of the ring and pushed out the real 429 or 5xx that
+// started the cooldown: 100 identical "cooling down" lines and no cause.
+//
+// Not parallel: errlog is process-wide.
+func TestYahooCooldownDoesNotEvictItsOwnCause(t *testing.T) {
+	errlog.Clear()
+	t.Cleanup(errlog.Clear)
+
+	y := NewYahooHistory()
+	y.base = "http://127.0.0.1:1"
+	y.minInterval = 0
+
+	errlog.Record("yahoo", "HTTP 429: the real cause")
+	y.coolDown()
+
+	for range 40 {
+		_, _ = y.Candles(context.Background(), "AAPL", Res1Min, time.Time{}, time.Time{})
+	}
+
+	found, cooling := false, 0
+
+	for _, e := range errlog.Recent() {
+		if e.Source != "yahoo" {
+			continue
+		}
+
+		if strings.Contains(e.Message, "the real cause") {
+			found = true
+		}
+
+		if strings.Contains(e.Message, "cooling down") {
+			cooling++
+		}
+	}
+
+	if !found {
+		t.Error("40 refused requests during a cooldown evicted the error that caused it")
+	}
+
+	if cooling != 1 {
+		t.Errorf("the cooldown was recorded %d times, want once", cooling)
+	}
+}

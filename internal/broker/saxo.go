@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,14 @@ type Saxo struct {
 
 	mu  sync.Mutex
 	uic map[string]instrument // symbol -> resolved instrument (cached)
+	// uicSymbol is the FIRST watchlist symbol each Uic was resolved from:
+	// symbolForUic used to pick from uic by map iteration, so two symbols
+	// resolving to one listing (SAP and SAP.DE → SAP:xetr) named the
+	// position at random from sync to sync — BR2-4's record/adoption
+	// mismatch by another door (BR3-9).
+	uicSymbol map[int]string
+	// ticks caches each instrument's tick-size scheme (see roundToTick).
+	ticks map[int]saxoTickScheme
 
 	// Order pacing to respect Saxo's ~1 order/second per-session limit.
 	orderMu          sync.Mutex
@@ -113,6 +122,8 @@ func NewSaxo(baseURL string, tokens TokenSource, accountKey, assetTypes, preferC
 		preferCcy:  strings.ToUpper(preferCcy),
 		fx:         newFXConverter(httpClient),
 		uic:        make(map[string]instrument),
+		uicSymbol:  make(map[int]string),
+		ticks:      make(map[int]saxoTickScheme),
 	}
 	if err := s.resolveAccount(context.Background()); err != nil {
 		return nil, err
@@ -139,6 +150,8 @@ func NewSaxoHistory(baseURL string, tokens TokenSource, assetTypes string) *Saxo
 		http:       httpClient,
 		fx:         newFXConverter(httpClient),
 		uic:        make(map[string]instrument),
+		uicSymbol:  make(map[int]string),
+		ticks:      make(map[int]saxoTickScheme),
 	}
 }
 
@@ -158,6 +171,21 @@ var saxoIdentifierParams = []string{"ClientKey", "AccountKey"}
 // string, for use in error messages/logs. The real path (with the real
 // values) is still what the actual HTTP request uses — only what reaches
 // errlog is redacted.
+// saxoTransportErr rebuilds a transport error around the redacted path. A
+// DNS, TCP, TLS or timeout failure is net/http's *url.Error, whose Error()
+// embeds the whole request URL — ClientKey and AccountKey included — so only
+// the status paths were redacted, and every sync of a network outage wrote
+// the raw identifiers into the UI-served errlog ring (EL3-3; notify's
+// sanitizeTransportErr fixed the same thing there).
+func saxoTransportErr(method, safePath string, err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("saxo %s %s: %w", method, safePath, uerr.Err)
+	}
+
+	return fmt.Errorf("saxo %s %s: %w", method, safePath, err)
+}
+
 func redactSaxoPath(path string) string {
 	base, query, hasQuery := strings.Cut(path, "?")
 	if !hasQuery {
@@ -215,7 +243,7 @@ func (s *Saxo) do(ctx context.Context, method, path string, body, out any) (err 
 
 	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+path, reader)
 	if err != nil {
-		return err
+		return saxoTransportErr(method, safePath, err)
 	}
 
 	tok, err := s.tokens.Token(ctx)
@@ -232,7 +260,7 @@ func (s *Saxo) do(ctx context.Context, method, path string, body, out any) (err 
 
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return err
+		return saxoTransportErr(method, safePath, err)
 	}
 	defer resp.Body.Close()
 
@@ -309,6 +337,77 @@ type saxoInstrumentHit struct {
 	CurrencyCode string `json:"CurrencyCode"`
 }
 
+// saxoExchangeForSuffix maps the Yahoo-style exchange suffixes the watchlist
+// uses onto Saxo's exchange codes (the part after ":" in a Saxo symbol).
+var saxoExchangeForSuffix = map[string]string{
+	"DE": "xetr", "F": "xfra", "L": "xlon", "PA": "xpar", "AS": "xams",
+	"MI": "xmil", "SW": "xswx", "MC": "xmad", "BR": "xbru", "VI": "xwbo",
+	"ST": "xsto", "CO": "xcse", "HE": "xhel", "OL": "xosl", "TO": "xtse",
+}
+
+// pickSaxoInstrument chooses the search hit for symbol. A watchlist symbol
+// like "SAP.DE" never equalled a Saxo symbol like "SAP:xetr", so the lookup fell
+// back to the FIRST hit — often another listing, e.g. the NYSE ADR priced in
+// USD (BR2-4). Preference: the base ticker on the exchange the suffix names,
+// then the base ticker anywhere, then the first hit.
+func pickSaxoInstrument(hits []saxoInstrumentHit, symbol string) saxoInstrumentHit {
+	base, suffix, _ := strings.Cut(symbol, ".")
+	exchange := saxoExchangeForSuffix[strings.ToUpper(suffix)]
+
+	split := func(h saxoInstrumentHit) (string, string) {
+		t, ex, _ := strings.Cut(h.Symbol, ":")
+
+		return t, ex
+	}
+
+	if exchange != "" {
+		for _, h := range hits {
+			if t, ex := split(h); strings.EqualFold(t, base) && strings.EqualFold(ex, exchange) {
+				return h
+			}
+		}
+	}
+
+	for _, h := range hits {
+		if t, _ := split(h); strings.EqualFold(t, symbol) || strings.EqualFold(t, base) {
+			return h
+		}
+	}
+
+	return hits[0]
+}
+
+// symbolForUic returns the watchlist symbol an instrument was resolved from,
+// or fallback when it was never resolved here. Positions and orders come back
+// with Saxo's own bare ticker ("SAP" for SAP.DE); without this the engine's
+// record for SAP.DE never matched the holding, a separate "SAP" was adopted,
+// and reconcile cleared SAP.DE's double-sell guard while its sell was still
+// working (BR2-4).
+func (s *Saxo) symbolForUic(uic int, fallback string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sym, ok := s.uicSymbol[uic]; ok {
+		return sym
+	}
+
+	// An instrument cached without a recorded first symbol: the
+	// alphabetically first one that maps to it, never map order.
+	var match []string
+
+	for sym, inst := range s.uic {
+		if inst.Uic == uic {
+			match = append(match, sym)
+		}
+	}
+
+	if len(match) > 0 {
+		return slices.Min(match)
+	}
+
+	return fallback
+}
+
 // resolveInstrument maps a ticker to a Saxo Uic and asset type, with caching.
 func (s *Saxo) resolveInstrument(ctx context.Context, symbol string) (instrument, error) {
 	s.mu.Lock()
@@ -337,14 +436,7 @@ func (s *Saxo) resolveInstrument(ctx context.Context, symbol string) (instrument
 		return instrument{}, fmt.Errorf("saxo: no instrument found for %q", symbol)
 	}
 
-	// Prefer an exact symbol match; otherwise take the first result.
-	pick := resp.Data[0]
-	for _, d := range resp.Data {
-		if strings.EqualFold(strings.Split(d.Symbol, ":")[0], symbol) {
-			pick = d
-			break
-		}
-	}
+	pick := pickSaxoInstrument(resp.Data, symbol)
 
 	inst := instrument{
 		Uic: pick.Identifier, AssetType: pick.AssetType,
@@ -354,6 +446,14 @@ func (s *Saxo) resolveInstrument(ctx context.Context, symbol string) (instrument
 	s.mu.Lock()
 
 	s.uic[symbol] = inst
+	if s.uicSymbol == nil {
+		s.uicSymbol = make(map[int]string)
+	}
+
+	if _, taken := s.uicSymbol[inst.Uic]; !taken {
+		s.uicSymbol[inst.Uic] = symbol
+	}
+
 	s.mu.Unlock()
 
 	return inst, nil
@@ -384,7 +484,7 @@ func (s *Saxo) fxRateForCurrencyResolved(ctx context.Context, ccy string) (rate 
 
 	rate, err := s.fx.Rate(ctx, ccy, s.preferCcy)
 	if err != nil {
-		errlog.Recordf("saxo", "fx rate %s->%s: %s (using 1:1)", ccy, s.preferCcy, err)
+		recordFXFailure("saxo", err, "rate unresolved: orders that need it are refused, positions stay in their native currency")
 		return 1, false
 	}
 
@@ -457,7 +557,9 @@ func (s *Saxo) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 		return OrderResult{}, err
 	}
 
-	amount := math.Floor(o.Qty)
+	// floorUnits, not math.Floor: a scale-out's 100 × 0.29 is
+	// 28.999999999999996 and floored to 28 (BR3-6, BR2-5's fix applied here).
+	amount := floorUnits(o.Qty)
 	if amount < 1 {
 		return OrderResult{}, fmt.Errorf(
 			"saxo: order for %s floors to 0 whole shares (qty %.4f)",
@@ -509,7 +611,7 @@ func (s *Saxo) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 				o.Symbol, inst.Currency, s.preferCcy)
 		}
 
-		body["OrderPrice"] = o.LimitPx / rate
+		body["OrderPrice"] = s.roundToTick(ctx, inst, o.LimitPx/rate)
 	}
 
 	var resp struct {
@@ -644,7 +746,7 @@ func (s *Saxo) GetAccount(ctx context.Context) (Account, error) {
 
 	if s.preferCcy != "" && ccy != "" && ccy != s.preferCcy {
 		if rate, err := s.fx.Rate(ctx, ccy, s.preferCcy); err != nil {
-			errlog.Recordf("saxo", "fx rate %s->%s: %s (using 1:1, balances will be wrong)", ccy, s.preferCcy, err)
+			recordFXFailure("saxo", err, "balances shown at 1:1 and will be wrong until the rate resolves")
 		} else {
 			cash, equity, bp = cash*rate, equity*rate, bp*rate
 			ccy = s.preferCcy
@@ -782,7 +884,7 @@ func (s *Saxo) GetPositions(ctx context.Context) ([]Position, error) {
 
 	out := make([]Position, 0, len(resp.Data))
 	for _, d := range resp.Data {
-		sym := strings.Split(d.DisplayAndFormat.Symbol, ":")[0]
+		sym := s.symbolForUic(d.NetPositionBase.Uic, strings.Split(d.DisplayAndFormat.Symbol, ":")[0])
 		ccy := strings.ToUpper(d.DisplayAndFormat.Currency)
 		rate, resolved := s.fxRateForCurrencyResolved(ctx, ccy)
 

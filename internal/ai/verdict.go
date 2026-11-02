@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -80,9 +81,27 @@ func parseVerdict(raw string) (Verdict, error) {
 		return Verdict{}, err
 	}
 
+	conf, confOK := parseConfidence(body.Confidence)
+
+	// A BUY/SELL whose confidence is missing or unreadable is not a vote:
+	// kept, it counted as a full vote in majority/unanimous mode (votes are
+	// counted, not weighted) with min_confidence 0 (AI2-3). Treated as a
+	// parse failure it becomes HOLD, like any other unusable answer.
+	//
+	// A confidence that reads as 0 or below is no vote either: with
+	// min_confidence 0 it passed the `<` gate and counted in full, which is
+	// the AI2-3 hole by another door (AI3-3).
+	if action != Hold && (!confOK || conf <= 0) {
+		return Verdict{}, fmt.Errorf(
+			"verdict %s has no readable positive confidence (%s)",
+			action,
+			snippet(body.Confidence),
+		)
+	}
+
 	v := Verdict{
 		Action:     action,
-		Confidence: clamp01(parseConfidence(body.Confidence)),
+		Confidence: clamp01(conf),
 		Reason:     strings.TrimSpace(body.Reason),
 	}
 
@@ -133,36 +152,53 @@ func parseAction(s string) (Action, error) {
 }
 
 // parseConfidence reads a confidence that may arrive as a number, a quoted
-// number, or a percentage (70 meaning 0.70).
-func parseConfidence(raw json.RawMessage) float64 {
+// number, or a percentage (70 meaning 0.70), and reports whether there was a
+// readable one at all.
+//
+// A value written with "%" is ALWAYS a percentage. Only a bare number uses
+// the "> 1 means percent" rule: dividing a "%" value only when it exceeded 1
+// read "1%" as 1.0 and "0.5%" as 0.5 — a weak answer as full confidence (AI2-2).
+func parseConfidence(raw json.RawMessage) (float64, bool) {
 	if len(raw) == 0 {
-		return 0
+		return 0, false
 	}
 
 	var num float64
+
+	percent := false
 
 	if err := json.Unmarshal(raw, &num); err != nil {
 		var s string
 
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return 0
+			return 0, false
 		}
 
-		s = strings.TrimSuffix(strings.TrimSpace(s), "%")
-		if _, err := fmt.Sscanf(s, "%g", &num); err != nil {
-			return 0
+		s = strings.TrimSpace(s)
+		if trimmed := strings.TrimSuffix(s, "%"); trimmed != s {
+			s, percent = strings.TrimSpace(trimmed), true
 		}
+
+		// The whole string must be the number. Sscanf read the leading part
+		// and ignored the rest, so a decimal comma ("0,8") read as 0 and
+		// "7/10" as 0.07 (AI3-3).
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+
+		num = v
 	}
 
 	if math.IsNaN(num) || math.IsInf(num, 0) {
-		return 0
+		return 0, false
 	}
 
-	if num > 1 { // a percentage
+	if percent || num > 1 {
 		num /= 100
 	}
 
-	return num
+	return num, true
 }
 
 // extractJSONObject returns the outermost {...} span of s, ignoring braces

@@ -4,9 +4,22 @@
 package portfolio
 
 import (
+	"math"
 	"strings"
 	"sync"
 )
+
+// DustQty is the largest quantity that still counts as "not held". A residual
+// at or below it — broker quantity rounding after a full exit — is not an open
+// position: the engine never sells or adopts it, so counting it here would
+// let it hold a max_open_positions slot, and exempt a fresh buy of that symbol
+// from the slot and sector/correlation caps, for as long as the broker keeps
+// reporting it (PF2-4). One constant, so the engine's "closed" and this
+// package's "open" cannot disagree again.
+const DustQty = 1e-6
+
+// Held reports whether h is a real position rather than a dust or zero row.
+func (h Holding) Held() bool { return h.Qty > DustQty }
 
 // Normalize is the canonical form every holding is keyed by: upper-cased and
 // trimmed, matching config.PerSymbolStrategy, risk.PortfolioGuard.AllowEntry
@@ -76,7 +89,21 @@ func (p *Portfolio) SetCash(cash float64) {
 }
 
 // SyncPositions replaces tracked holdings from an authoritative broker list.
-func (p *Portfolio) SyncPositions(hs []Holding) {
+//
+// Two rows that normalise to the same key — Saxo's "SAP:xetr" and "SAP:xnys"
+// both become "SAP", or two spellings differing only in case — are MERGED
+// (quantities and values summed, a quantity-weighted average price), and
+// their symbols returned so the caller can surface the ambiguous mapping.
+// Last-row-wins, as before, kept one row at random: a full exit then sold
+// part of the position and stranded the rest, and equity understated by the
+// dropped row on every sync — enough to trip a sticky drawdown halt (PF2-2).
+//
+// The merge has a cost of its own, which is why the caller surfaces it: a
+// full exit now sends the summed quantity through ONE listing's instrument,
+// which the broker may refuse (the exit then fails each evaluation) or, on a
+// margin account, partly fill as a short. Equity and the caps are right;
+// the symbol mapping is what needs fixing.
+func (p *Portfolio) SyncPositions(hs []Holding) (collided []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -86,12 +113,42 @@ func (p *Portfolio) SyncPositions(hs []Holding) {
 		h := hs[i]
 		h.Symbol = Normalize(h.Symbol)
 
-		p.holdings[h.Symbol] = &h
+		prev, dup := p.holdings[h.Symbol]
+		if !dup {
+			p.holdings[h.Symbol] = &h
+
+			continue
+		}
+
+		collided = append(collided, h.Symbol)
+
+		qty := prev.Qty + h.Qty
+		if qty != 0 {
+			prev.AvgPrice = (prev.AvgPrice*prev.Qty + h.AvgPrice*h.Qty) / qty
+		}
+
+		prev.Qty = qty
+
+		prev.MarketValue += h.MarketValue
+		prev.UnrealizedPL += h.UnrealizedPL
+
+		if h.LastPrice > 0 {
+			prev.LastPrice = h.LastPrice
+		}
 	}
+
+	return collided
 }
 
 // MarkPrice updates the last price for a symbol and recomputes its value.
 func (p *Portfolio) MarkPrice(symbol string, price float64) {
+	// A non-positive or non-finite tick is a bad print, not a price: marking
+	// it valued the holding at 0, and a drawdown check reading that equity
+	// could trip a sticky halt over nothing (PF2-5).
+	if !(price > 0) || math.IsInf(price, 0) {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -180,7 +237,8 @@ func (p *Portfolio) Snapshot() Snapshot {
 		// open position — counting it inflates max_open_positions against
 		// nothing actually held. See CODE_REVIEW_FINDINGS.md's
 		// "max_open_positions bypassed by a zero-quantity holdings row".
-		if h.Qty > 0 {
+		// Dust counts as closed too (PF2-4).
+		if h.Held() {
 			out.OpenPositions++
 		}
 	}

@@ -1,6 +1,7 @@
 package backtest
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -297,6 +298,32 @@ func TestDrawdownHaltIsReported(t *testing.T) {
 
 	if res.HaltedAt == "" {
 		t.Error("a 0.01% drawdown limit did not report a halt")
+	}
+}
+
+// PR2-7: max_realized_drawdown_pct was never fed in the backtest, so a config
+// the live bot would halt on realized give-back reported a full, unhalted
+// equity curve — and passed autotune's gates on it.
+func TestRealizedDrawdownHaltIsReported(t *testing.T) {
+	t.Parallel()
+
+	data := Generate([]string{"AAPL", "MSFT"}, 1500)
+
+	bt := &Backtester{
+		Strategy: strategy.New(permissiveStrategy()), Limits: testLimits(),
+		Exits: config.ExitsConfig{Enabled: true, StopLossPct: 0.02},
+		Cash:  100000, OrderSize: 20000,
+		// Only the realized-drawdown limit: ObserveEquity cannot trip this run.
+		Protections: config.ProtectionsConfig{Enabled: true, MaxRealizedDrawdownPct: 0.0001},
+	}
+
+	res := bt.Run(data)
+	if res.Losses == 0 {
+		t.Skip("no losing trade on this sample")
+	}
+
+	if res.HaltedAt == "" || !strings.Contains(res.HaltedAt, "realized") {
+		t.Errorf("HaltedAt = %q, want a realized-drawdown halt", res.HaltedAt)
 	}
 }
 

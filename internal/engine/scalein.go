@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
@@ -53,6 +54,36 @@ func (e *Engine) checkScaleIn(ctx context.Context) {
 			continue
 		}
 
+		if e.addRefusedRecently(p.Symbol) {
+			continue // the broker refused the last add; see scaleInRefusedBackoff
+		}
+
+		// An add whose outcome the broker never confirmed is not booked, so
+		// Adds does not move and the rung stays due: without this the same add
+		// went to the broker again every evaluation, each with an "unknown
+		// order" alert (EN2-1) — the check act makes before any buy. A sell in
+		// flight blocks an add too: recordOpen clears the pendingSell marker,
+		// so an add filling during a stop-exit re-armed that exit.
+		if e.hasUnconfirmedBuy(p.Symbol) {
+			continue
+		}
+
+		// In flight means the sale is not yet reflected: the holding still
+		// stands at or above the marker. Any marker used to block, and a
+		// CONFIRMED scale-out rung leaves its marker until reconcile clears
+		// it — which needs an order-listing broker (not Alpaca, not Sim) — so
+		// scale-in silently stopped for good after the first rung (EN3-2).
+		if pending, selling := e.pendingSellQty(
+			p.Symbol,
+		); selling &&
+			e.pf.PositionQty(p.Symbol) >= pending {
+			continue
+		}
+
+		if e.countUnconfirmed(p.Symbol, broker.Sell) > 0 {
+			continue // a sale of unknown outcome is in flight too
+		}
+
 		if cfg.RequireSignal && e.signalFor(p.Symbol) != strategy.Buy {
 			continue // the price fell, but the strategy no longer likes it
 		}
@@ -90,11 +121,13 @@ func (e *Engine) addToPosition(
 	cfg := e.ScaleInConfig()
 	indSnap := e.indicatorSnapshot(symbol)
 
+	// A refused add is a standing condition while the price sits under the
+	// rung — checkScaleIn re-tries it every evaluation — so it is announced
+	// once per distinct reason, like an entry refusal. Recording it per
+	// evaluation wrote a blocked trade and a notification twice a minute
+	// (EN2-8; the VP-1 fix had reached act only).
 	blocked := func(reason string) {
-		e.record(TradeRecord{
-			Time: now(), Symbol: symbol, Side: broker.Buy, Price: price,
-			Status: "blocked", Reason: "SCALE-IN " + reason, Indicators: indSnap,
-		})
+		e.noteBlockedOnceKeyed(scaleInBlockKey(symbol), symbol, "SCALE-IN "+reason, price, indSnap)
 	}
 
 	// First, and silently: a closed venue or an instrument the broker refuses
@@ -172,7 +205,7 @@ func (e *Engine) addToPosition(
 
 	// Hold this add's estimated cash cost against risk.Manager's headroom
 	// for the round trip to the broker — see risk.Manager.Reserve.
-	resID := e.rm.ReserveBuy(authOrder.Qty, price)
+	resID := e.rm.ReserveBuy(symbol, authOrder.Qty, price)
 
 	res, err := e.brk.SubmitOrder(ctx, authOrder)
 	if err != nil {
@@ -188,18 +221,48 @@ func (e *Engine) addToPosition(
 	}
 
 	e.met.onOrder()
+	e.clearBlockedOnce(scaleInBlockKey(symbol)) // got past every gate
 
 	bought, isSettled := settledQty(res)
 	if !isSettled {
 		// Ambiguous — leave resID reserved rather than guess; see
 		// risk.Manager.Reserve's fails-closed guidance.
-		e.flagUnconfirmed(symbol, broker.Buy, authOrder.Qty, res, tag+" | broker did not confirm this order's outcome")
+		e.flagUnconfirmed(
+			symbol,
+			broker.Buy,
+			authOrder.Qty,
+			res,
+			tag+" | broker did not confirm this order's outcome",
+			resID,
+		)
 		e.syncPortfolio(ctx)
 
 		return
 	}
 
 	e.rm.Release(resID)
+
+	if bought <= 0 {
+		// The broker refused the add — insufficient funds, the instrument
+		// closed for buys. Adds did not move, so the rung stayed due and the
+		// same add went out, was refused and was recorded every evaluation
+		// (EN3-7). Recorded once, and not retried for a while.
+		e.mu.Lock()
+
+		if e.addRefusedAt == nil {
+			e.addRefusedAt = make(map[string]time.Time)
+		}
+
+		e.addRefusedAt[symbol] = now()
+
+		e.mu.Unlock()
+
+		e.noteBlockedOnceKeyed(scaleInBlockKey(symbol), symbol,
+			"scale-in add refused by the broker ("+filledOr(res.Status, 0)+")", price, indSnap)
+		e.syncPortfolio(ctx)
+
+		return
+	}
 
 	fillPx := res.FilledPx
 	if fillPx <= 0 {
@@ -221,6 +284,20 @@ func (e *Engine) addToPosition(
 		Reason: tag, OrderID: res.ID, Indicators: indSnap,
 	})
 	e.recordOpen(symbol, bought, fillPx, indSnap) // also bumps Adds
+
+	// The rest of a partly filled add is still working: reported, with its
+	// own reservation held until it resolves (EN3-3).
+	if rem := workingRemainder(authOrder, res, bought); rem > 0 {
+		e.flagUnconfirmed(
+			symbol,
+			broker.Buy,
+			rem,
+			res,
+			tag+" | partly filled at the broker's wait deadline; the rest is still working or its outcome is unknown",
+			e.rm.ReserveBuy(symbol, rem, price),
+		)
+	}
+
 	e.syncPortfolio(ctx)
 }
 
@@ -247,4 +324,19 @@ func (e *Engine) signalFor(symbol string) strategy.Action {
 	}
 
 	return strategy.Hold
+}
+
+// scaleInRefusedBackoff is how long scale-in leaves a symbol alone after the
+// broker refused an add for it (EN3-7).
+const scaleInRefusedBackoff = 30 * time.Minute
+
+// addRefusedRecently reports whether the broker refused an add for symbol
+// within scaleInRefusedBackoff.
+func (e *Engine) addRefusedRecently(symbol string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	at, ok := e.addRefusedAt[symbol]
+
+	return ok && now().Sub(at) < scaleInRefusedBackoff
 }

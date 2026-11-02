@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
 	"github.com/Kellerman81/go_finance_bot/internal/risk"
@@ -255,5 +257,65 @@ func TestHeldForUsesTheEntryTime(t *testing.T) {
 
 	if got := e.heldFor("NOPE"); got != 0 {
 		t.Errorf("heldFor of an unknown symbol = %v, want 0 (which disables the ladder)", got)
+	}
+}
+
+// TestPartialLadderUsesTheSweepsConfigCopy is the regression for EX2-2.
+// checkExits takes one locked copy of the exits config for the whole sweep and
+// hands it to checkPartialExit, whose doc says it reads only that copy. It
+// then asked NextPartial for the due rung from e.exits instead — unlocked. A
+// settings save mid-sweep was a data race, and could pair one ladder's rung
+// index with another's tranche.
+//
+// The race window (between the openPos RUnlock and the bare read) is too
+// narrow for -race to hit reliably in a test, so this pins the property the
+// fix restores instead: the ladder that decides is the one passed in. The
+// live config here has no ladder at all; the unfixed code read it and sold
+// nothing.
+func TestPartialLadderUsesTheSweepsConfigCopy(t *testing.T) {
+	e := ledgerEngine(t) // holds 2 of X at 100, priced 120: +20%
+	e.brk = rejectingBroker{}
+	e.SetExitsConfig(config.ExitsConfig{Enabled: true}) // no ladder in the live field
+
+	sweep := config.ExitsConfig{
+		Enabled:           true,
+		PartialTakeProfit: []config.PartialExit{{ProfitPct: 0.05, SellPct: 0.5}},
+	}
+
+	e.checkPartialExit(context.Background(), sweep, "X", 100, 120, 2, e.pf.Snapshot())
+
+	if len(e.Trades()) != 1 {
+		t.Fatalf("the sweep's ladder had a due rung but %d sell attempts were made — "+
+			"the rung was read from somewhere other than the config the sweep passed", len(e.Trades()))
+	}
+}
+
+// TestScaleInAddDoesNotTriggerTheTightTrail is the live half of EX2-1, in the
+// README's two-stage trail. The position was bought at 100 and peaked at 104.5
+// (loose trail at 94.05). An equal add at 95 brings the average to 97.5; the
+// broker then reports that average, and against it the 104.5 peak read as
+// +7.2% — the tight stage — putting the trail at 102.41, above the price. The
+// very next checkExits sold the whole enlarged position at a loss.
+func TestScaleInAddDoesNotTriggerTheTightTrail(t *testing.T) {
+	e := ledgerEngine(t)
+	e.brk = rejectingBroker{} // any sell attempt is recorded
+	e.SetExitsConfig(config.ExitsConfig{
+		Enabled: true, TrailingStopPct: 0.10, TrailingOffsetPct: 0.05, TrailingTightPct: 0.02,
+	})
+
+	e.openPos["X"].Peak = 104.5
+	e.peaks["X"] = 104.5
+
+	e.recordOpen("X", 2, 95, "") // the scale-in add fills
+
+	e.pf.SyncPositions([]portfolio.Holding{{Symbol: "X", Qty: 4, AvgPrice: 97.5, LastPrice: 95}})
+	e.prices.Set("X", 95)
+
+	e.checkExits(context.Background())
+
+	for _, tr := range e.Trades() {
+		if tr.Side == broker.Sell {
+			t.Fatalf("checkExits tried to sell right after a scale-in add: %s", tr.Reason)
+		}
 	}
 }

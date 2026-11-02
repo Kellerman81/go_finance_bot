@@ -68,6 +68,8 @@ type PortfolioGuard struct {
 // symbol missing from it counts against config.UnclassifiedAssetClass, which is
 // capped only if the operator wrote that key — so an unnamed bucket stays
 // exempt, and a named one binds like any other class.
+//
+//nolint:cyclop // one "anything to enforce?" term per cap family
 func NewPortfolioGuard(
 	cfg config.PortfolioConfig,
 	sectors map[string]string,
@@ -83,12 +85,15 @@ func NewPortfolioGuard(
 	sectorCaps := cfg.MaxPerSector > 0 || cfg.MaxPositionsPerSector > 0
 	corrCaps := cfg.MaxCorrelatedPositions > 0 && cfg.CorrelationThreshold > 0
 	classCaps := len(caps) > 0
+	slots := cfg.NormalizedAssetClassSlots()
 
-	if !sectorCaps && !corrCaps && !classCaps {
+	// Slots alone are something to enforce too: config.Validate calls slots
+	// without a class budget a supported way to split the book, and without
+	// this the guard came back nil and min_positions_per_asset_class was
+	// silently ignored (RK2-3).
+	if !sectorCaps && !corrCaps && !classCaps && len(slots) == 0 {
 		return nil
 	}
-
-	slots := cfg.NormalizedAssetClassSlots()
 
 	var (
 		defined   int
@@ -114,7 +119,7 @@ func NewPortfolioGuard(
 	return &PortfolioGuard{
 		cfg:           cfg,
 		sectors:       NormalizeLabels(sectors),
-		classes:       NormalizeLabels(classes),
+		classes:       NormalizeClassLabels(classes),
 		caps:          caps,
 		slots:         slots,
 		definedSlots:  defined,
@@ -138,10 +143,25 @@ func NewPortfolioGuard(
 // on a class that was in fact capped. One exported function, called by both,
 // is what keeps the panel and the limit it displays telling the same story.
 func NormalizeLabels(in map[string]string) map[string]string {
+	return normalizeLabelsWith(
+		in,
+		func(l string) string { return strings.ToLower(strings.TrimSpace(l)) },
+	)
+}
+
+// NormalizeClassLabels is NormalizeLabels for an asset-class map: each label
+// in canonical class form (config.CanonicalAssetClass), so a hand-written
+// "ETFs" buckets with the classifier's "etf" rather than founding a class of
+// its own that no cap binds (SC3-5).
+func NormalizeClassLabels(in map[string]string) map[string]string {
+	return normalizeLabelsWith(in, config.CanonicalAssetClass)
+}
+
+func normalizeLabelsWith(in map[string]string, canon func(string) string) map[string]string {
 	out := make(map[string]string, len(in))
 
 	for sym, label := range in {
-		if l := strings.ToLower(strings.TrimSpace(label)); l != "" {
+		if l := canon(label); l != "" {
 			out[strings.ToUpper(strings.TrimSpace(sym))] = l
 		}
 	}
@@ -180,7 +200,7 @@ func (g *PortfolioGuard) AllowEntry(
 		return false, reason
 	}
 
-	if h, held := snap.Holding(symbol); held && h.Qty > 0 {
+	if h, held := snap.Holding(symbol); held && h.Held() {
 		return true, ""
 	}
 
@@ -419,7 +439,7 @@ func (g *PortfolioGuard) checkAssetClass(
 	var value float64
 
 	for sym, h := range snap.Holdings {
-		if h.Qty <= 0 {
+		if !h.Held() { // dust is not a position (RK3-2)
 			continue
 		}
 
@@ -469,7 +489,7 @@ func (g *PortfolioGuard) checkSector(
 	)
 
 	for sym, h := range snap.Holdings {
-		if h.Qty <= 0 {
+		if !h.Held() { // dust is not a position (RK3-2)
 			continue
 		}
 
@@ -549,7 +569,7 @@ func (g *PortfolioGuard) checkCorrelation(
 	)
 
 	for sym, h := range snap.Holdings {
-		if h.Qty <= 0 || strings.EqualFold(sym, symbol) {
+		if !h.Held() || strings.EqualFold(sym, symbol) { // dust is not a position (RK3-2)
 			continue
 		}
 

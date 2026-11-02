@@ -266,9 +266,89 @@ func TestBuildModifyBody(t *testing.T) {
 		Qty:     5,
 		Price:   160,
 	}
-	body := buildModifyBody("ACC", inst, m, 5)
+	body := buildModifyBody("ACC", inst, m, 5, "Limit", "")
 	if body["OrderId"] != "ord-1" || body["OrderPrice"] != 160.0 || body["Amount"].(float64) != 5 ||
 		body["BuySell"] != "Sell" || body["OrderType"] != "Limit" {
 		t.Fatalf("modify body wrong: %#v", body)
+	}
+}
+
+// TestBuildModifyBodyKeepsAStopLegAStop is the type half of BR2-2. The
+// modification only knows Market and Limit, and the body always sent one of
+// those: modifying a bracket's stop leg re-sent it as a sell LIMIT below the
+// market, which fills at once — the opposite of a stop.
+func TestBuildModifyBodyKeepsAStopLegAStop(t *testing.T) {
+	inst := instrument{Uic: 211, AssetType: "Stock"}
+	m := OrderModification{OrderID: "stop-1", Symbol: "AAPL", Side: Sell, Type: Limit, Qty: 5, Price: 140}
+
+	if body := buildModifyBody("ACC", inst, m, 5, "StopIfTraded", ""); body["OrderType"] != "StopIfTraded" {
+		t.Errorf("modifying a stop leg sent OrderType %v, want it kept as StopIfTraded", body["OrderType"])
+	}
+}
+
+// TestSaxoModifyOrderRefusesWhenFXFails is the currency half of BR2-2:
+// SubmitOrder and PlaceBracket convert a price to the instrument's currency or
+// refuse, but ModifyOrder sent it as-is — a €150 limit went out as 150 USD
+// while the engine's risk check treated the same number as euros.
+func TestSaxoModifyOrderRefusesWhenFXFails(t *testing.T) {
+	patched := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("PATCH /trade/v2/orders", func(w http.ResponseWriter, _ *http.Request) {
+		patched = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"OrderId": "1"})
+	})
+	mux.HandleFunc("GET /port/v1/orders/me", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"Data": []map[string]any{{"OrderId": "1", "OpenOrderType": "Limit"}}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	s := &Saxo{
+		baseURL: srv.URL, tokens: saxoTestToken("tok"), http: srv.Client(),
+		clientKey: "CK", accountKey: "ACC", preferCcy: "EUR",
+		fx:  newFXConverter(srv.Client()),
+		uic: map[string]instrument{"NVDA": {Uic: 1, AssetType: "Stock", Currency: "USD"}},
+	}
+	s.fx.baseURL = "http://127.0.0.1:1" // nothing listens here: fx fetch fails
+
+	_, err := s.ModifyOrder(context.Background(), OrderModification{
+		OrderID: "1", Symbol: "NVDA", Side: Buy, Type: Limit, Qty: 1, Price: 150,
+	})
+	if err == nil || patched {
+		t.Errorf("modify with no fx rate: err=%v, patched=%v — want it refused before sending", err, patched)
+	}
+}
+
+// TestSaxoPicksTheListingTheSuffixNames and TestSaxoReportsTheWatchlistSymbol
+// are the regression for BR2-4. "SAP.DE" never equalled a Saxo symbol like
+// "SAP:xetr", so the instrument lookup took the first hit — here the NYSE
+// ADR, priced in USD — and positions and orders came back as the bare "SAP",
+// so the engine's SAP.DE record never matched the holding: a separate "SAP"
+// was adopted and reconcile cleared SAP.DE's double-sell guard while its sell
+// was still working.
+func TestSaxoPicksTheListingTheSuffixNames(t *testing.T) {
+	hits := []saxoInstrumentHit{
+		{Symbol: "SAP:xnys", Identifier: 1},
+		{Symbol: "SAP:xetr", Identifier: 2},
+	}
+
+	if got := pickSaxoInstrument(hits, "SAP.DE"); got.Identifier != 2 {
+		t.Errorf("SAP.DE resolved to %s, want SAP:xetr", got.Symbol)
+	}
+
+	if got := pickSaxoInstrument(hits, "SAP"); got.Identifier != 1 {
+		t.Errorf("a bare SAP resolved to %s, want the first exact ticker match", got.Symbol)
+	}
+}
+
+func TestSaxoReportsTheWatchlistSymbol(t *testing.T) {
+	s := &Saxo{uic: map[string]instrument{"SAP.DE": {Uic: 2}}}
+
+	if got := s.symbolForUic(2, "SAP"); got != "SAP.DE" {
+		t.Errorf("a position in Uic 2 reported as %q, want the watchlist's SAP.DE", got)
+	}
+
+	if got := s.symbolForUic(9, "XYZ"); got != "XYZ" {
+		t.Errorf("an unresolved Uic reported as %q, want Saxo's own ticker as the fallback", got)
 	}
 }

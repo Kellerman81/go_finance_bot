@@ -201,8 +201,13 @@ func (*Mock) Candles(
 	return out, nil
 }
 
-// resolutionDuration maps a candle resolution to its bar interval; unknown
+// ResolutionDuration maps a candle resolution to its bar interval; unknown
 // resolutions fall back to one minute.
+func ResolutionDuration(res Resolution) time.Duration {
+	return resolutionDuration(res)
+}
+
+// resolutionDuration is ResolutionDuration.
 func resolutionDuration(res Resolution) time.Duration {
 	switch res {
 	case Res5Min:
@@ -217,6 +222,36 @@ func resolutionDuration(res Resolution) time.Duration {
 	}
 
 	return time.Minute
+}
+
+// FinestBarGap infers a candle series' native spacing as the SMALLEST positive
+// gap between consecutive bars.
+//
+// The smallest gap, not the average or the last one: real 1-minute data on an
+// illiquid instrument is full of multi-minute holes where nothing traded, so an
+// average would read as "hourly" and reject perfectly good data. One genuine
+// one-minute step anywhere in the series proves the feed is minute-resolution.
+// Conversely a series that never steps finer than an hour IS hourly data,
+// whatever was asked for. ok is false for a series too short to measure.
+func FinestBarGap(candles []Candle) (time.Duration, bool) {
+	if len(candles) < 2 {
+		return 0, false
+	}
+
+	smallest := time.Duration(0)
+
+	for i := 1; i < len(candles); i++ {
+		gap := candles[i].Time.Sub(candles[i-1].Time)
+		if gap <= 0 {
+			continue
+		}
+
+		if smallest == 0 || gap < smallest {
+			smallest = gap
+		}
+	}
+
+	return smallest, smallest > 0
 }
 
 // round2 rounds to two decimals.

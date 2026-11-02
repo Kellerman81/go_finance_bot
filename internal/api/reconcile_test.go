@@ -118,3 +118,27 @@ func TestDriftToleranceIsRelative(t *testing.T) {
 		}
 	}
 }
+
+// PF2-6: the snapshot is keyed normalised, an openPos record by whatever the
+// order carried. A raw lookup reported a lower-case record as BOTH "tracked
+// but not held" and "held but not tracked" for one position the two sides
+// agree on.
+func TestReconcileMatchesRecordsCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	rows := reconcile(snapOf(map[string]float64{"SAP.DE": 3}), trackedOf(map[string]float64{"sap.de": 3}))
+
+	if len(rows) != 0 {
+		t.Errorf("one agreed position was reported as drift: %+v", rows)
+	}
+}
+
+// PF3-4: a broker dust remainder was listed as "held, not tracked", offering
+// Adopt — which recorded a permanent dust position.
+func TestReconcileIgnoresDust(t *testing.T) {
+	t.Parallel()
+
+	if rows := reconcile(snapOf(map[string]float64{"X": 5e-7}), nil); len(rows) != 0 {
+		t.Errorf("a dust row was reported as drift: %+v", rows)
+	}
+}

@@ -81,6 +81,11 @@ func commentOutWatchlistBytes(src []byte, symbol, reason string) ([]byte, bool, 
 		return src, false, err
 	}
 
+	// Every active entry, not the first: a duplicate (- AAPL ... - aapl)
+	// left behind stayed active while the caller was told the drop had
+	// persisted, and the symbol came back at the next start (CF2-7).
+	changed := false
+
 	for i := start; i < len(lines); i++ {
 		item, ok := watchlistItem(lines[i])
 		if !ok {
@@ -97,11 +102,14 @@ func commentOutWatchlistBytes(src []byte, symbol, reason string) ([]byte, bool, 
 
 		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
 		lines[i] = fmt.Sprintf("%s# - %s   # %s", indent, item, reason)
-
-		return []byte(strings.Join(lines, nl)), true, nil
+		changed = true
 	}
 
-	return src, false, nil
+	if !changed {
+		return src, false, nil
+	}
+
+	return []byte(strings.Join(lines, nl)), true, nil
 }
 
 // watchlistBlockStart returns the index of the first line after a top-level
@@ -120,7 +128,12 @@ func watchlistBlockStart(lines []string) (int, error) {
 			continue
 		}
 
-		if strings.TrimSpace(rest) != "" {
+		// A comment on the key line ("watchlist:   # my picks") is still
+		// a block list. Read as inline style it made drop_after_losses
+		// unable to persist a drop, with an error blaming a style the file
+		// does not use (CF2-7).
+		rest = strings.TrimSpace(rest)
+		if rest != "" && !strings.HasPrefix(rest, "#") {
 			// watchlist: [A, B] — nothing per-symbol to comment.
 			return -1, ErrWatchlistFlowStyle
 		}

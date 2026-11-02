@@ -69,6 +69,23 @@ func (s *Sim) SetSlippage(f SlippageFunc) {
 	s.mu.Unlock()
 }
 
+// SetCommission installs the commission model charged on every simulated
+// fill. NewSim takes it as a method value, which captures a COPY of the
+// costs config, so without this a costs save reached sizing and headroom but
+// never the paper broker: a flat 5 commission raised in the UI was never
+// debited, and every paper round trip read better than the cost model the
+// engine books (AP3-8). nil means zero-cost fills.
+func (s *Sim) SetCommission(f func(notional float64) float64) {
+	if f == nil {
+		f = func(float64) float64 { return 0 }
+	}
+
+	s.mu.Lock()
+
+	s.costOf = f
+	s.mu.Unlock()
+}
+
 // fillPrice applies the configured slippage model to a reference price.
 func (s *Sim) fillPrice(symbol string, side Side, px float64) float64 {
 	if s.slipOf == nil {

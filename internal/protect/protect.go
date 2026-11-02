@@ -260,6 +260,8 @@ func (m *Manager) AllowEntry(symbol string) (bool, string) {
 // stop-loss exit also counts toward the stop guard. stoppedOut marks exits that
 // came from a protective stop rather than a strategy signal — repeated stop-outs
 // are the signal the guard is looking for.
+//
+//nolint:cyclop // one guard per protection a close feeds
 func (m *Manager) RecordClose(symbol string, pnl float64, stoppedOut bool) {
 	if m == nil {
 		return
@@ -280,7 +282,13 @@ func (m *Manager) RecordClose(symbol string, pnl float64, stoppedOut bool) {
 
 	m.checkLowProfit(symbol, pnl, now)
 
-	if !stoppedOut || m.cfg.StopGuardTrades <= 0 || m.cfg.StopGuardLookback <= 0 {
+	// A stop-out that LOST is the pattern this guard exists for — a symbol
+	// behaving unlike the backtest. A trailing stop exiting in profit is the
+	// trail doing its job: counting those locked a symbol for 4h after 4
+	// winning exits in a day, as a "stop-loss guard" (PR2-3). Both the live
+	// engine and the backtester report trailing-stop exits as stop-outs, so
+	// the P&L is checked here, once, for both.
+	if !stoppedOut || pnl >= 0 || m.cfg.StopGuardTrades <= 0 || m.cfg.StopGuardLookback <= 0 {
 		return
 	}
 

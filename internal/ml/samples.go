@@ -36,10 +36,28 @@ func BuildSamples(
 		return nil
 	}
 
+	return buildSamples(candles, 0, p, horizon, threshold)
+}
+
+// buildSamples is BuildSamples emitting rows from index from on (and never
+// before the feature warmup), with every row's features still computed over
+// all of candles[0..i] — so a caller can hand in history before the rows it
+// wants labelled and have the features read it (see Predictor.train).
+func buildSamples(
+	candles []market.Candle,
+	from int,
+	p ai.Params,
+	horizon int,
+	threshold float64,
+) []Sample {
+	if horizon < 1 || len(candles) <= horizon+1 {
+		return nil
+	}
+
 	p = p.WithDefaults()
 
 	// Features need enough history to be defined; labels need enough future.
-	first := p.WarmupBars()
+	first := max(p.WarmupBars(), from)
 	last := len(candles) - horizon - 1
 
 	if first > last {

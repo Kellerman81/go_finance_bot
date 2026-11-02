@@ -252,3 +252,26 @@ func TestCompleteRespectsContext(t *testing.T) {
 		t.Fatal("want error when the context expires")
 	}
 }
+
+// TestNewCompleterPicksTheProvider guards provider selection: the provider
+// name (any case, blank meaning Ollama) picks the wire protocol, Name
+// reports it for the diagnostics view, and an unknown provider or a blank
+// base_url is refused at configuration rather than failing on every call.
+func TestNewCompleterPicksTheProvider(t *testing.T) {
+	t.Parallel()
+
+	for provider, want := range map[string]string{"": "ollama", "Ollama": "ollama", " OpenAI ": "openai"} {
+		cl, err := newCompleter(provider, "http://127.0.0.1:1/", "m", "", 0, nil)
+		if err != nil || cl.Name() != want {
+			t.Errorf("newCompleter(%q) = %v, %v; want %s", provider, cl, err, want)
+		}
+	}
+
+	if _, err := newCompleter("anthropic", "http://x", "m", "", 0, nil); err == nil {
+		t.Error("an unknown provider was accepted")
+	}
+
+	if _, err := newCompleter("ollama", "  ", "m", "", 0, nil); err == nil {
+		t.Error("a blank base_url was accepted")
+	}
+}

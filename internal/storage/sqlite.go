@@ -12,6 +12,7 @@ import (
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/engine"
+	"github.com/Kellerman81/go_finance_bot/internal/errlog"
 	"github.com/Kellerman81/go_finance_bot/internal/protect"
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
 )
@@ -28,6 +29,15 @@ import (
 // Reading is unaffected: time.Parse(time.RFC3339Nano, ...) accepts either
 // width. See CODE_REVIEW_FINDINGS.md's "TradeStats compares RFC3339Nano
 // timestamps as strings".
+//
+// And always written in UTC. The fixed width only orders strings in the SAME
+// offset: a close at 10:00Z stored as "12:00+02:00" sorted after an 11:00Z
+// cutoff, so it was counted, and a UTC row against a cutoff written as
+// "11:00+02:00" was dropped — local-time trade stamps and cutoffs (AddDate,
+// candle times, LastAutotuneApply) were never normalised, and every DST switch
+// changed the offset of the rows themselves. Autotune's real-track-record
+// baselines gained or lost closes within an hour or two of the cutoff (SG2-1).
+// Rows from before this are rewritten to UTC once, at open.
 const tsLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // dbTimeout bounds every database call. SetMaxOpenConns(1) serializes all
@@ -99,7 +109,9 @@ CREATE TABLE IF NOT EXISTS open_positions (
 	orig_qty         REAL,
 	partials_taken   INTEGER,
 	adds             INTEGER,
-	entry_commission REAL
+	entry_commission REAL,
+	trail_floor      REAL,
+	trail_floor_key  TEXT
 );
 `
 
@@ -120,6 +132,8 @@ var legacyColumns = []struct{ table, column, decl string }{
 	{"open_positions", "partials_taken", "INTEGER"},
 	{"open_positions", "adds", "INTEGER"},
 	{"open_positions", "entry_commission", "REAL"},
+	{"open_positions", "trail_floor", "REAL"},
+	{"open_positions", "trail_floor_key", "TEXT"},
 }
 
 // ensureColumn adds column to table with the given SQL type/decl if it does
@@ -195,7 +209,79 @@ func OpenSQLite(path string) (*SQLite, error) {
 		}
 	}
 
+	if err := normaliseTradeTimes(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate trade timestamps to UTC: %w", err)
+	}
+
 	return &SQLite{db: db}, nil
+}
+
+// normaliseTradeTimes rewrites every trades.ts not already in UTC to UTC, so
+// the string comparison TradeStats relies on is chronological for old rows
+// too (see tsLayout). A no-op once done: only rows not ending in "Z" are read.
+//
+// One transaction, with its own generous deadline rather than the 10 s
+// dbCtx: on an install whose clock was never UTC every existing row is
+// rewritten, and one autocommit UPDATE per row (an fsync each, on a network
+// volume) could overrun 10 s and fail Open — the bot would not start.
+//
+//nolint:cyclop // scan, then rewrite in one transaction
+func normaliseTradeTimes(db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `SELECT id, ts FROM trades WHERE ts NOT LIKE '%Z'`)
+	if err != nil {
+		return err
+	}
+
+	type fix struct {
+		id int64
+		ts string
+	}
+
+	var fixes []fix
+
+	for rows.Next() {
+		var (
+			id int64
+			ts string
+		)
+
+		if err := rows.Scan(&id, &ts); err != nil {
+			_ = rows.Close()
+
+			return err
+		}
+
+		if t, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
+			fixes = append(fixes, fix{id, t.UTC().Format(tsLayout)})
+		}
+	}
+
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	if err := rows.Err(); err != nil || len(fixes) == 0 {
+		return err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, f := range fixes {
+		if _, err := tx.ExecContext(ctx, `UPDATE trades SET ts = ? WHERE id = ?`, f.ts, f.id); err != nil {
+			_ = tx.Rollback()
+
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 // Close closes the database handle.
@@ -228,18 +314,26 @@ func (s *SQLite) SaveTrade(t engine.TradeRecord) error {
 		`INSERT INTO trades (ts, symbol, side, qty, price, value, status, reason, order_id, err,
 		                      pnl, pnl_pct, win, indicators, entry_indicators, strategy_config, simulated)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.Time.Format(tsLayout), t.Symbol, string(t.Side), t.Qty, t.Price,
+		t.Time.UTC().Format(tsLayout), t.Symbol, string(t.Side), t.Qty, t.Price,
 		t.Value, t.Status, t.Reason, t.OrderID, t.Err,
 		nullFloat(t.PnL), nullFloat(t.PnLPct), nullBool(t.Win), t.Indicators, t.EntryIndicators,
 		t.StrategyConfig, t.Simulated,
 	)
-	if err == nil && s.saveCount.Add(1)%pruneEvery == 0 {
+	if err != nil {
+		return err
+	}
+
+	// A prune failure is not a failed save: the row above is written. It was
+	// returned as SaveTrade's error, so the engine logged and errlogged
+	// "persist trade failed" for a trade that was persisted (SG2-4). Reported
+	// on its own, as what it is.
+	if s.saveCount.Add(1)%pruneEvery == 0 {
 		if perr := s.pruneTrades(); perr != nil {
-			return fmt.Errorf("prune trades: %w", perr)
+			errlog.Recordf("storage", "prune old trade rows failed (the trade itself was saved): %v", perr)
 		}
 	}
 
-	return err
+	return nil
 }
 
 // pruneTrades caps the unrealized decision noise at maxNoiseTrades rows,
@@ -265,8 +359,13 @@ func (s *SQLite) RecentTrades(limit int) ([]engine.TradeRecord, error) {
 	ctx, cancel := dbCtx()
 	defer cancel()
 
+	// reason/order_id/err are nullable columns scanned into strings: one NULL —
+	// a row from an older binary, a manual fix, an outside tool — failed the
+	// whole query, so Restore lost all trade history and /api/stats and
+	// autotune's real baseline broke for any window holding the row (SG3-3).
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ts, symbol, side, qty, price, value, status, reason, order_id, err,
+		`SELECT ts, symbol, side, qty, price, value, status,
+		        COALESCE(reason, ''), COALESCE(order_id, ''), COALESCE(err, ''),
 		        pnl, pnl_pct, win, indicators, entry_indicators, strategy_config, simulated
 		 FROM trades ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
@@ -584,14 +683,15 @@ func (s *SQLite) SaveOpenPosition(p engine.OpenPosition) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO open_positions (
 		   symbol, qty, entry_price, entry_time, peak, entry_indicators,
-		   orig_qty, partials_taken, adds, entry_commission)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   orig_qty, partials_taken, adds, entry_commission, trail_floor, trail_floor_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(symbol) DO UPDATE SET
 		   qty=excluded.qty, entry_price=excluded.entry_price,
 		   entry_time=excluded.entry_time, peak=excluded.peak,
 		   entry_indicators=excluded.entry_indicators,
 		   orig_qty=excluded.orig_qty, partials_taken=excluded.partials_taken,
-		   adds=excluded.adds, entry_commission=excluded.entry_commission`,
+		   adds=excluded.adds, entry_commission=excluded.entry_commission,
+		   trail_floor=excluded.trail_floor, trail_floor_key=excluded.trail_floor_key`,
 		p.Symbol,
 		p.Qty,
 		p.EntryPrice,
@@ -602,6 +702,8 @@ func (s *SQLite) SaveOpenPosition(p engine.OpenPosition) error {
 		p.PartialsTaken,
 		p.Adds,
 		p.EntryCommission,
+		p.TrailFloor,
+		p.TrailFloorKey,
 	)
 
 	return err
@@ -628,7 +730,8 @@ func (s *SQLite) LoadOpenPositions() ([]engine.OpenPosition, error) {
 
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT symbol, qty, entry_price, entry_time, peak, entry_indicators,
-		        orig_qty, partials_taken, adds, entry_commission
+		        orig_qty, partials_taken, adds, entry_commission, trail_floor,
+		        COALESCE(trail_floor_key, '')
 		 FROM open_positions`,
 	)
 	if err != nil {
@@ -646,6 +749,7 @@ func (s *SQLite) LoadOpenPositions() ([]engine.OpenPosition, error) {
 			origQty         sql.NullFloat64
 			partials, adds  sql.NullInt64
 			entryCommission sql.NullFloat64
+			trailFloor      sql.NullFloat64
 		)
 
 		if err := rows.Scan(
@@ -659,6 +763,8 @@ func (s *SQLite) LoadOpenPositions() ([]engine.OpenPosition, error) {
 			&partials,
 			&adds,
 			&entryCommission,
+			&trailFloor,
+			&p.TrailFloorKey,
 		); err != nil {
 			return nil, err
 		}
@@ -679,6 +785,9 @@ func (s *SQLite) LoadOpenPositions() ([]engine.OpenPosition, error) {
 		// simply books its close gross, exactly as it did before, rather than
 		// inventing a commission nobody recorded.
 		p.EntryCommission = entryCommission.Float64
+		// NULL for a row from before the column, or a position never added
+		// to: no floor, the trail as it always was.
+		p.TrailFloor = trailFloor.Float64
 		out = append(out, p)
 	}
 
@@ -693,7 +802,7 @@ func (s *SQLite) TradeStats(since time.Time) (engine.TradeStats, error) {
 	ctx, cancel := dbCtx()
 	defer cancel()
 
-	sinceStr := since.Format(tsLayout)
+	sinceStr := since.UTC().Format(tsLayout)
 
 	var (
 		stats           engine.TradeStats
@@ -783,7 +892,7 @@ func (s *SQLite) TradeStats(since time.Time) (engine.TradeStats, error) {
 // re-duplicate every time the reason-string convention changes).
 func (s *SQLite) exitBreakdownBySymbol(ctx context.Context, sinceStr string) (map[string]map[string]int, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT symbol, reason FROM trades WHERE win IS NOT NULL AND ts >= ?`, sinceStr)
+		`SELECT symbol, COALESCE(reason, '') FROM trades WHERE win IS NOT NULL AND ts >= ?`, sinceStr)
 	if err != nil {
 		return nil, err
 	}

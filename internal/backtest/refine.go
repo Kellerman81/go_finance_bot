@@ -105,7 +105,7 @@ func (r *refiner) try(axis, label string, mutate func(*Trial)) {
 	mutate(&cand)
 
 	res := runTrialConfig(r.base, r.data, cand, r.cash, r.respectLimits)
-	if res.NumTrades < r.minTrades {
+	if res.ClosedTrades < r.minTrades {
 		return
 	}
 

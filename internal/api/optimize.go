@@ -252,6 +252,15 @@ func (s *Server) fragOptimizeField(c *gin.Context) {
 		return
 	}
 
+	// A symbol with its own strategy_overrides entry is swept on THAT
+	// strategy, and the shared strategy form is no place to apply a result
+	// for it: Apply would change every other symbol and not this one (AP3-4).
+	if pf, ok := findPickerField(fields, fieldName); ok && pf.ApplyPrefix == "strategy" &&
+		contains(s.eng.OverriddenSymbols(), symbol) {
+		data["ApplyPrefix"] = ""
+		data["Overridden"] = true
+	}
+
 	baseline, sweep := s.runFieldSweep(symbol, axis, candles)
 	if sweep == nil {
 		data["Error"] = t("opt.unknownField")
@@ -281,18 +290,7 @@ func (s *Server) fragOptimizeField(c *gin.Context) {
 func (s *Server) runFieldSweep(
 	symbol, axis string, candles []market.Candle,
 ) (backtest.Result, *backtest.AxisSweep) {
-	port, sectors, assetClasses := s.eng.PortfolioConfig()
-
-	cfg := config.Config{
-		Strategy:     s.eng.StrategyConfig(),
-		Exits:        s.eng.ExitsConfig(),
-		Costs:        s.eng.CostsConfig(),
-		Engine:       s.eng.EngineConfig(),
-		Limits:       s.rm.Limits(),
-		Portfolio:    port,
-		Sectors:      sectors,
-		AssetClasses: assetClasses,
-	}
+	cfg := s.sweepConfig(symbol)
 
 	cash := s.pf.Snapshot().Equity
 	if cash <= 0 {
@@ -312,6 +310,25 @@ func (s *Server) runFieldSweep(
 	data := map[string][]market.Candle{symbol: candles}
 
 	return backtest.SensitivityAxis(cfg, data, cash, baseFrac, false, axis)
+}
+
+// sweepConfig is the live configuration a sweep for symbol starts from — with
+// the strategy the symbol actually trades: its override, if it has one. The
+// shared strategy measured a config an overridden symbol does not run, and
+// presented it as that symbol's result (AP3-4).
+func (s *Server) sweepConfig(symbol string) config.Config {
+	port, sectors, assetClasses := s.eng.PortfolioConfig()
+
+	return config.Config{
+		Strategy:     s.eng.StrategyConfigFor(symbol),
+		Exits:        s.eng.ExitsConfig(),
+		Costs:        s.eng.CostsConfig(),
+		Engine:       s.eng.EngineConfig(),
+		Limits:       s.rm.Limits(),
+		Portfolio:    port,
+		Sectors:      sectors,
+		AssetClasses: assetClasses,
+	}
 }
 
 // scoredRows ranks a sweep's rows by the same blended score the optimizer

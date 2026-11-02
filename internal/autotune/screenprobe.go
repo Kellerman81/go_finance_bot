@@ -3,10 +3,12 @@ package autotune
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/backtest"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/engine"
+	"github.com/Kellerman81/go_finance_bot/internal/errlog"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
 	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
 	"github.com/Kellerman81/go_finance_bot/internal/risk"
@@ -36,8 +38,10 @@ import (
 //
 // With both set, the autotune score wins where the search found something
 // better, because the two are not comparable and the achievable figure is the
-// more informative one to rank a candidate universe by. The Probe's Source
-// field always says which produced the number.
+// more informative one to rank a candidate universe by; a candidate whose
+// search could not run keeps its backtest score and ranks below every
+// searched one (see screener.rankTierOf). The Probe's Source field always
+// says which produced the number.
 type ScreenProbe struct {
 	eng *engine.Engine
 	rm  *risk.Manager
@@ -73,6 +77,11 @@ func (p *ScreenProbe) Probe(
 		return screener.Probe{}, false
 	}
 
+	candles, ok := p.atBarInterval(candles)
+	if !ok {
+		return screener.Probe{}, false
+	}
+
 	if bars := cfg.Bars; bars > 0 && len(candles) > bars {
 		candles = candles[len(candles)-bars:]
 	}
@@ -92,12 +101,45 @@ func (p *ScreenProbe) Probe(
 	// the best configuration found rather than today's, so where it differs it
 	// is strictly the more informative number to rank a universe by.
 	if cfg.Autotune && ctx.Err() == nil {
-		if r, ok := p.runSearch(symbol, candles); ok {
+		if r, ok := p.runSearch(ctx, symbol, candles); ok {
 			out, scored = r, true
 		}
 	}
 
 	return out, scored
+}
+
+// atBarInterval returns candles on the engine's bar_interval, the bars the
+// live strategy trades on. The screener fetches at its class profile's
+// resolution — daily over a year for an ETF profile — and the probe replayed
+// a strategy tuned on 1-minute bars over those: every period, confirm streak
+// and ATR multiple then spans days, and adoption was decided on a number
+// with no relation to how the bot would trade the symbol (SC3-4). Finer bars
+// are aggregated up; coarser ones cannot be, and the probe declines, saying
+// so once per resolution.
+func (p *ScreenProbe) atBarInterval(candles []market.Candle) ([]market.Candle, bool) {
+	interval := p.eng.EngineConfig().BarInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+
+	gap, ok := market.FinestBarGap(candles)
+	if !ok {
+		return candles, true
+	}
+
+	switch {
+	case gap > interval*3/2:
+		errlog.RecordOncef("screener", "probe skipped: the screener's %s bars are coarser than "+
+			"engine.bar_interval %s, so a backtest on them would not measure the live strategy — "+
+			"set the profile's resolution to the bar interval to probe", gap.Round(time.Minute), interval)
+
+		return nil, false
+	case gap < interval:
+		return market.ResampleStep(candles, interval), true
+	default:
+		return candles, true
+	}
 }
 
 // runLiveStrategy backtests the engine's current configuration over the
@@ -109,6 +151,16 @@ func (p *ScreenProbe) Probe(
 // because the account is full is not a bad symbol.
 func (p *ScreenProbe) runLiveStrategy(symbol string, candles []market.Candle) (screener.Probe, bool) {
 	cfg := p.probeConfig(symbol)
+
+	// The guard RunSymbolOptimize applies (AT-14), which this path skipped
+	// (AT2-3): an "ai" detector in a replay reads the LIVE per-symbol verdict
+	// cache — today's opinion on every historical bar, a lookahead — and its
+	// refresh, fed historical features, overwrites the verdict the live loop
+	// reads for a symbol it may be trading. Unscored, the candidate simply
+	// keeps its cheap-filter ranking.
+	if len(unsearchableDetectors(cfg.Strategy)) > 0 {
+		return screener.Probe{}, false
+	}
 
 	cash, frac := probeCapital(p.pf)
 
@@ -124,7 +176,7 @@ func (p *ScreenProbe) runLiveStrategy(symbol string, candles []market.Candle) (s
 // Improved answers "should this replace the symbol's live config", which is a
 // question about a symbol already being traded. For a candidate that is not in
 // the book at all, the question is simply "what is achievable here".
-func (p *ScreenProbe) runSearch(symbol string, candles []market.Candle) (screener.Probe, bool) {
+func (p *ScreenProbe) runSearch(ctx context.Context, symbol string, candles []market.Candle) (screener.Probe, bool) {
 	if !TryAcquire() {
 		// The shared run slot is busy with a real optimisation pass. A probe
 		// is the least important user of it: skip rather than queue, and fall
@@ -135,13 +187,24 @@ func (p *ScreenProbe) runSearch(symbol string, candles []market.Candle) (screene
 	}
 	defer Release()
 
+	// The screening pass's context: a shutdown stops the search instead of
+	// holding the process for minutes (AT3-1).
+	// The screener trusts a probe only over probe.min_trades closed trades.
+	// The search gated on its own 3, and its Best can be the baseline trial,
+	// gated on none: a 4-trade winner replaced a 7-trade backtest leg and was
+	// then ignored as too thin, so the measured candidate lost its ranking
+	// altogether — and a winner with fills but no closed trade counted as
+	// scored (AT3-4). The search ranks on the screener's floor, and a winner
+	// below it leaves the backtest leg standing.
+	minTrades := max(DefaultMinTrades, screener.ProbeMinTrades(p.eng.ScreenerConfig().Probe))
+
 	result := RunSymbolOptimize(
-		p.eng, p.rm, p.pf, symbol, candles,
-		DefaultMinTrades, DefaultObjective, DefaultMinReturnPct,
+		ctx, p.eng, p.rm, p.pf, symbol, candles,
+		minTrades, DefaultObjective, DefaultMinReturnPct,
 	)
 
 	best := result.Best
-	if best.Result.NumTrades == 0 {
+	if best.Result.ClosedTrades < minTrades {
 		return screener.Probe{}, false
 	}
 
@@ -164,11 +227,17 @@ func (p *ScreenProbe) probeConfig(symbol string) config.Config {
 // probeFrom converts a backtest result into the screener's own probe shape.
 func probeFrom(source string, r backtest.Result, score float64) screener.Probe {
 	return screener.Probe{
-		Source:        source,
-		Trades:        r.NumTrades,
-		ReturnPct:     r.TotalReturnPct,
-		WinRatePct:    r.WinRatePct,
-		ExpectancyPct: r.ExpectancyPct,
+		Source:     source,
+		Trades:     r.ClosedTrades, // closed trades, what probe.min_trades means (BT2-3)
+		ReturnPct:  r.TotalReturnPct,
+		WinRatePct: r.WinRatePct,
+		// backtest.Result.ExpectancyPct is a PERCENT (PnLPct = net/basis*100);
+		// the screener, its min_expectancy_pct threshold and the verdict table
+		// all read Probe.ExpectancyPct as a FRACTION. Passed through raw, a
+		// 0.001 threshold (documented as 0.1%) meant 0.001%, "below -1 never
+		// rejects" meant -1%/trade, and the UI showed 0.8%/trade as 80%
+		// (SC2-2/AT2-2). Converted here, at the one boundary.
+		ExpectancyPct: r.ExpectancyPct / 100,
 		Score:         score,
 	}
 }

@@ -129,6 +129,8 @@ const alpacaNotionalScale = 1e4
 // are expected in preferCcy (as everything else this adapter reports) and
 // converted to the account's own currency for the API call; the returned
 // FilledPx is converted back.
+//
+//nolint:cyclop // one guarded step per order type, FX case and fill outcome
 func (a *Alpaca) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) {
 	rate := 1.0
 	needsConversion := false
@@ -192,7 +194,7 @@ func (a *Alpaca) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) 
 	}
 
 	if o.Type == Limit {
-		reqBody["limit_price"] = strconv.FormatFloat(o.LimitPx*rate, 'f', 2, 64)
+		reqBody["limit_price"] = alpacaLimitPrice(o.LimitPx*rate, o.Side)
 	}
 
 	var raw alpacaOrder
@@ -210,7 +212,14 @@ func (a *Alpaca) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) 
 		res = a.confirmFill(ctx, res)
 	}
 
-	if res.FilledPx > 0 && rate != 0 {
+	// A market order is still sent when the rate could not be fetched (rate
+	// stays 1), so its fill price is in the account currency, not the
+	// preferred one — booking it as-is mislabels it (BR2-3). Report no price;
+	// the engine falls back to its own converted reference price.
+	switch {
+	case needsConversion:
+		res.FilledPx = 0
+	case res.FilledPx > 0 && rate != 0:
 		res.FilledPx /= rate
 	}
 
@@ -224,21 +233,45 @@ const (
 	alpacaPollInterval = time.Second
 )
 
-// alpacaWorkingStatus reports whether an order status means "still heading for
-// a fill" (keep polling). Anything unrecognised is treated as terminal.
-func alpacaWorkingStatus(s string) bool {
-	switch strings.ToLower(s) {
-	case "",
-		"new",
-		"accepted",
-		"pending_new",
-		"accepted_for_bidding",
-		"partially_filled",
-		"calculated":
-		return true
+// alpacaLimitPrice formats a limit price at the precision Alpaca accepts — 4
+// decimals below $1, 2 at or above — rounding toward the CONSERVATIVE side: a
+// buy down (never pay more than asked), a sell up (never accept less). A flat
+// 2 dp sent a 0.4567 buy limit as 0.46, up to ~0.7% over the intended price,
+// and a sub-$1 sell limit could round past the market and never fill (BR2-7).
+func alpacaLimitPrice(px float64, side Side) string {
+	dp := 2
+	if px < 1 {
+		dp = 4
 	}
 
-	return false
+	p := math.Pow(10, float64(dp))
+
+	// Representation-safe, like roundDownQty: 12.34 must stay 12.34 either way.
+	scaled := floorUnits(px * p)
+	if side == Sell {
+		scaled = ceilUnits(px * p)
+	}
+
+	return strconv.FormatFloat(scaled/p, 'f', dp, 64)
+}
+
+// alpacaWorkingStatus reports whether an order status means "still heading for
+// a fill" (keep polling). Only Alpaca's FINAL statuses stop the poll.
+//
+// The list used to be the other way round — named working states, anything
+// else terminal — so pending_cancel, pending_replace, held, stopped and
+// suspended read as a confirmed fill of whatever filled_qty was last seen,
+// usually 0. A "stopped" market order (a fill guaranteed but not yet printed)
+// was booked as nothing and its shares arrived later as an untracked holding
+// (BR2-6). A status this list does not know now keeps polling and, at the
+// deadline, stays unconfirmed — unknown is not zero.
+func alpacaWorkingStatus(s string) bool {
+	switch strings.ToLower(s) {
+	case "filled", "canceled", "expired", "rejected", "replaced", "done_for_day":
+		return false
+	}
+
+	return true
 }
 
 // confirmFill polls GET /v2/orders/{id} until the order reaches a terminal
@@ -303,7 +336,7 @@ func (a *Alpaca) GetAccount(ctx context.Context) (Account, error) {
 
 	if a.preferCcy != "" && ccy != "" && ccy != a.preferCcy {
 		if rate, err := a.fx.Rate(ctx, ccy, a.preferCcy); err != nil {
-			errlog.Recordf("alpaca", "fx rate %s->%s: %s (using 1:1, balances will be wrong)", ccy, a.preferCcy, err)
+			recordFXFailure("alpaca", err, "balances shown at 1:1 and will be wrong until the rate resolves")
 		} else {
 			cash, equity, bp = cash*rate, equity*rate, bp*rate
 			ccy = a.preferCcy
@@ -359,7 +392,7 @@ func (a *Alpaca) currencyAndRate(ctx context.Context) (ccy string, rate float64,
 
 	r, err := a.fx.Rate(ctx, ccy, a.preferCcy)
 	if err != nil {
-		errlog.Recordf("alpaca", "fx rate %s->%s: %s (using 1:1)", ccy, a.preferCcy, err)
+		recordFXFailure("alpaca", err, "rate unresolved: orders that need it are refused, positions stay in their native currency")
 		return ccy, 1, false
 	}
 

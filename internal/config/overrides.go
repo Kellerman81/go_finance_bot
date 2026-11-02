@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -106,6 +107,22 @@ func resolveSymbolStrategies(data []byte, base StrategyConfig) (map[string]Strat
 	return out, nil
 }
 
+// ResolveOverridesFile re-resolves path's strategy_overrides block onto
+// base — what a restart would build for every overridden symbol if base were
+// the file's strategy. A shared-strategy save changes the base every
+// override inherits from, and the engine's overrides are resolved
+// snapshots: without this, an overridden symbol kept the OLD base live and
+// switched to the new one at the next restart, so the config autotune
+// backtested was not the one the file reproduced (AT3-2, CF3-3).
+func ResolveOverridesFile(path string, base StrategyConfig) (map[string]StrategyConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	return resolveSymbolStrategies(data, base)
+}
+
 // layerOntoBase marshals fields (any value whose yaml tags name
 // StrategyConfig fields — a map[string]any fragment from a parsed file, or
 // a SymbolOverrideFields struct) and unmarshals the result over a COPY of
@@ -144,14 +161,39 @@ func ApplyStrategyOverride(base StrategyConfig, fields SymbolOverrideFields) (St
 // one is reported at load time naming the symbol rather than producing a
 // silently broken strategy for that symbol alone.
 func validateStrategy(sc StrategyConfig, symbol string) error {
+	return ValidateStrategyRules(sc, "strategy_overrides["+symbol+"]")
+}
+
+// ValidateStrategyRules checks the invariants every strategy — the base one and each
+// override — must hold. The base strategy was checked for fast_ma < slow_ma
+// only, so `min_strength: 25` (a percent written where a fraction is read)
+// loaded cleanly and the bot never bought, while the same value in an override
+// was refused (CF3-4).
+func ValidateStrategyRules(sc StrategyConfig, scope string) error {
 	if sc.FastMA >= sc.SlowMA {
-		return fmt.Errorf("strategy_overrides[%s]: fast_ma (%d) must be < slow_ma (%d)",
-			symbol, sc.FastMA, sc.SlowMA)
+		return fmt.Errorf("%s: fast_ma (%d) must be < slow_ma (%d)", scope, sc.FastMA, sc.SlowMA)
 	}
 
 	if sc.MinStrength < 0 || sc.MinStrength > 1 {
-		return fmt.Errorf("strategy_overrides[%s]: min_strength %.2f must be in 0..1",
-			symbol, sc.MinStrength)
+		return fmt.Errorf("%s: min_strength %.2f must be in 0..1", scope, sc.MinStrength)
+	}
+
+	// Negative means "inherit min_strength".
+	if sc.MinStrengthSell > 1 {
+		return fmt.Errorf("%s: min_strength_sell %.2f must be at most 1 (negative inherits min_strength)",
+			scope, sc.MinStrengthSell)
+	}
+
+	// An ai or ml detector has no symbol on the higher timeframe, so it
+	// abstains: in htf_detectors it voted HOLD on every bar with nothing
+	// saying so (ST3-5). Only checked while the higher timeframe is on.
+	if sc.HTFMultiple > 1 {
+		for _, d := range sc.HTFDetectors {
+			if n := strings.ToLower(strings.TrimSpace(d)); n == "ai" || n == "ml" {
+				return fmt.Errorf("%s: htf_detectors cannot include %q — it has no symbol on the higher "+
+					"timeframe and would always vote HOLD", scope, n)
+			}
+		}
 	}
 
 	return nil

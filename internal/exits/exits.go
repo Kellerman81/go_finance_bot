@@ -91,6 +91,78 @@ func Compute(cfg config.ExitsConfig, entry, peak, atr float64, held time.Duratio
 	return lv
 }
 
+// WithTrailFloor raises the trailing stop to floor when floor is above it. See
+// RebaseOnAdd for where a floor comes from; 0 leaves the levels unchanged.
+//
+// The floor is part of the trailing stop, so it lapses with it: an operator
+// who sets every trailing distance to 0 has switched the trail off, and a
+// floor left over from an earlier add must not keep firing for exactly the
+// positions that had one.
+func (lv Levels) WithTrailFloor(cfg config.ExitsConfig, floor float64) Levels {
+	if !TrailConfigured(cfg) {
+		return lv
+	}
+
+	if floor > lv.Trail {
+		lv.Trail = floor
+	}
+
+	return lv
+}
+
+// TrailKey fingerprints the settings a trail level depends on, so a floor can
+// tell whether it was computed under the settings now in force.
+func TrailKey(cfg config.ExitsConfig) string {
+	return fmt.Sprintf("%g/%g/%g/%t/%g", cfg.TrailingStopPct, cfg.TrailingTightPct,
+		cfg.TrailingOffsetPct, cfg.TrailingOnlyAfterOffset, cfg.ATRTrailMult)
+}
+
+// FloorFor is floor while the trailing settings are the ones it was set under
+// (key, from TrailKey), and 0 once they have changed. The floor is the
+// pre-add trail at the settings OF THE ADD; kept after a change it froze them
+// for exactly the positions that were ever scaled into — a trail widened from
+// 3% to 10% applied to every position but those (EX3-5). An empty key (a
+// floor recorded before keys existed) keeps the floor.
+func FloorFor(cfg config.ExitsConfig, floor float64, key string) float64 {
+	if key != "" && key != TrailKey(cfg) {
+		return 0
+	}
+
+	return floor
+}
+
+// TrailConfigured reports whether any trailing-stop distance is set.
+func TrailConfigured(cfg config.ExitsConfig) bool {
+	return cfg.TrailingStopPct > 0 || cfg.TrailingTightPct > 0 || cfg.ATRTrailMult > 0
+}
+
+// RebaseOnAdd returns the peak and trailing-stop floor a position carries
+// after it is added to — a scale-in on the way down or a pyramid on the way up
+// — so the live engine and the backtester treat an add identically.
+//
+// The trail judges its stage from peak/entry, and an add moves the entry (the
+// average cost) under a peak that was reached against the old one. Left alone
+// that misreads the position (EX2-1): averaging down from 100 to 97.5 under a
+// 104.5 peak turned a 4.5% gain into a 7.2% one, armed the tight stage, and put
+// the trail at 102.41 — above the 95 price, so the whole enlarged position was
+// sold at a loss on the very next check. Averaging UP did the opposite and
+// loosened a tight trail from 107.80 to 99, or removed it outright under
+// trailing_only_after_offset: a trailing stop that moves down.
+//
+// So an add re-bases the peak to where the new position actually stands —
+// the higher of the new average and the add price — and keeps the trail level
+// in force just before the add as a floor. The trail then ratchets up from the
+// new basis and never sits below where it already was. floor is the
+// position's existing floor (0 if none).
+func RebaseOnAdd(
+	cfg config.ExitsConfig,
+	oldEntry, peak, floor, atr, newEntry, addPrice float64,
+) (newPeak, newFloor float64) {
+	before := Compute(cfg, oldEntry, peak, atr, 0).WithTrailFloor(cfg, floor).Trail
+
+	return max(newEntry, addPrice), max(floor, before)
+}
+
 // stopLevel returns the stop-loss price: the wider of the percentage and ATR
 // stops, so the percentage acts as a floor.
 func stopLevel(cfg config.ExitsConfig, entry, atr float64) float64 {
@@ -100,13 +172,24 @@ func stopLevel(cfg config.ExitsConfig, entry, atr float64) float64 {
 		stop = entry * (1 - cfg.StopLossPct)
 	}
 
-	if cfg.ATRStopMult > 0 && atr > 0 {
-		if s := entry - cfg.ATRStopMult*atr; s > 0 && (stop == 0 || s < stop) {
-			stop = s
-		}
-	}
+	return widerATRLevel(stop, entry, cfg.ATRStopMult, atr)
+}
 
-	return stop
+// minLevelFrac is where an ATR-only stop or trail goes when entry − mult·ATR
+// is not positive: it used to be dropped, leaving an ATR-only position with
+// no stop at all (EX3-4). With a percentage set, that one stays in force
+// instead — deliberately NOT the 1% clamp: exits read the CURRENT ATR, so a
+// crash bar on a HELD position would otherwise move its stop to 1% of entry,
+// which is no stop. The entry side of EX3-4 (a volatile entry sized as if
+// the narrow percentage stop applied) is closed in risk.SizeBuy, which
+// refuses such an entry (ATROutOfRange).
+const minLevelFrac = 0.01
+
+// ATROutOfRange reports whether mult·ATR reaches the entry price, so the ATR
+// stop cannot be placed above zero and the position's risk cannot be measured
+// against it.
+func ATROutOfRange(cfg config.ExitsConfig, entry, atr float64) bool {
+	return cfg.ATRStopMult > 0 && atr > 0 && entry-cfg.ATRStopMult*atr <= 0
 }
 
 // trailLevel returns the trailing-stop price, or 0 when the position has not
@@ -134,13 +217,33 @@ func trailLevel(cfg config.ExitsConfig, entry, peak, atr float64) float64 {
 		trail = peak * (1 - pct)
 	}
 
-	if cfg.ATRTrailMult > 0 && atr > 0 {
-		if s := peak - cfg.ATRTrailMult*atr; s > 0 && (trail == 0 || s < trail) {
-			trail = s
-		}
+	// Wider wins in BOTH stages, deliberately: past the offset the effective
+	// distance is max(trailing_tight_pct, atr_trail_mult × ATR), so on a
+	// volatile instrument the ATR trail overrides the tight stage. A fixed 2%
+	// trail inside a 3-ATR noise band is the noise exit the ATR multiple was
+	// configured to prevent. Documented (README, config.example.yaml) rather
+	// than silent, and pinned by TestATRTrailBoundsTheTightStage (EX2-4).
+	return widerATRLevel(trail, peak, cfg.ATRTrailMult, atr)
+}
+
+// widerATRLevel is level widened to anchor − mult·ATR when that is lower and
+// still positive; with no level of its own and an ATR level that cannot sit
+// above zero, it is minLevelFrac of the anchor (see there).
+func widerATRLevel(level, anchor, mult, atr float64) float64 {
+	if mult <= 0 || atr <= 0 {
+		return level
 	}
 
-	return trail
+	s := anchor - mult*atr
+
+	switch {
+	case s > 0 && (level == 0 || s < level):
+		return s
+	case s <= 0 && level == 0:
+		return anchor * minLevelFrac
+	}
+
+	return level
 }
 
 // trailPct returns the trailing distance for a position whose peak is gain above
@@ -237,6 +340,11 @@ func roiThreshold(roi map[string]float64, held time.Duration) (float64, string, 
 // range, the loss is the one that must not be missed.
 func (lv Levels) Triggered(price float64) string {
 	switch {
+	// The trail first when it sits above the stop: it is the level a falling
+	// price reached, and naming the deeper stop mislabelled a trailing exit
+	// on a gap (EX3-2).
+	case lv.Trail > lv.Stop && price <= lv.Trail:
+		return fmt.Sprintf("trailing-stop %.2f<=%.2f", price, lv.Trail)
 	case lv.Stop > 0 && price <= lv.Stop:
 		return fmt.Sprintf("stop-loss %.2f<=%.2f", price, lv.Stop)
 	case lv.Trail > 0 && price <= lv.Trail:

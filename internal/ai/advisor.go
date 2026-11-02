@@ -115,7 +115,7 @@ func withAIDefaults(c config.AIConfig) config.AIConfig {
 	}
 
 	if c.RefreshInterval <= 0 {
-		c.RefreshInterval = 15 * time.Minute
+		c.RefreshInterval = config.DefaultAIRefreshInterval
 	}
 
 	if c.MaxAge <= 0 {
@@ -145,43 +145,69 @@ func (a *Advisor) Verdict(symbol string, f Features) (Verdict, bool) {
 	}
 
 	mark := f.Fingerprint()
+	now := a.clockFor(f)
 
-	verdict, have, due := a.claim(symbol, mark)
+	verdict, have, due := a.claim(symbol, mark, now)
 	if !due {
 		return verdict, have
 	}
 
 	if !a.cfg.Blocking {
-		go a.refresh(symbol, f, mark)
+		go a.refresh(symbol, f, mark, now)
 
 		return verdict, have
 	}
 
-	a.refresh(symbol, f, mark)
+	a.refresh(symbol, f, mark, now)
 
-	return a.cached(symbol)
+	return a.cached(symbol, now)
+}
+
+// clockFor is the time a call is judged at. Live (non-blocking) that is the
+// wall clock. A blocking advisor — the deliberate backtest of it — runs on the
+// BAR's time when the caller supplied one: refresh_interval and max_age are
+// durations of market time there, and on the wall clock a replay racing
+// through years of bars in minutes reused its first verdict for every bar of
+// the next 15 real minutes — 1 model call, 1000 bars, the same BUY on every
+// one — so the backtest the docs prescribe never measured the advisor (AI2-1).
+func (a *Advisor) clockFor(f Features) time.Time {
+	if a.cfg.Blocking && !f.At.IsZero() {
+		return f.At
+	}
+
+	return a.now()
 }
 
 // claim reads the cached verdict for symbol and, when a refresh is due, marks
 // the entry in flight so exactly one caller performs it. It returns the verdict
 // usable right now (which may be the previous one) and whether the caller owns
 // the refresh.
-func (a *Advisor) claim(symbol, mark string) (verdict Verdict, have, due bool) {
+func (a *Advisor) claim(symbol, mark string, now time.Time) (verdict Verdict, have, due bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	e, seen := a.cache[symbol]
-	if !seen {
+
+	// A clock that went BACKWARDS — a second replay starting at an earlier
+	// bar — made both ages negative: never due, always fresh. The previous
+	// run's last verdict, formed on the end of the data, answered every bar of
+	// the next one with no model call (AI3-1). An entry from the future is no
+	// entry.
+	if !seen || e.fromTheFuture(now) {
 		e = &entry{}
 		a.cache[symbol] = e
 	}
 
-	now := a.now()
 	// A refresh is due once the interval has elapsed, unless nothing moved: an
-	// unchanged fingerprint would only buy the same answer again.
+	// unchanged fingerprint would only buy the same answer again — until that
+	// answer EXPIRES. Without the age test a quiet market let the verdict
+	// pass max_age with nothing ever asking again, and the detector voted
+	// "awaiting model" until some reading happened to move (AI2-5).
+	stale := e.have && now.Sub(e.verdict.At) > a.cfg.MaxAge
+
 	due = !e.inflight &&
 		now.Sub(e.asked) >= a.cfg.RefreshInterval &&
-		(!e.have || e.mark != mark)
+		(!e.have || e.mark != mark || stale)
 
 	if due {
 		e.inflight = true
@@ -191,8 +217,15 @@ func (a *Advisor) claim(symbol, mark string) (verdict Verdict, have, due bool) {
 	return e.verdict, e.have && now.Sub(e.verdict.At) <= a.cfg.MaxAge, due
 }
 
+// fromTheFuture reports whether e was asked, or answered, after now — the
+// clock went backwards (AI3-1). An entry with a call in flight is kept: its
+// answer is on its way.
+func (e *entry) fromTheFuture(now time.Time) bool {
+	return !e.inflight && (now.Before(e.asked) || (e.have && now.Before(e.verdict.At)))
+}
+
 // cached returns symbol's stored verdict if it is still within max_age.
-func (a *Advisor) cached(symbol string) (Verdict, bool) {
+func (a *Advisor) cached(symbol string, now time.Time) (Verdict, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -201,12 +234,12 @@ func (a *Advisor) cached(symbol string) (Verdict, bool) {
 		return Verdict{}, false
 	}
 
-	return e.verdict, e.have && a.now().Sub(e.verdict.At) <= a.cfg.MaxAge
+	return e.verdict, e.have && now.Sub(e.verdict.At) <= a.cfg.MaxAge
 }
 
 // refresh performs one model call and stores its result. It always clears the
 // in-flight flag, so a failed call cannot wedge a symbol permanently.
-func (a *Advisor) refresh(symbol string, f Features, mark string) {
+func (a *Advisor) refresh(symbol string, f Features, mark string, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Timeout)
 	defer cancel()
 
@@ -254,6 +287,10 @@ func (a *Advisor) refresh(symbol string, f Features, mark string) {
 		errlog.Recordf(errSource, "%s: %v", symbol, err)
 
 		return
+	}
+
+	if a.cfg.Blocking && !f.At.IsZero() {
+		v.At = now // judged on the bar's clock, like claim and cached
 	}
 
 	e.verdict, e.have, e.mark = v, true, mark
@@ -384,6 +421,32 @@ func Configure(cfg config.AIConfig) error {
 	defaultMu.Unlock()
 
 	return nil
+}
+
+// Fresh returns an advisor with a's model client and settings but its own
+// empty verdict cache, request slots and counters — for a replay, which must
+// never read or write the live per-symbol cache. Every in-process backtest
+// used the process-wide advisor: a replayed bar got TODAY's verdict
+// (lookahead), and a due refresh fed historical features overwrote the
+// verdict the live loop trades on (ST3-1, AI3-2). Two replays also shared one
+// cache across a clock that went back (AI3-1). Nil-safe: a nil a returns nil.
+func (a *Advisor) Fresh() *Advisor {
+	if a == nil {
+		return nil
+	}
+
+	f := &Advisor{
+		cfg:   a.cfg,
+		cl:    a.cl,
+		sys:   a.sys,
+		sem:   make(chan struct{}, cap(a.sem)),
+		now:   a.now,
+		cache: make(map[string]*entry),
+	}
+
+	f.call = f.ask
+
+	return f
 }
 
 // Default returns the process-wide advisor, or nil when none is configured.

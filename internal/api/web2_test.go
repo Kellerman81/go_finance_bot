@@ -36,18 +36,22 @@ func postForm(t *testing.T, s *Server, path string, values url.Values) *httptest
 
 // ----- the parallel-deployment promise -----
 
-// The old interface must keep working untouched. Everything here is additive;
-// if this fails, a regression in the new page has taken the usable one with it.
-func TestOriginalUIStillServed(t *testing.T) {
+// The original single-page dashboard was removed (UI-1): it had no CSP, a
+// known stored-XSS path to the auth token it held as a JS global, an auth flow
+// that prompted once per failed fetch, and it had silently fallen behind — no
+// autotune or test_mode settings existed in it at all.
+//
+// The root must still go somewhere useful, so a bookmark on / is not a 404.
+func TestRootRedirectsToTheV2UI(t *testing.T) {
 	s := newTestServer(t)
 
 	rec := fetch(t, s, "/")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET / = %d, want the original page", rec.Code)
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("GET / = %d, want a permanent redirect", rec.Code)
 	}
 
-	if !strings.Contains(rec.Body.String(), "<html") {
-		t.Error("GET / did not return an HTML document")
+	if got := rec.Header().Get("Location"); got != "/v2/" {
+		t.Errorf("GET / redirects to %q, want /v2/", got)
 	}
 }
 

@@ -3,6 +3,8 @@ package screener
 import (
 	"context"
 	"fmt"
+
+	"github.com/Kellerman81/go_finance_bot/internal/config"
 )
 
 // The probe stage.
@@ -29,6 +31,17 @@ const defaultProbeCandidates = 10
 // defaultProbeMinTrades is the fewest trades a probe result is trusted on. A
 // score built on three lucky fills says nothing about the instrument.
 const defaultProbeMinTrades = 5
+
+// ProbeMinTrades resolves probe.min_trades as the probe stage applies it, for
+// the prober (autotune.ScreenProbe), whose search must gate its winner on the
+// same floor (AT3-4).
+func ProbeMinTrades(c config.ScreenerProbeConfig) int {
+	if c.MinTrades > 0 {
+		return c.MinTrades
+	}
+
+	return defaultProbeMinTrades
+}
 
 // probeAll scores the top candidates of each class and folds the outcome back
 // into both the per-class survivor lists (which decide what gets adopted) and
@@ -91,10 +104,7 @@ func (s *Screener) probeOne(ctx context.Context, v Verdict) (Verdict, bool) {
 
 	v.Probe = &p
 
-	minTrades := s.cfg.Probe.MinTrades
-	if minTrades <= 0 {
-		minTrades = defaultProbeMinTrades
-	}
+	minTrades := ProbeMinTrades(s.cfg.Probe)
 
 	if p.Trades < minTrades {
 		// Too thin to mean anything. The candidate keeps its cheap-filter
@@ -119,6 +129,7 @@ func (s *Screener) probeOne(ctx context.Context, v Verdict) (Verdict, bool) {
 	// A measured result outranks an indicator proxy: every cheap rank is a
 	// guess at "would this have traded well", and this is the answer.
 	v.Rank = p.Score
+	v.rankTier = rankTierOf(p.Source)
 	v.Reason = fmt.Sprintf("passed (%s: %.2f%% return, %.0f%% win, %.3f%%/trade over %d)",
 		p.Source, p.ReturnPct, p.WinRatePct, p.ExpectancyPct*100, p.Trades)
 
@@ -140,4 +151,28 @@ func publishVerdict(verdicts []Verdict, v Verdict) {
 			return
 		}
 	}
+}
+
+// rankTierOf is the tier a trusted probe result ranks in. Scores are only
+// comparable within one source, and a cheap-filter rank not at all: sorted on
+// Rank alone, a probe Score (a return %, single digits to tens) lost to every
+// unprobed survivor's rank (AvgVol under the default rank: volume, thousands
+// to millions), so the stage dropped exactly the candidates it had measured as
+// winners and kept the ones past the cutoff, the thin and the unscorable
+// (SC2-1/AT2-1). So: every probed winner above every unprobed candidate, and
+// the two sources apart.
+//
+// The two sources only ever meet with BOTH probe legs on — each alone
+// produces one source — and there the search's result replaces the
+// backtest's, so a candidate carries a "backtest" probe only when its
+// search could not run: the run slot was busy, or the winner was too thin.
+// Ranking that fallback first, as this did, let the candidates that
+// happened to collide with an autotune pass outrank every candidate that
+// was actually searched (AT3-3). The searched ones rank first.
+func rankTierOf(source string) int {
+	if source == "autotune" {
+		return 2
+	}
+
+	return 1
 }

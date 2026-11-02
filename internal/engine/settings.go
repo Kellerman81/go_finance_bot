@@ -2,11 +2,14 @@ package engine
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
 	"github.com/Kellerman81/go_finance_bot/internal/notify"
+	"github.com/Kellerman81/go_finance_bot/internal/portfolio"
 	"github.com/Kellerman81/go_finance_bot/internal/protect"
 	"github.com/Kellerman81/go_finance_bot/internal/risk"
 	"github.com/Kellerman81/go_finance_bot/internal/screener"
@@ -36,18 +39,38 @@ func (e *Engine) SetCostsConfig(c config.CostsConfig) {
 	e.rm.SetCosts(c)
 
 	// The simulated broker prices its own fills; a live broker charges what it
-	// charges and ignores this. The closure resolves the symbol's own measured
-	// spread at fill time rather than at install time, so a later screening pass
-	// updates the friction without re-installing anything.
+	// charges and ignores this.
 	if sim, ok := e.brk.(*broker.Sim); ok {
-		sim.SetSlippage(func(symbol string, buy bool, price float64) float64 {
-			return e.CostsFor(symbol).FillPrice(buy, price)
-		})
+		e.installSimFriction(sim)
+	}
+
+	// The screener's cost filter captured the costs it was built with; rebuild
+	// it so a commission change made here reaches that filter too (SC2-5).
+	if e.screener() != nil {
+		e.SetScreenerConfig(e.ScreenerConfig())
 	}
 
 	e.log.Info("costs updated",
 		"commission_pct", c.CommissionPct, "spread_pct", c.SpreadPct,
 		"slippage_pct", c.SlippagePct)
+}
+
+// installSimFriction prices a simulated broker's fills with CostsFor — the
+// symbol's own measured spread when measure_spread is on, the same model the
+// backtester charges. The closure resolves the spread at fill time, so a later
+// screening pass updates the friction without re-installing anything. One
+// installer for startup, a costs edit and test mode, so the three cannot
+// charge different costs again (CM2-3).
+func (e *Engine) installSimFriction(sim *broker.Sim) {
+	sim.SetSlippage(func(symbol string, buy bool, price float64) float64 {
+		return e.CostsFor(symbol).FillPrice(buy, price)
+	})
+
+	// The commission is read from the risk manager at fill time too, so a
+	// costs save reaches the paper broker as it reaches sizing (AP3-8).
+	sim.SetCommission(func(notional float64) float64 {
+		return e.rm.Costs().Commission(notional)
+	})
 }
 
 // CostsFor returns the cost model to charge for one symbol: the shared
@@ -166,6 +189,13 @@ func (e *Engine) SetProtectionsConfig(cfg config.ProtectionsConfig) {
 		current.SetConfig(cfg) // keeps halt state and lockouts regardless of cfg.Enabled
 	case cfg.Enabled:
 		e.SetProtections(protect.New(cfg))
+		// A fresh manager starts empty, so load whatever the last one saved.
+		// A disabled manager is nil from protect.New, so a restart while
+		// protections were off had nothing to restore into — and enabling
+		// them later built a clean one, silently dropping a halt nobody had
+		// resumed; the next save then overwrote the stored halt for good
+		// (PR2-2). Startup comes through here too.
+		e.RestoreProtectionState()
 	}
 	// current == nil && !cfg.Enabled: nothing to create, nothing to preserve.
 
@@ -189,13 +219,57 @@ func (e *Engine) PortfolioConfig() (config.PortfolioConfig, map[string]string, m
 // because the guard reads all three: swapping them one at a time would leave a
 // window in which a cap is enforced against a map that does not yet describe
 // the symbols it applies to.
+//
+// sectors and assetClasses are the HAND-WRITTEN layer (config.yaml's sectors:
+// and asset_classes:, or the settings screen). What the bot learned by itself
+// is kept apart (autoSectors / autoClasses) and layered underneath, hand
+// entries winning. Merging the two into one map, as before, meant the
+// learned-cache save stored config entries too — a removed `FOO: bond` came
+// back from the database on restart and was never reclassified — and a
+// settings save replacing the maps dropped every learned entry (SG2-2).
 func (e *Engine) SetPortfolioConfig(
 	cfg config.PortfolioConfig,
 	sectors, assetClasses map[string]string,
 ) {
 	e.mu.Lock()
 
-	e.portCfg, e.sectors, e.assetClasses = cfg, sectors, assetClasses
+	e.portCfg = cfg
+	e.handSectors = normalizeSymbolKeys(sectors)
+	e.handClasses = normalizeSymbolKeys(assetClasses)
+
+	e.mu.Unlock()
+
+	e.rebuildPortfolio()
+}
+
+// PortfolioOverrides returns the hand-written sector and asset-class maps —
+// what SetPortfolioConfig was given — without the learned entries
+// PortfolioConfig layers in. A settings save that leaves a map out keeps this,
+// not the merged view.
+func (e *Engine) PortfolioOverrides() (sectors, assetClasses map[string]string) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return maps.Clone(e.handSectors), maps.Clone(e.handClasses)
+}
+
+// rebuildPortfolio merges the learned and hand-written maps (hand wins) and
+// rebuilds the guard and the screener from them.
+func (e *Engine) rebuildPortfolio() {
+	e.mu.Lock()
+
+	sectors := make(map[string]string, len(e.autoSectors)+len(e.handSectors))
+	maps.Copy(sectors, e.autoSectors)
+	maps.Copy(sectors, e.handSectors)
+
+	assetClasses := make(map[string]string, len(e.autoClasses)+len(e.handClasses))
+	maps.Copy(assetClasses, e.autoClasses)
+	maps.Copy(assetClasses, e.handClasses)
+
+	e.sectors, e.assetClasses = sectors, assetClasses
+
+	cfg := e.portCfg
+
 	e.mu.Unlock()
 
 	e.SetPortfolioGuard(risk.NewPortfolioGuard(cfg, sectors, assetClasses, e))
@@ -283,8 +357,9 @@ func (e *Engine) SetAutotuneConfig(cfg config.AutotuneConfig) {
 }
 
 // RescreenNow runs a screening pass immediately instead of waiting for the
-// interval, so an edit can be checked at once.
-func (e *Engine) RescreenNow(ctx context.Context) { e.rescreen(ctx) }
+// interval, so an edit can be checked at once. It reports false, having done
+// nothing, when a pass is already running (passes are single-flight).
+func (e *Engine) RescreenNow(ctx context.Context) bool { return e.rescreen(ctx) }
 
 // NotifyConfig returns the active alert settings.
 func (e *Engine) NotifyConfig() config.NotifyConfig {
@@ -309,4 +384,27 @@ func (e *Engine) SetNotifyConfig(cfg config.NotifyConfig) {
 	old.Close()
 
 	e.log.Info("notifications updated", "enabled", cfg.Enabled, "sinks", e.NotifyStats().Sinks)
+}
+
+// normalizeSymbolKeys copies m with every symbol key in portfolio.Normalize's
+// canonical form; labels are kept as written. The hand-written maps were
+// stored as typed, so `sectors: {sap.de: tech}` never matched hasSector's
+// upper-cased lookup, the learned SAP.DE label landed beside it, and which of
+// the two NormalizeLabels kept was decided by map order — the hand-written
+// label lost about one rebuild in nine (EN3-6). Keys that collide resolve in
+// sorted order, so the outcome is at least the same every time.
+func normalizeSymbolKeys(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+
+	out := make(map[string]string, len(m))
+
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		if sym := portfolio.Normalize(k); sym != "" {
+			out[sym] = m[k]
+		}
+	}
+
+	return out
 }

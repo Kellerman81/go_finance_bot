@@ -33,8 +33,10 @@ func VWAP(high, low, closes, volume []float64, period int) []float64 {
 	return out
 }
 
-// VWAPLast returns only the final rolling-VWAP value, matching Last(VWAP(...))
-// in O(period) instead of O(n·period).
+// VWAPLast returns only the final rolling-VWAP value — the last element of
+// VWAP(...), not Last(VWAP(...)): when the final window has no volume this
+// reports undefined, where Last would skip back to an older bar's value
+// (IN2-4). Computed in O(period) instead of O(n·period).
 func VWAPLast(high, low, closes, volume []float64, period int) (float64, bool) {
 	n := len(closes)
 	if period <= 0 || n < period {
@@ -57,8 +59,10 @@ func VWAPLast(high, low, closes, volume []float64, period int) (float64, bool) {
 	return pv / vol, true
 }
 
-// RVOLLast returns only the final relative-volume value, matching Last(RVOL(...))
-// in O(period) instead of O(n·period).
+// RVOLLast returns only the final relative-volume value — the last element of
+// RVOL(...), not Last(RVOL(...)): when the final window has no volume this
+// reports undefined, where Last would skip back to an older bar's value
+// (IN2-4). Computed in O(period) instead of O(n·period).
 func RVOLLast(volume []float64, period int) (float64, bool) {
 	n := len(volume)
 	if period <= 0 || n <= period {
@@ -168,7 +172,11 @@ func BuildVolumeProfile(
 		hi = math.Max(hi, closes[i])
 	}
 
-	if !(hi > lo) {
+	// An infinite close passes !(hi > lo) — +Inf IS above lo — and then made
+	// the bucket width infinite, the index int(NaN) (math.MinInt64 on amd64)
+	// and vol[b] a panic on the evaluation path (IN3-3). NaN is already
+	// caught: Min/Max spread it and the comparison fails.
+	if !(hi > lo) || math.IsInf(hi, 0) || math.IsInf(lo, 0) {
 		return VolumeProfile{}, false
 	}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/strategy/indicators"
 )
@@ -89,6 +90,11 @@ func (p Params) WarmupBars() int {
 // computed is left out of the prompt entirely rather than sent as a zero the
 // model would read as real data.
 type Features struct {
+	// At is the time of the bar the features were read at, when the caller
+	// knows it. A blocking (backtest) advisor times its refreshes on it — see
+	// Advisor.clockFor. Never sent to the model.
+	At time.Time `json:"-"`
+
 	Symbol string  `json:"symbol"`
 	Price  float64 `json:"price"`
 	Bars   int     `json:"bars"`
@@ -199,8 +205,10 @@ func BuildFeatures(symbol string, high, low, closes, volume []float64, p Params)
 		// z-standardization for every other row of that symbol's feature
 		// column. See CODE_REVIEW_FINDINGS.md's trend-formula-singularity
 		// finding.
+		// And a negative intercept is no anchor either (ST2-2): it flips
+		// the sign, so a strong rally fed the model a negative TrendPct.
 		base := intercept
-		if math.Abs(base) < 0.01*price {
+		if base < 0.01*price {
 			base = price
 		}
 

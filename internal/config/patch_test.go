@@ -53,7 +53,7 @@ isins:
 func patched(t *testing.T, src string, section string, value any) string {
 	t.Helper()
 
-	out, err := patchBytes([]byte(src), section, value)
+	out, err := patchBytes([]byte(src), section, value, true)
 	if err != nil {
 		t.Fatalf("patch: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestPatchRefusesAMissingSection(t *testing.T) {
 	t.Parallel()
 
 	_, err := patchBytes([]byte("exits:\n  enabled: true\n"), "portfolio",
-		PortfolioConfig{Enabled: true})
+		PortfolioConfig{Enabled: true}, true)
 	if err == nil {
 		t.Error("patching a section the file lacks silently succeeded")
 	}
@@ -678,7 +678,7 @@ func TestPatchRefusesRatherThanCorruptAMultiLineValue(t *testing.T) {
 
 	ai := AIConfig{SystemPrompt: "line one\nline two"}
 
-	out, err := patchBytes([]byte(src), "ai", ai)
+	out, err := patchBytes([]byte(src), "ai", ai, true)
 	if err != nil {
 		return // refused, which is the safe outcome
 	}

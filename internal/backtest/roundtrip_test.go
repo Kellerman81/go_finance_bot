@@ -27,10 +27,12 @@ func TestClassifyExit(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]string{
-		"EXIT stop-loss 92.40<=100.00":                        ExitStopLoss,
-		"EXIT trailing-stop 110.00<=peak 120":                 ExitTrailingStop,
-		"EXIT take-profit +20.0% 120.00>=100":                 ExitTakeProfit,
-		"EXIT roi 2h +2.0% 102.00>=100.00":                    ExitROI,
+		"EXIT stop-loss 92.40<=100.00":        ExitStopLoss,
+		"EXIT trailing-stop 110.00<=peak 120": ExitTrailingStop,
+		"EXIT take-profit +20.0% 120.00>=100": ExitTakeProfit,
+		"EXIT roi 2h +2.0% 102.00>=100.00":    ExitROI,
+		// BT3-5: the time barrier fell through to "strategy".
+		"EXIT max hold 72h0m0s reached":                       ExitMaxHold,
 		"rsi:SELL(0.60), macd:SELL(0.12) => SELL by majority": ExitStrategy,
 		"": ExitStrategy,
 	}

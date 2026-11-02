@@ -35,10 +35,20 @@ func newTestServer(t *testing.T) *Server {
 func newTestServerWith(t *testing.T, b broker.Broker) *Server {
 	t.Helper()
 
+	return newTestServerFrom(t, b, config.Config{})
+}
+
+// newTestServerFrom builds the server over cfg. A save compares the live
+// section with what the file LOADS to — Default() under the profile — so a
+// test of what a save writes needs a live config shaped like a loaded one
+// (config.Default()), not the zero value: zero eval_interval differs from the
+// default and is (rightly) refused as a file that would not load.
+func newTestServerFrom(t *testing.T, b broker.Broker, cfg config.Config) *Server {
+	t.Helper()
+
 	gin.SetMode(gin.TestMode)
 
 	var (
-		cfg    config.Config
 		prices = engine.NewPriceCache()
 		feed   = market.NewMock(time.Hour)
 		rm     = risk.New(cfg.Limits, cfg.Costs)

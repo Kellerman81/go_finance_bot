@@ -73,7 +73,7 @@ func TestApplyResultWritesTheFileAndUpdatesTheLiveEngine(t *testing.T) {
 	}
 
 	fields := symbolFields()
-	result := Result{Symbol: "AAPL", Fields: fields}
+	result := Result{Symbol: "AAPL", Fields: fields, Base: eng.StrategyConfigFor("AAPL")}
 
 	applyResult(eng, path, "AAPL", result, discardLog())
 
@@ -316,5 +316,39 @@ func TestScheduleSkipsATickWhenDisabledLive(t *testing.T) {
 
 	if strings.Contains(string(body), "strategy_overrides") {
 		t.Errorf("config file was written to despite autotune being disabled live: %s", body)
+	}
+}
+
+// AT3-2, its second path: Fields is a diff against the config the search
+// started from. A strategy save during the 20-40 s search moved that base,
+// and the same diff layered onto the new one is a config no trial ran. The
+// result is discarded — neither the file nor the live engine changes.
+func TestApplyResultDiscardsASearchWhoseBaseMoved(t *testing.T) {
+	eng, _, _ := newTestEngine(t, nil)
+	if err := eng.AddSymbols("AAPL"); err != nil {
+		t.Fatalf("AddSymbols: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+
+	const body = "strategy:\n  fast_ma: 12\n  slow_ma: 26\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	searched := eng.StrategyConfigFor("AAPL")
+
+	moved := searched
+	moved.RSIPeriod = searched.RSIPeriod + 7
+	eng.SetStrategyConfig(moved) // the operator's save, mid-search
+
+	applyResult(eng, path, "AAPL", Result{Symbol: "AAPL", Fields: symbolFields(), Base: searched}, discardLog())
+
+	if got, _ := os.ReadFile(path); string(got) != body {
+		t.Errorf("config.yaml was written from a search on a stale base:\n%s", got)
+	}
+
+	if slices.Contains(eng.OverriddenSymbols(), "AAPL") {
+		t.Error("the stale search's override was installed live")
 	}
 }

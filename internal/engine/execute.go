@@ -3,10 +3,12 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/broker"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
+	"github.com/Kellerman81/go_finance_bot/internal/errlog"
 )
 
 // defaultLimitTimeout is how long an unfilled limit order is left working before
@@ -173,7 +175,7 @@ func (e *Engine) submitPlan(
 				refPrice = price
 			}
 
-			resID = e.rm.ReserveBuy(child.Qty, refPrice)
+			resID = e.rm.ReserveBuy(child.Symbol, child.Qty, refPrice)
 		}
 
 		res, err := e.brk.SubmitOrder(ctx, child)
@@ -222,6 +224,15 @@ func (e *Engine) submitPlan(
 			// is re-made for the remainder alone for the same reason.
 			if e.watchRemainder(ctx, res, child, qty, price) {
 				resting = true
+			} else if rem := workingRemainder(child, res, qty); rem > 0 {
+				// A market clip's working remainder: flagged by the caller
+				// as unconfirmed, its reservation re-made and parked with
+				// it — fail closed while unknown (EN3-3).
+				unconfirmed += rem
+
+				if child.Side == broker.Buy {
+					e.parkUnconfirmedReservation(symbol, e.rm.ReserveBuy(symbol, rem, price))
+				}
 			}
 
 		case child.Type == broker.Limit:
@@ -247,8 +258,11 @@ func (e *Engine) submitPlan(
 			// A market order the broker could not confirm one way or the other —
 			// genuinely anomalous; the caller must flag it rather than guess.
 			// Leave resID reserved rather than guess at the outcome — see
-			// risk.Manager.Reserve's fails-closed guidance.
+			// risk.Manager.Reserve's fails-closed guidance — parked so the
+			// flagged order can release it once reconciled.
 			unconfirmed += child.Qty
+
+			e.parkUnconfirmedReservation(symbol, resID)
 		}
 
 		if i == 0 {
@@ -283,6 +297,26 @@ func settledQty(res broker.OrderResult) (qty float64, confirmed bool) {
 	}
 
 	return 0, false
+}
+
+// workingRemainder is the part of a MARKET order still working after the
+// broker confirmed a partial fill at its wait deadline (FilledQty > 0,
+// Terminal false — what Alpaca and Trading 212 return). settledQty books the
+// filled part; the rest is neither filled nor refused, and was dropped from
+// every bookkeeping path: no watcher, no unconfirmed order, its reservation
+// released. A buy remainder that later filled never counted against
+// max_daily_spend; a sell remainder was sold AGAIN next evaluation while it
+// still worked (EN3-3). Limit clips have their own path (watchRemainder, LS-6).
+func workingRemainder(order broker.Order, res broker.OrderResult, filled float64) float64 {
+	if res.Terminal || order.Type == broker.Limit {
+		return 0
+	}
+
+	if rem := order.Qty - filled; rem > sellDustQty {
+		return rem
+	}
+
+	return 0
 }
 
 // limitTimeout returns the configured working time for a limit order.
@@ -336,7 +370,7 @@ func (e *Engine) watchRemainder(
 			remPrice = price
 		}
 
-		remID = e.rm.ReserveBuy(rem, remPrice)
+		remID = e.rm.ReserveBuy(child.Symbol, rem, remPrice)
 	}
 
 	go e.watchLimitOrder(ctx, res, remainder, remID)
@@ -363,7 +397,20 @@ func (e *Engine) watchRemainder(
 // deliberately leave resID reserved rather than guess; see
 // risk.Manager.Reserve's fails-closed guidance.
 func (e *Engine) watchLimitOrder(ctx context.Context, res broker.OrderResult, order broker.Order, resID uint64) {
+	defer e.contain("limit-order watcher " + order.Symbol)
+
 	cfg := e.executionConfig()
+
+	untrack := e.trackWatcher(order.Symbol)
+	defer untrack()
+
+	// The broker the order was SENT to, held for the watcher's whole life.
+	// Re-reading e.brk at wake-up let a test-mode switch during the wait
+	// point a real order's watcher at the simulated broker (which cannot
+	// cancel, so the real order was abandoned) or a simulated order's at the
+	// real one (which does not know its id, so a phantom unconfirmed buy was
+	// flagged and blocked real buys of the symbol) — EN2-9.
+	brk := e.currentBroker()
 
 	timer := time.NewTimer(limitTimeout(cfg))
 	defer timer.Stop()
@@ -378,18 +425,18 @@ func (e *Engine) watchLimitOrder(ctx context.Context, res broker.OrderResult, or
 	// filled, or was cancelled by something else (the venue, the broker's own
 	// duration expiry, a human). This adapter gives no way to tell, so it must
 	// be flagged rather than guessed at either way.
-	if !e.orderStillOpen(ctx, res.ID) {
+	if !orderStillOpen(ctx, brk, res.ID) {
 		e.flagUnconfirmed(order.Symbol, order.Side, order.Qty, res,
 			fmt.Sprintf("limit %.4f left the working set before the %s timeout with no confirmed outcome",
-				order.LimitPx, limitTimeout(cfg)))
+				order.LimitPx, limitTimeout(cfg)), resID)
 
 		return
 	}
 
-	canceller, ok := e.brk.(broker.OrderCanceller)
+	canceller, ok := brk.(broker.OrderCanceller)
 	if !ok {
 		e.log.Warn("broker cannot cancel orders; leaving the limit order working",
-			"symbol", order.Symbol, "order_id", res.ID, "broker", e.brk.Name())
+			"symbol", order.Symbol, "order_id", res.ID, "broker", brk.Name())
 
 		return
 	}
@@ -402,12 +449,13 @@ func (e *Engine) watchLimitOrder(ctx context.Context, res broker.OrderResult, or
 	}
 
 	// A cancel that succeeds is the broker's confirmation that (at least) some
-	// quantity was still unfilled and working — booked as a confirmed zero
-	// fill for the limit leg, consistent with never having booked it at
-	// submission. If a partial fill happened in the narrow window before the
-	// cancel took effect, the next syncPortfolio reconciles it against the
-	// broker's own position report.
-	e.rm.Release(resID) // confirmed: this clip will never fill
+	// quantity was still unfilled and working. It is NOT a confirmation that
+	// nothing filled: a limit order can fill partially at any point of its
+	// working life, and OpenOrder carries no filled quantity. Re-sending the
+	// whole clip after a 60/100 partial bought 160 and left the 60 unbooked
+	// (EN2-5, the half the LS-6 fix did not reach). See filledWhileResting for
+	// how the filled part is measured, and when it cannot be.
+	e.rm.Release(resID) // confirmed: the working part of this clip will never fill
 
 	e.record(TradeRecord{
 		Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: 0,
@@ -415,30 +463,232 @@ func (e *Engine) watchLimitOrder(ctx context.Context, res broker.OrderResult, or
 		Reason: fmt.Sprintf("limit %.4f unfilled after %s", order.LimitPx, limitTimeout(cfg)),
 	})
 
+	// Held across sync → measure → book, so sibling slices of one plan (they
+	// share limit_timeout and wake together) each see the others' bookings
+	// rather than all claiming the same excess.
+	e.restMu.Lock()
+	defer e.restMu.Unlock()
+
+	e.syncPortfolio(ctx)
+
+	remaining := order.Qty
+
+	if order.Side == broker.Buy {
+		filled, known := e.filledWhileResting(order)
+		if !known {
+			// Ambiguous: another slice of this symbol is resting or
+			// unconfirmed, so the broker's excess cannot be pinned on this
+			// clip. Re-sending the whole clip is the over-buy EN2-5 is about;
+			// sending nothing under-buys, which is safe — any shares that did
+			// fill are untracked holdings that adopt picks up.
+			e.record(TradeRecord{
+				Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: order.Qty,
+				Price: order.LimitPx, Status: "blocked",
+				Reason: "market fallback skipped: another order for this symbol is in flight, " +
+					"so a partial fill of this limit could not be measured",
+			})
+
+			return
+		}
+
+		if filled > 0 {
+			e.rm.RecordBuy(order.LimitPx * filled)
+			e.persistSpend()
+			e.bookFill(order, filled, order.LimitPx, "partial", res.ID,
+				fmt.Sprintf("limit %.4f partially filled before the %s timeout", order.LimitPx, limitTimeout(cfg)))
+		}
+
+		remaining -= filled
+	}
+
+	// The sell side of the same measurement. A resting sell that partly
+	// filled left the record at its old size: no TradeRecord or realized
+	// P&L for the shares that sold, the protections never saw the round
+	// trip end, and pendingExposure overlaid the phantom onto equity for ten
+	// minutes — EN3-1's false-drawdown mechanism (EN3-5). When nothing else
+	// for the symbol is working, the record's excess over the holding is
+	// what this clip sold.
+	if order.Side == broker.Sell {
+		if sold, known := e.soldWhileResting(order); known && sold > 0 {
+			e.bookFill(order, sold, order.LimitPx, "partial", res.ID,
+				fmt.Sprintf("limit %.4f partially filled before the %s timeout", order.LimitPx, limitTimeout(cfg)))
+		}
+	}
+
 	if !cfg.MarketFallback {
 		e.syncPortfolio(ctx)
 
 		return
 	}
 
-	// The limit leg is assumed to have filled nothing (see above), so the
-	// fallback re-sends the full original quantity, not a remainder.
+	// A sell's fallback is capped at the holding inside marketFallback, which
+	// is all a partial sale needs — the shares that sold are already gone.
+	e.marketFallback(ctx, brk, order, remaining)
+}
+
+// trackWatcher counts a live limit watcher for symbol (see filledWhileResting)
+// and returns the func that uncounts it.
+func (e *Engine) trackWatcher(symbol string) func() {
+	e.mu.Lock()
+
+	if e.restingWatchers == nil {
+		e.restingWatchers = make(map[string]int)
+	}
+
+	e.restingWatchers[symbol]++
+
+	e.mu.Unlock()
+
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		e.restingWatchers[symbol]--
+
+		if e.restingWatchers[symbol] <= 0 {
+			delete(e.restingWatchers, symbol)
+		}
+	}
+}
+
+// filledWhileResting measures how much of a cancelled resting limit BUY filled
+// before the cancel, from the excess of the broker's holding over the engine's
+// openPos record (which never contains a resting clip — it is only booked once
+// confirmed). The result is clamped to [0, order.Qty].
+//
+// known is false when the excess cannot be attributed to this order: another
+// limit watcher for the symbol is still live, or a buy of it is unconfirmed —
+// either could own those shares. It is only measured for buys. On the sell
+// side the same arithmetic reads broker-report lag after a recent buy (the
+// record ahead of the snapshot, what pendingFillGrace absorbs) as a sale and
+// would book a phantom close and realized P&L, so a partial sale is left to
+// reconcile and the fallback is only capped at the holding.
+// soldWhileResting is filledWhileResting for a resting SELL: the record's
+// excess over the broker's holding, capped at the clip, known only when no
+// sibling slice or unconfirmed sell of the symbol could own the difference.
+func (e *Engine) soldWhileResting(order broker.Order) (sold float64, known bool) {
+	if e.countUnconfirmed(order.Symbol, broker.Sell) > 0 {
+		return 0, false
+	}
+
+	held := 0.0
+	if h, ok := e.pf.Snapshot().Holding(order.Symbol); ok {
+		held = h.Qty
+	}
+
+	e.mu.RLock()
+
+	siblings := e.restingWatchers[order.Symbol] > 1
+
+	recorded := 0.0
+	if p, ok := e.openPos[order.Symbol]; ok {
+		recorded = p.Qty
+	}
+
+	e.mu.RUnlock()
+
+	if siblings {
+		return 0, false
+	}
+
+	if deficit := recorded - held; deficit > sellDustQty {
+		return math.Min(deficit, order.Qty), true
+	}
+
+	return 0, true
+}
+
+func (e *Engine) filledWhileResting(order broker.Order) (filled float64, known bool) {
+	if e.hasUnconfirmedBuy(order.Symbol) {
+		return 0, false
+	}
+
+	held := 0.0
+	if h, ok := e.pf.Snapshot().Holding(order.Symbol); ok {
+		held = h.Qty
+	}
+
+	e.mu.RLock()
+
+	siblings := e.restingWatchers[order.Symbol] > 1
+
+	recorded := 0.0
+	if p, ok := e.openPos[order.Symbol]; ok {
+		recorded = p.Qty
+	}
+
+	e.mu.RUnlock()
+
+	if siblings {
+		return 0, false
+	}
+
+	if excess := held - recorded; excess > sellDustQty {
+		return math.Min(excess, order.Qty), true
+	}
+
+	return 0, true
+}
+
+// marketFallback re-sends the unfilled remainder of a cancelled limit order as
+// a market order.
+//
+// A fallback BUY is a new commitment of money made up to limit_timeout after
+// the decision that sized it, so it passes the same gates any buy does at the
+// moment it is sent: the trading toggle (a drawdown halt, the kill switch or a
+// breaker trip in the meantime must stop it), the order-rate breaker, and a
+// fresh risk.Authorize against current headroom (EN2-4). A fallback SELL is
+// an exit and is never gated — it is only capped at what is still held, since
+// whatever sold while the limit rested is already gone.
+//
+//nolint:cyclop // gate → submit → confirm → book, mirroring act()
+func (e *Engine) marketFallback(ctx context.Context, brk broker.Broker, order broker.Order, qty float64) {
 	market := order
 
 	market.Type = broker.Market
 	market.LimitPx = 0
+	market.Qty = qty
 
-	var fbResID uint64
-	if market.Side == broker.Buy {
-		fbResID = e.rm.ReserveBuy(market.Qty, order.LimitPx)
+	held := 0.0
+	if h, ok := e.pf.Snapshot().Holding(order.Symbol); ok {
+		held = h.Qty
 	}
 
-	fallback, err := e.brk.SubmitOrder(ctx, market)
+	if market.Side == broker.Sell {
+		market.Qty = math.Min(market.Qty, held)
+	}
+
+	if market.Qty <= sellDustQty {
+		e.syncPortfolio(ctx)
+
+		return
+	}
+
+	refPx := order.LimitPx
+	if px, ok := e.prices.Get(order.Symbol); ok && px > 0 {
+		refPx = px
+	}
+
+	var fbResID uint64
+
+	if market.Side == broker.Buy {
+		authOrder, ok := e.gateFallbackBuy(market, refPx)
+		if !ok {
+			return
+		}
+
+		market = authOrder
+		fbResID = e.rm.ReserveBuy(market.Symbol, market.Qty, refPx)
+	} else {
+		e.guardOrderRate(false) // counted, never refused: exits are not gated
+	}
+
+	fallback, err := brk.SubmitOrder(ctx, market)
 	if err != nil {
 		e.rm.Release(fbResID) // never reached the venue
 
 		e.record(TradeRecord{
-			Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: order.Qty,
+			Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: market.Qty,
 			Status: "error", Reason: "market fallback after unfilled limit", Err: err.Error(),
 		})
 
@@ -448,65 +698,112 @@ func (e *Engine) watchLimitOrder(ctx context.Context, res broker.OrderResult, or
 	e.met.onOrder()
 
 	if order.Side == broker.Sell {
-		e.markPendingSell(order.Symbol, order.Qty)
+		// The HELD quantity, as every other site records it — the clip size
+		// read as "not landed yet" for as long as the remaining holding was
+		// at least one clip, blocking later exits (EN2-3).
+		e.markPendingSell(order.Symbol, held)
 	}
 
 	filledQty, confirmed := settledQty(fallback)
 	if !confirmed {
 		// Ambiguous — leave fbResID reserved rather than guess.
-		e.flagUnconfirmed(order.Symbol, order.Side, order.Qty, fallback,
-			"market fallback after unfilled limit | broker did not confirm this order's outcome")
+		e.flagUnconfirmed(order.Symbol, order.Side, market.Qty, fallback,
+			"market fallback after unfilled limit | broker did not confirm this order's outcome", fbResID)
 		e.syncPortfolio(ctx)
 
 		return
 	}
 
-	fillPx := fallback.FilledPx
-	if fillPx <= 0 {
-		fillPx = order.LimitPx
+	if order.Side == broker.Sell {
+		e.clearPendingSell(order.Symbol) // outcome known; same rule as act
 	}
 
-	indSnap := e.indicatorSnapshot(order.Symbol)
+	fillPx := fallback.FilledPx
+	if fillPx <= 0 {
+		fillPx = refPx
+	}
 
-	value := fillPx * filledQty
 	if order.Side == broker.Buy {
-		e.rm.RecordBuy(value)
+		e.rm.RecordBuy(fillPx * filledQty)
 		e.rm.Release(fbResID) // real spend now booked; the estimate can go
 		e.persistSpend()
 	}
 
+	if filledQty > 0 {
+		e.bookFill(market, filledQty, fillPx, filledOr(fallback.Status, filledQty), fallback.ID,
+			"market fallback after unfilled limit")
+	}
+
+	e.syncPortfolio(ctx)
+}
+
+// gateFallbackBuy runs a fallback BUY through the gates any buy passes at the
+// moment it is sent — see marketFallback — and returns the authorised order.
+// A refusal is recorded; the breaker records its own halt.
+func (e *Engine) gateFallbackBuy(market broker.Order, refPx float64) (broker.Order, bool) {
+	blocked := func(reason string) {
+		e.record(TradeRecord{
+			Time: now(), Symbol: market.Symbol, Side: market.Side, Qty: market.Qty,
+			Price: refPx, Status: "blocked", Reason: "market fallback after unfilled limit | " + reason,
+		})
+	}
+
+	if !e.tradingOn() {
+		blocked("trading is disabled")
+
+		return broker.Order{}, false
+	}
+
+	authOrder, decision := e.rm.Authorize(market, refPx, e.pendingExposure(e.pf.Snapshot()))
+	if !decision.Approved {
+		blocked(decision.Reason)
+
+		return broker.Order{}, false
+	}
+
+	if !e.guardOrderRate(true) {
+		return broker.Order{}, false
+	}
+
+	return authOrder, true
+}
+
+// bookFill records a confirmed fill of qty at fillPx and books it into the
+// open-position record — the tail every fill path shares once the outcome is
+// known. Spend accounting (RecordBuy) stays with the caller, which knows
+// which reservation the fill settles.
+func (e *Engine) bookFill(order broker.Order, qty, fillPx float64, status, orderID, reason string) {
+	indSnap := e.indicatorSnapshot(order.Symbol)
+
 	var outcome *realised
 
 	if order.Side == broker.Sell {
-		if r, ok := e.closePnL(order.Symbol, fillPx, filledQty); ok {
+		if r, ok := e.closePnL(order.Symbol, fillPx, qty); ok {
 			outcome = &r
 		}
 	}
 
 	rec := TradeRecord{
-		Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: filledQty,
-		Price: fillPx, Value: value,
-		Status: filledOr(fallback.Status, filledQty), OrderID: fallback.ID,
-		Reason: "market fallback after unfilled limit", Indicators: indSnap,
+		Time: now(), Symbol: order.Symbol, Side: order.Side, Qty: qty,
+		Price: fillPx, Value: fillPx * qty,
+		Status: status, OrderID: orderID, Reason: reason, Indicators: indSnap,
 	}
 
 	outcome.apply(&rec)
 	e.record(rec)
 
 	if order.Side == broker.Buy {
-		e.recordOpen(order.Symbol, filledQty, fillPx, indSnap)
+		e.recordOpen(order.Symbol, qty, fillPx, indSnap)
 	} else {
-		e.recordClose(order.Symbol, filledQty)
+		e.recordClose(order.Symbol, qty)
 	}
-
-	e.syncPortfolio(ctx)
 }
 
 // orderStillOpen reports whether an order is still working at the broker. A
 // broker that cannot list working orders is assumed to still have it, so the
 // cancel is attempted rather than skipped.
-func (e *Engine) orderStillOpen(ctx context.Context, id string) bool {
-	lister, ok := e.brk.(broker.OrderLister)
+func orderStillOpen(ctx context.Context, brk broker.Broker, id string) bool {
+	lister, ok := brk.(broker.OrderLister)
 	if !ok {
 		return true
 	}
@@ -531,4 +828,63 @@ func (e *Engine) executionConfig() config.ExecutionConfig {
 	defer e.mu.RUnlock()
 
 	return e.cfg.Execution
+}
+
+// currentBroker returns the broker orders go to right now — the simulated one
+// while test mode is active.
+func (e *Engine) currentBroker() broker.Broker {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return e.brk
+}
+
+// planningExecutionConfig is the execution config a NEW order is planned with:
+// limit execution degrades to market on a broker that cannot both list and
+// cancel orders.
+//
+// A resting limit needs a watcher that can see it and cancel it. Without one
+// (Alpaca here, and the simulated broker in test mode) the watcher logged
+// "cannot cancel" and returned: an expired limit SELL left its pendingSell
+// marker equal to the holding forever, blocking strategy sells and stop-losses
+// for the symbol (EN2-6), and a buy's reservation was never released, filled
+// or not, so cash was counted twice until buys starved. In test mode the leak
+// went into the REAL risk.Manager, and a watcher waking after the window
+// checked the real broker and flagged a phantom unconfirmed buy (EN2-9).
+// Recorded once per broker so the setting is not silently ineffective.
+func (e *Engine) planningExecutionConfig() config.ExecutionConfig {
+	cfg := e.executionConfig()
+	if !wantsLimit(cfg) {
+		return cfg
+	}
+
+	brk := e.currentBroker()
+
+	_, lists := brk.(broker.OrderLister)
+	_, cancels := brk.(broker.OrderCanceller)
+
+	if lists && cancels {
+		return cfg
+	}
+
+	e.mu.Lock()
+
+	if e.limitDegraded == nil {
+		e.limitDegraded = make(map[string]bool)
+	}
+
+	first := !e.limitDegraded[brk.Name()]
+
+	e.limitDegraded[brk.Name()] = true
+
+	e.mu.Unlock()
+
+	if first {
+		errlog.Recordf("engine", "execution.type is \"limit\" but broker %q cannot list and cancel orders, "+
+			"so a resting limit could never be managed: orders are sent to market instead", brk.Name())
+	}
+
+	cfg.Type = "market"
+
+	return cfg
 }

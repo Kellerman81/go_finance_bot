@@ -209,8 +209,12 @@ func (f *Finnhub) runConn() error {
 		}
 	}
 
+	// Counted under the lock: Subscribe writes f.symbols concurrently, and
+	// reading its length after Unlock was a data race (-race caught it).
+	subscribed := len(f.symbols)
+
 	f.mu.Unlock()
-	f.log.Info("websocket connected", "symbols", len(f.symbols))
+	f.log.Info("websocket connected", "symbols", subscribed)
 
 	defer func() {
 		f.mu.Lock()
@@ -316,8 +320,12 @@ func (f *Finnhub) Candles(
 		return nil, fmt.Errorf("no candle data for %s (status=%q)", symbol, raw.Status)
 	}
 
-	out := make([]Candle, len(raw.C))
-	for i := range raw.C {
+	// Bounded by the shortest array: a truncated o/h/l/v/t panicked on the
+	// index, and a panic on the engine goroutine disarms trading (MK2-7).
+	rows := min(len(raw.C), len(raw.O), len(raw.H), len(raw.L), len(raw.V), len(raw.T))
+
+	out := make([]Candle, rows)
+	for i := range rows {
 		out[i] = Candle{
 			Symbol: symbol,
 			Open:   raw.O[i],

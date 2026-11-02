@@ -87,6 +87,14 @@ func main() {
 
 	flag.Parse()
 
+	if conflicts := flagConflicts(activeFlags(flag.CommandLine)); len(conflicts) > 0 {
+		for _, c := range conflicts {
+			_, _ = fmt.Fprintln(os.Stderr, "error:", c)
+		}
+
+		os.Exit(2)
+	}
+
 	// A typo in -rank used to fall back to the blend scorer silently — the
 	// run's own banner kept printing the (wrong, never-actually-used)
 	// requested name for the rest of the run, with nothing anywhere saying
@@ -110,6 +118,15 @@ func main() {
 	// cancellation, no incremental result persistence".
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	// After the first Ctrl+C, give SIGINT back its default meaning. While
+	// NotifyContext stays registered a second Ctrl+C is swallowed, and the
+	// only way out of a run still finishing its search was SIGKILL — which
+	// loses the very result the checkpoint is there to save (CM2-6).
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	cfg := backtest.LoadConfig(*cfgPath, os.Stderr)
 	backtest.ConfigureAI(cfg, os.Stderr)
@@ -240,12 +257,33 @@ func main() {
 
 	var changes []backtest.Refinement
 
-	if *refine {
-		fmt.Fprintln(os.Stderr, "\nRefining the winner over the axes the grid does not cover...")
+	// The un-refined result goes to disk BEFORE Refine, which takes no
+	// context and can run a long sweep: an interrupt during it used to lose
+	// everything, contradicting the promise that the checkpoint captures the
+	// un-refined winner (CM2-6). It is rewritten with the refinement after.
+	if *checkpoint != "" && *refine {
+		pre := searchOutput{trials, best, nil, []string{confirmCountWarning}}
+		if err := writeCheckpoint(*checkpoint, pre); err != nil {
+			_, _ = fmt.Fprintf(
+				os.Stderr,
+				"warning: could not write checkpoint %s: %v\n",
+				*checkpoint,
+				err,
+			)
+		}
+	}
 
-		best, changes = backtest.Refine(cfg, data, best, *cash, *minTrades,
-			score, *respectLimits, os.Stderr,
-			false) // every axis: this CLI's output is applied to the shared config by hand
+	if *refine {
+		best, changes = refineUnlessCancelled(ctx, func() (backtest.Trial, []backtest.Refinement) {
+			_, _ = fmt.Fprintln(
+				os.Stderr,
+				"\nRefining the winner over the axes the grid does not cover...",
+			)
+
+			return backtest.Refine(cfg, data, best, *cash, *minTrades,
+				score, *respectLimits, os.Stderr,
+				false) // every axis: this CLI's output is applied to the shared config by hand
+		}, best)
 	}
 
 	out := searchOutput{trials, best, changes, []string{confirmCountWarning}}
@@ -269,7 +307,7 @@ func main() {
 
 	printLeaderboard(trials, *top)
 	printRefinements(changes, trials[0], best)
-	printBest(best, *cash)
+	printBest(best, *cash, cfg.Engine.MaxRiskSizeUSD)
 }
 
 // printRefinements reports what the refinement pass changed, and what it left
@@ -484,15 +522,13 @@ func describe(t backtest.Trial) string {
 }
 
 // printBest prints the winning trial as paste-ready config.yaml YAML.
-func printBest(t backtest.Trial, cash float64) {
+func printBest(t backtest.Trial, cash, baseCap float64) {
 	fmt.Println("\n================ BEST CONFIG (paste into config.yaml) ================")
 
 	p := t.Params
 
-	fmt.Println("strategy:")
-	fmt.Printf("  detectors: [%s]\n", quoteJoin(t.Detectors))
-	fmt.Printf("  combine: %q\n", t.Combine)
-	fmt.Printf("  min_strength: %.2f\n", t.MinStrength)
+	fmt.Printf("strategy:\n  detectors: [%s]\n  combine: %q\n  min_strength: %.2f\n",
+		quoteJoin(t.Detectors), t.Combine, t.MinStrength)
 
 	// The SELL side. Emitted even when it inherits, so the file states what the
 	// exit rule is rather than leaving it implicit.
@@ -555,7 +591,7 @@ func printBest(t backtest.Trial, cash float64) {
 		p.SupertrendMult,
 	)
 	fmt.Printf("  donchian_period: %d\n", p.DonchianPeriod)
-	printBestEngine(t, cash)
+	printBestEngine(t, cash, baseCap)
 	printBestExits(t)
 
 	fmt.Println("# To realise this, money limits must allow the deployment, e.g.:")
@@ -591,15 +627,35 @@ func printBest(t backtest.Trial, cash float64) {
 }
 
 // printBestEngine emits the engine block, including the behaviour and sizing
-// settings refinement tunes.
-func printBestEngine(t backtest.Trial, cash float64) {
+// settings refinement tunes. baseCap is the config's own max_risk_size_usd,
+// which every trial also ran under.
+func printBestEngine(t backtest.Trial, cash, baseCap float64) {
 	fmt.Println("engine:")
-	fmt.Printf(
-		"  order_size_usd: %.0f   # = %.0f%% of %.0f cash\n",
-		t.OrderSize,
-		t.CapitalFrac*100,
-		cash,
-	)
+	// max_risk_size_usd, not order_size_usd: the latter was removed in the
+	// sizing rework, and config.Load's non-strict decode drops an unknown key
+	// silently, so the pasted block did not reproduce the deployment it
+	// reported. The trial measured OrderSize as a per-trade sizing CAP
+	// (Backtester.sizingConfig), which is what max_risk_size_usd is live
+	// (CM2-5).
+	//
+	// The cap a trial ran under is min(OrderSize, the config's own
+	// max_risk_size_usd) — Backtester.sizingConfig — so printing OrderSize
+	// alone handed a 500-capped trial's results a pasted 12500 cap: 25× the
+	// per-trade size that was measured (CM3-3). Print what bound.
+	if baseCap > 0 && baseCap < t.OrderSize {
+		fmt.Printf(
+			"  max_risk_size_usd: %.0f   # your config's cap; it bound every trial "+
+				"(the %.0f%% deployment = %.0f was never reached)\n",
+			baseCap, t.CapitalFrac*100, t.OrderSize,
+		)
+	} else {
+		fmt.Printf(
+			"  max_risk_size_usd: %.0f   # = %.0f%% of %.0f cash\n",
+			t.OrderSize,
+			t.CapitalFrac*100,
+			cash,
+		)
+	}
 	fmt.Printf("  confirm_buy: %d\n", t.ConfirmBuy)
 	fmt.Printf("  confirm_sell: %d\n", t.ConfirmSell)
 	fmt.Printf("  keep_interval: %s\n", t.KeepInterval)
@@ -664,6 +720,89 @@ func splitSymbols(s string) []string {
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.ToUpper(strings.TrimSpace(p)); p != "" {
 			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
+// refineUnlessCancelled runs refine unless ctx is already done. An interrupted
+// search returns its partial trials, and Refine — which takes no context —
+// then swept them in full before anything was written, so Ctrl+C appeared to
+// do nothing for as long as the sweep took (CM2-6).
+func refineUnlessCancelled(
+	ctx context.Context, refine func() (backtest.Trial, []backtest.Refinement), best backtest.Trial,
+) (backtest.Trial, []backtest.Refinement) {
+	if ctx.Err() != nil {
+		_, _ = fmt.Fprintln(
+			os.Stderr,
+			"\ninterrupted: skipping the refinement pass; reporting the un-refined winner",
+		)
+
+		return best, nil
+	}
+
+	return refine()
+}
+
+// flagConflicts lists explicitly set flags the chosen mode would ignore.
+// -sensitivity outranks -walkforward, which outranks the search flags, and
+// the losing flags were dropped without a word: "-walkforward 5 -random 2000"
+// ran the default grid per fold while the banner never mentioned random
+// (CM2-7). Only flags the user actually typed count — a default is not a
+// request.
+// activeFlags lists the flags set on the command line, a mode flag only while
+// its mode is ON. flag.Visit reports a flag that was typed whatever its value,
+// so "-walkforward 0 -random 500" aborted with "-random has no effect with
+// -walkforward" — a mode switched off claiming the others — while
+// "-random 0 -seed 7" counted -random as on and ran a grid ignoring -seed
+// without a word (CM3-5).
+func activeFlags(fs *flag.FlagSet) map[string]bool {
+	set := make(map[string]bool)
+
+	fs.Visit(func(f *flag.Flag) {
+		switch v := f.Value.String(); f.Name {
+		case "sensitivity":
+			set[f.Name] = v == "true"
+		case "walkforward", "random":
+			set[f.Name] = v != "0" && v != ""
+		default:
+			set[f.Name] = true
+		}
+	})
+
+	return set
+}
+
+func flagConflicts(set map[string]bool) []string {
+	var out []string
+
+	ignored := func(mode string, names ...string) {
+		for _, n := range names {
+			if set[n] {
+				out = append(out, fmt.Sprintf("-%s has no effect with -%s", n, mode))
+			}
+		}
+	}
+
+	switch {
+	case set["sensitivity"]:
+		ignored("sensitivity", "walkforward", "random", "generations", "seed", "refine", "json",
+			"checkpoint", "min-trades", "rank", "top")
+
+	case set["walkforward"]:
+		ignored("walkforward", "random", "generations", "seed", "refine",
+			"checkpoint", "top", "deploy")
+
+	default:
+		if set["deploy"] {
+			out = append(out, "-deploy only applies to -sensitivity")
+		}
+
+		for _, n := range []string{"generations", "seed"} {
+			if set[n] && !set["random"] {
+				out = append(out, fmt.Sprintf("-%s only applies to -random searches", n))
+			}
 		}
 	}
 

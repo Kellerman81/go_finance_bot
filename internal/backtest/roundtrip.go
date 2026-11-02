@@ -37,7 +37,11 @@ const (
 	ExitTrailingStop = "trailing-stop"
 	ExitTakeProfit   = "take-profit"
 	ExitROI          = "roi"
-	ExitStrategy     = "strategy"
+	// ExitMaxHold is the time barrier. It used to fall through to "strategy",
+	// so the breakdown could not show whether max_hold paid for itself
+	// (BT3-5).
+	ExitMaxHold  = "max-hold"
+	ExitStrategy = "strategy"
 )
 
 // classifyExit maps a sell's reason string onto an exit kind. Protective exits
@@ -53,6 +57,8 @@ func classifyExit(reason string) string {
 		return ExitROI
 	case strings.Contains(reason, ExitTakeProfit):
 		return ExitTakeProfit
+	case strings.Contains(reason, "max hold"): // exits.Compute's "max hold <d> reached"
+		return ExitMaxHold
 	}
 
 	return ExitStrategy

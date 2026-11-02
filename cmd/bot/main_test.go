@@ -1,15 +1,23 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/errlog"
+	"github.com/Kellerman81/go_finance_bot/internal/market"
 )
 
 // TestRunSupervisedRecoversAPanic reproduces the "an unrecovered panic in
@@ -172,5 +180,160 @@ func TestUsesDetectorChecksBothSides(t *testing.T) {
 
 	if usesDetector(s, "ml", "model", "classifier") {
 		t.Error("usesDetector false-matched a name that is not present")
+	}
+}
+
+// CM2-2: with feed: binance and a broker with no history of its own, the bot
+// wired Yahoo alone — which has no BTCUSDT — as the source the venue-price
+// check and the screener read. Every crypto entry was refused "venue price
+// unavailable", so the documented binance + sim mode never bought. The feed
+// itself must answer first.
+func TestBinanceFeedServesItsOwnHistory(t *testing.T) {
+	feed := market.NewMock(time.Hour)
+	defer feed.Close()
+
+	h := defaultHistory("binance", feed)
+
+	got, err := h.Candles(context.Background(), "BTCUSDT", market.Res1Min,
+		time.Now().Add(-time.Hour), time.Now())
+	if err != nil || len(got) == 0 {
+		t.Fatalf("no history for BTCUSDT from the binance feed: %d bars, err %v", len(got), err)
+	}
+
+	if _, isYahoo := defaultHistory("finnhub", feed).(*market.YahooHistory); !isYahoo {
+		t.Error("a non-binance feed no longer gets Yahoo as its history source")
+	}
+}
+
+// A smoke test of run's shutdown path, which had no test at all: a SIGINT
+// stops the engine through its shutdown arm, the protection-state save
+// succeeds, and run returns. It does NOT pin CM3-1's ordering on its own —
+// that race is narrow on an idle engine and passes either way;
+// TestWaitBoundedJoinsTheWorkers pins the join run now performs.
+func TestRunShutsDownCleanlyOnSIGINT(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	yaml := "server:\n  addr: \"127.0.0.1:0\"\nbroker: \"sim\"\n" +
+		"storage:\n  driver: \"sqlite\"\n  path: \"" + filepath.Join(dir, "bot.db") + "\"\n" +
+		"protections:\n  enabled: true\n  max_drawdown_pct: 0.5\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origArgs, origStdout := os.Args, os.Stdout
+	t.Cleanup(func() { os.Args, os.Stdout = origArgs, origStdout })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	os.Stdout = w
+	os.Args = []string{"bot", "-config", path}
+
+	// run registers its flags on the global set; another test calls it too.
+	origFlags := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet("bot", flag.ContinueOnError)
+	t.Cleanup(func() { flag.CommandLine = origFlags })
+
+	var (
+		mu  sync.Mutex
+		out strings.Builder
+	)
+
+	go func() {
+		buf := make([]byte, 4096)
+
+		for {
+			n, err := r.Read(buf)
+
+			mu.Lock()
+			out.Write(buf[:n])
+			mu.Unlock()
+
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	logged := func(s string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return strings.Contains(out.String(), s)
+	}
+
+	done := make(chan int, 1)
+
+	go func() { done <- run() }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !logged("engine started") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(40 * time.Second):
+		t.Fatal("run did not return after SIGINT")
+	}
+
+	_ = w.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if logged("database is closed") {
+		t.Error("the engine's shutdown save ran against a closed store")
+	}
+
+	if !logged("engine stopping") {
+		t.Error("run returned before the engine reached its shutdown path")
+	}
+}
+
+// CM3-1: run started the engine and autotune goroutines and never joined
+// them, so SIGTERM ran its defers — closing the store — while the engine was
+// still on its way to the shutdown save of the protection state, the only
+// save of a peak reached in the last five minutes. run now waits for them,
+// bounded, before returning.
+func TestWaitBoundedJoinsTheWorkers(t *testing.T) {
+	var (
+		wg   sync.WaitGroup
+		done atomic.Bool
+	)
+
+	wg.Go(func() {
+		time.Sleep(100 * time.Millisecond) // the engine finishing its final save
+		done.Store(true)
+	})
+
+	waitBounded(&wg, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if !done.Load() {
+		t.Error("waitBounded returned before the worker finished")
+	}
+}
+
+// The bound: a worker stuck in a hung broker call must not hold a container
+// stop forever.
+func TestWaitBoundedGivesUpAfterTheGrace(t *testing.T) {
+	var wg sync.WaitGroup
+
+	block := make(chan struct{})
+	defer close(block)
+
+	wg.Go(func() { <-block })
+
+	start := time.Now()
+	waitBounded(&wg, 100*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if time.Since(start) > time.Second {
+		t.Error("waitBounded did not give up after its grace")
 	}
 }

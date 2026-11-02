@@ -64,6 +64,32 @@ func newAIDetector(c config.StrategyConfig) *aiDetector {
 	return d
 }
 
+// UseAdvisor points every "ai" detector in s — buy, sell and higher-timeframe
+// sets — at a, the twin of UsePredictor. backtest.Run gives each replay its
+// own advisor this way, so no replay reads or writes the live verdict cache
+// (ST3-1). A nil a, or a strategy that is not a *Combined, is left alone.
+func UseAdvisor(s Strategy, a *ai.Advisor) {
+	c, ok := s.(*Combined)
+	if !ok || a == nil {
+		return
+	}
+
+	rebind := func(dets []Detector) {
+		for _, d := range dets {
+			if ad, ok := d.(*aiDetector); ok {
+				ad.adv = a
+			}
+		}
+	}
+
+	rebind(c.detectors)
+	rebind(c.sellDetectors)
+
+	if c.htf != nil {
+		rebind(c.htf.detectors)
+	}
+}
+
 // Name returns the canonical detector name.
 func (*aiDetector) Name() string { return "ai" }
 
@@ -97,6 +123,10 @@ func (d *aiDetector) DetectFor(symbol string, s series) (Action, float64, string
 	f, ok := ai.BuildFeatures(symbol, s.high, s.low, s.close, s.volume, d.params)
 	if !ok {
 		return Hold, 0, "ai: not enough history"
+	}
+
+	if n := len(s.src); n > 0 {
+		f.At = s.src[n-1].Time // the bar's own clock, for a blocking advisor
 	}
 
 	v, ok := d.adv.Verdict(symbol, f)

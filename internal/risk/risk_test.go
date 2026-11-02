@@ -295,7 +295,7 @@ func TestReserveBuyMatchesAuthorizesOwnCostBasis(t *testing.T) {
 		MaxDailySpend: 1e6, MaxOpenPositions: 10, CashReserve: 0,
 	}, costs)
 
-	m2.ReserveBuy(order.Qty, price)
+	m2.ReserveBuy("", order.Qty, price)
 
 	_, d2 := m2.Authorize(order, price, snap)
 	if d2.Approved && d2.FinalQty >= order.Qty {
@@ -481,5 +481,28 @@ func TestSellIsAuthorizedRegardlessOfSymbolCase(t *testing.T) {
 
 	if out.Qty != 10 {
 		t.Errorf("authorised qty = %v, want the full 10 held", out.Qty)
+	}
+}
+
+// PF2-4: a broker rounding residual below portfolio.DustQty is a position the
+// engine never sells or adopts. Treating it as "already held" exempted a
+// fresh buy of that symbol from max_open_positions, so with the one slot
+// taken by MSFT the bot could still open a second, full-size position in X.
+func TestMaxOpenPositionsDoesNotExemptADustRow(t *testing.T) {
+	m := New(config.Limits{
+		MaxOrderValue: 1e6, MaxPerPosition: 1e6, MaxTotalInvested: 1e6,
+		MaxDailySpend: 1e6, MaxOpenPositions: 1,
+	}, config.CostsConfig{})
+
+	pf := portfolio.New()
+	pf.SetCash(1e6)
+	pf.SyncPositions([]portfolio.Holding{
+		{Symbol: "MSFT", Qty: 10, MarketValue: 1000},
+		{Symbol: "X", Qty: 5e-7},
+	})
+
+	order := broker.Order{Symbol: "X", Side: broker.Buy, Qty: 1, Type: broker.Market}
+	if _, d := m.Authorize(order, 100, pf.Snapshot()); d.Approved {
+		t.Error("a dust row exempted a new position from max_open_positions")
 	}
 }

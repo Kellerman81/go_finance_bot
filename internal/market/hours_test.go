@@ -170,3 +170,60 @@ func TestOrderingAllowedCrypto(t *testing.T) {
 		t.Errorf("AAPL => %+v ok=%v, want US (not misclassified as crypto)", ex, ok)
 	}
 }
+
+// TestUSCryptoETFsKeepTheirExchangeHours is the regression for MK2-5. The
+// crypto-pair heuristic needed one character before a quote currency, so GBTC,
+// FBTC, FETH, CETH, EETH and SETH — US-listed funds — came back as known 24/7
+// venues: OrderingAllowed returned true on a Saturday and the engine's weekend
+// guard for unknown venues was skipped, so a weekend buy was queued at the
+// broker for Monday's open.
+func TestUSCryptoETFsKeepTheirExchangeHours(t *testing.T) {
+	t.Parallel()
+
+	for _, sym := range []string{"GBTC", "FBTC", "FETH", "CETH", "EETH", "SETH"} {
+		if ex, _ := ExchangeFor(sym); ex.Name == exCrypto.Name {
+			t.Errorf("%s is a US-listed fund, read as a 24/7 crypto pair", sym)
+		}
+	}
+
+	for _, pair := range []string{"BTCUSDT", "OPUSDT", "ETHBTC", "WUSDT", "SUSDT"} {
+		if ex, _ := ExchangeFor(pair); ex.Name != exCrypto.Name {
+			t.Errorf("%s is a crypto pair, read as %q", pair, ex.Name)
+		}
+	}
+}
+
+// MK2-8: the German regional suffixes were gated to Xetra's 09:00-17:30, so
+// a stop on a Stuttgart holding that triggered at 18:00 waited for the next
+// morning while Stuttgart was open — on a broker with no schedule the hours
+// gate holds exits too.
+func TestGermanRegionalVenuesKeepTheirOwnSessions(t *testing.T) {
+	t.Parallel()
+
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skip("no tzdata")
+	}
+
+	wed := func(h, m int) time.Time { return time.Date(2026, 10, 14, h, m, 0, 0, berlin) }
+
+	cases := []struct {
+		symbol string
+		at     time.Time
+		open   bool
+	}{
+		{"LX9B.SG", wed(18, 0), true},
+		{"LX9B.SG", wed(21, 30), true},
+		{"LX9B.SG", wed(22, 30), false},
+		{"2HP.F", wed(19, 0), true},
+		{"2HP.F", wed(20, 30), true}, // MK3-6: Frankfurt trades shares until 22:00
+		{"2HP.F", wed(22, 30), false},
+		{"SAP.DE", wed(18, 0), false}, // Xetra itself is unchanged
+	}
+
+	for _, c := range cases {
+		if got, why := OrderingAllowed(c.symbol, c.at, 0); got != c.open {
+			t.Errorf("%s at %s: allowed = %v (%s), want %v", c.symbol, c.at.Format("15:04"), got, why, c.open)
+		}
+	}
+}

@@ -15,6 +15,7 @@ import (
 // and click the trading toggle too.
 func TestResumeProtectionsAlsoReEnablesTrading(t *testing.T) {
 	s := newTestServer(t)
+	s.rm.SetLimits(config.Limits{MaxOrderValue: 1000, MaxTotalInvested: 10000}) // trading needs ceilings
 
 	s.eng.SetProtectionsConfig(config.ProtectionsConfig{Enabled: true, MaxDrawdownPct: 0.10})
 
@@ -47,6 +48,11 @@ func TestResumeProtectionsAlsoReEnablesTrading(t *testing.T) {
 // above is scoped to an actual halt: calling resume when nothing is halted
 // (e.g. a defensive/idempotent call) must not flip a deliberately-disabled
 // trading toggle back on as a side effect.
+//
+// AP3-6: nor may it touch the protections at all. Resume re-bases the
+// drawdown peak, the day's equity and the realized peak; called with nothing
+// halted — a stale tab, a double click — it forgave a drawdown in progress
+// (9% down moved a 10% halt to 18% below the real peak). It answers 409.
 func TestResumeProtectionsWithNoActiveHaltDoesNotForceTradingOn(t *testing.T) {
 	s := newTestServer(t)
 
@@ -54,8 +60,9 @@ func TestResumeProtectionsWithNoActiveHaltDoesNotForceTradingOn(t *testing.T) {
 	s.eng.SetTradingEnabled(false) // a deliberate, unrelated manual toggle-off
 
 	code, body := do(t, s, http.MethodPost, "/api/protections/resume", "")
-	if code != http.StatusOK {
-		t.Fatalf("POST /api/protections/resume = %d: %s", code, body)
+	if code != http.StatusConflict {
+		t.Fatalf("POST /api/protections/resume with nothing halted = %d: %s, want 409 and no re-base",
+			code, body)
 	}
 
 	if s.eng.Status().TradingEnabled {
@@ -110,5 +117,55 @@ func TestDiagnosticsKeepsTheResumeButtonWhenProtectionsAreSwitchedOff(t *testing
 	if !strings.Contains(body, catalogs["en"]["diag.disabled"]) {
 		t.Errorf("panel does not say protections are switched off (want %q)",
 			catalogs["en"]["diag.disabled"])
+	}
+}
+
+// TestResumeDoesNotEnableTradingWithoutCeilings is the regression for AP2-5.
+// The trading toggle refuses to switch on without money ceilings
+// (ValidateForTrading); Resume switched it on with no check at all, so
+// ceilings zeroed while the halt had trading off went live unbounded. The
+// halt is still cleared — trading stays off, and the response says why.
+func TestResumeDoesNotEnableTradingWithoutCeilings(t *testing.T) {
+	s := newTestServer(t)
+	s.rm.SetLimits(config.Limits{}) // zeroed during the halt
+
+	s.eng.SetProtectionsConfig(config.ProtectionsConfig{Enabled: true, MaxDrawdownPct: 0.10})
+
+	p := s.eng.Protections()
+	p.ObserveEquity(100000)
+	p.ObserveEquity(80000)
+
+	code, body := do(t, s, http.MethodPost, "/api/protections/resume", "")
+	if code != http.StatusOK {
+		t.Fatalf("resume = %d: %s", code, body)
+	}
+
+	if halted, _ := p.Halted(); halted {
+		t.Error("the halt was not cleared")
+	}
+
+	if s.eng.Status().TradingEnabled {
+		t.Error("resume switched trading on with no money ceilings")
+	}
+
+	if !strings.Contains(body, "trading_not_resumed") {
+		t.Errorf("the response does not say why trading stayed off: %s", body)
+	}
+}
+
+// The deliberate re-base the README advises after a withdrawal still works
+// without a halt, when asked for by name — and leaves trading as it was.
+func TestAnExplicitRebaseWorksWithoutAHalt(t *testing.T) {
+	s := newTestServer(t)
+
+	s.eng.SetProtectionsConfig(config.ProtectionsConfig{Enabled: true, MaxDrawdownPct: 0.10})
+	s.eng.SetTradingEnabled(false)
+
+	if code, body := do(t, s, http.MethodPost, "/api/protections/resume?rebase=1", ""); code != http.StatusOK {
+		t.Fatalf("POST resume?rebase=1 = %d: %s", code, body)
+	}
+
+	if s.eng.Status().TradingEnabled {
+		t.Error("a re-base with nothing halted turned trading on")
 	}
 }

@@ -44,3 +44,22 @@ func TestSymbolFromTickerHandlesTheUnderscoreForm(t *testing.T) {
 		}
 	}
 }
+
+// TestSuffixCountryMapsEveryVenue guards same-name listing disambiguation
+// on Trading 212: a Yahoo suffix must map to the ISIN country of its venue,
+// so "SAP.DE" picks the German listing and not the US ADR. A suffix that
+// fell through to "" would let the first listing win — often the wrong
+// currency and the wrong exchange hours.
+func TestSuffixCountryMapsEveryVenue(t *testing.T) {
+	t.Parallel()
+
+	for suffix, want := range map[string]string{
+		"DE": "DE", "F": "DE", "BE": "DE", "PA": "FR", "AS": "NL", "BR": "BE", "L": "GB", "IL": "GB",
+		"MI": "IT", "MC": "ES", "SW": "CH", "VX": "CH", "ST": "SE", "HE": "FI", "OL": "NO",
+		"CO": "DK", "LS": "PT", "VI": "AT", "IR": "IE", "": "US", "XC": "",
+	} {
+		if got := suffixCountry(suffix); got != want {
+			t.Errorf("suffixCountry(%q) = %q, want %q", suffix, got, want)
+		}
+	}
+}

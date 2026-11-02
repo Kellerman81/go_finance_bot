@@ -207,8 +207,10 @@ func TestNewScorers(t *testing.T) {
 		t.Errorf("sortino scorer = %v, want 2.5", score(r))
 	}
 
-	if score, _ := ScorerByName("calmar"); score(r) != 1.2 {
-		t.Errorf("calmar scorer = %v, want 1.2", score(r))
+	// The calmar objective scores a smoothed ratio (see ScoreCalmar, AT2-4),
+	// not the raw Result.Calmar; what this test pins is the name mapping.
+	if score, _ := ScorerByName("calmar"); score(r) != ScoreCalmar(r) {
+		t.Errorf("calmar scorer = %v, want ScoreCalmar's %v", score(r), ScoreCalmar(r))
 	}
 
 	if score, _ := ScorerByName("expectancy"); score(r) != 0.4 {

@@ -166,6 +166,10 @@ type Result struct {
 	// of "which StrategyConfig fields differ from base", ready to hand to
 	// config.PatchSymbolOverride. Only meaningful when Improved.
 	Fields config.SymbolOverrideFields
+	// Base is the strategy the search started from — the symbol's live
+	// config when it began. Fields is a diff against it, so applying them
+	// onto anything else applies a config no trial ran (AT3-2).
+	Base config.StrategyConfig
 	// Objective is the backtest.Scorer name that actually ranked
 	// candidates this run (see backtest.ScorerNames) — echoed back so a
 	// caller can display what "Best"/Improved were judged by, since an
@@ -241,8 +245,11 @@ const DefaultMinReturnPct = 0.0
 // regardless of objective or either baseline — see
 // config.AutotuneConfig.MinReturnPct's doc comment for why beating a weak
 // or empty baseline is not by itself proof of profitability.
+//
+// ctx parents the search's own Timeout, so a shutdown stops it; the refine
+// pass, which takes no context, is skipped once ctx is done (AT2-8).
 func RunSymbolOptimize(
-	eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
+	parent context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
 	symbol string, candles []market.Candle, minTrades int, objective string, minReturnPct float64,
 ) Result {
 	port, sectors, assetClasses := eng.PortfolioConfig()
@@ -303,7 +310,7 @@ func RunSymbolOptimize(
 	baseline := runBaseline(cfg, data, cash, baseFrac)
 	baseTrial := baselineTrial(cfg, baseFrac, cash, baseline, score)
 
-	ctx, cancel := context.WithTimeout(context.Background(), Timeout)
+	ctx, cancel := context.WithTimeout(parent, Timeout)
 	defer cancel()
 
 	// Pin every deployment axis to what this symbol already runs. None of the
@@ -322,17 +329,8 @@ func RunSymbolOptimize(
 	guided := backtest.OptimizeGuided(ctx, cfg, data, cash,
 		Samples, Generations, minTrades, score, false, Seed, pins)
 
-	best, changes := baseTrial, []backtest.Refinement(nil)
-	if len(guided) > 0 && guided[0].Score > best.Score {
-		best = guided[0]
-	}
-
-	if best.Score > baseTrial.Score || len(guided) > 0 {
-		// strategyOnly: same reasoning as pins above — Refine's behaviour/
-		// adaptiveExits/riskSizing axes tune engine:/exits: settings this
-		// package cannot write per-symbol.
-		best, changes = backtest.Refine(cfg, data, best, cash, minTrades, score, false, io.Discard, true)
-	}
+	cancelled := parent.Err() != nil
+	best, changes := refineWinner(cfg, data, guided, baseTrial, cash, minTrades, score, cancelled)
 
 	// The chosen Objective can legitimately rank a candidate that loses
 	// money above one that doesn't — blend, for instance, weighs a
@@ -375,10 +373,11 @@ func RunSymbolOptimize(
 		// len(notOverridable) == 0: a win this package cannot actually apply
 		// must not be reported as an improvement — see CODE_REVIEW_FINDINGS.md's
 		// AT-2/AT-5 findings and Result.Improved's own doc comment.
-		Improved: len(notOverridable) == 0 && beatsBothBaselines(
+		Improved: !cancelled && len(notOverridable) == 0 && beatsBothBaselines(
 			best, baseTrial, hasReal, real, minReturnPct, hasRecentWin, recentWin),
 		Reasoning:        reasoningLines(baseline, best.Result, changes, hasReal, real, hasTotal, total),
 		Proposed:         formatOverride(fields),
+		Base:             cfg.Strategy,
 		NotOverridable:   notOverridable,
 		Fields:           fields,
 		Objective:        objective,
@@ -386,9 +385,31 @@ func RunSymbolOptimize(
 		BelowReturnFloor: best.Result.TotalReturnPct < minReturnPct,
 		HasRecentWin:     hasRecentWin,
 		RecentWin:        recentWin,
-		BelowRecentWin: hasRecentWin &&
-			!(best.Result.WinRatePct > recentWin.WinRatePct && best.Result.ExpectancyPct > recentWin.ExpectancyPct),
+		BelowRecentWin:   hasRecentWin && !outperforms(best.Result, recentWin),
 	}
+}
+
+// refineWinner takes the guided search's best trial (or the baseline, if
+// nothing beat it) and runs the refine pass over it — unless the caller was
+// cancelled: Refine takes no context, and a shutdown must not sit through a
+// ~22-backtest sweep whose result it will discard anyway (AT2-8).
+func refineWinner(
+	cfg config.Config, data map[string][]market.Candle, guided []backtest.Trial, baseTrial backtest.Trial,
+	cash float64, minTrades int, score backtest.Scorer, cancelled bool,
+) (backtest.Trial, []backtest.Refinement) {
+	best := baseTrial
+	if len(guided) > 0 && guided[0].Score > best.Score {
+		best = guided[0]
+	}
+
+	if cancelled || (best.Score <= baseTrial.Score && len(guided) == 0) {
+		return best, nil
+	}
+
+	// strategyOnly: same reasoning as the pins in RunSymbolOptimize —
+	// Refine's behaviour/adaptiveExits/riskSizing axes tune engine:/exits:
+	// settings this package cannot write per-symbol.
+	return backtest.Refine(cfg, data, best, cash, minTrades, score, false, io.Discard, true)
 }
 
 // recentWinFor reports the symbol's real track record since autotune's own
@@ -471,8 +492,7 @@ func beatsBothBaselines(
 		return false
 	}
 
-	if hasRecentWin &&
-		!(best.Result.WinRatePct > recentWin.WinRatePct && best.Result.ExpectancyPct > recentWin.ExpectancyPct) {
+	if hasRecentWin && !outperforms(best.Result, recentWin) {
 		return false
 	}
 
@@ -480,7 +500,46 @@ func beatsBothBaselines(
 		return true
 	}
 
-	return best.Result.WinRatePct > real.WinRatePct && best.Result.ExpectancyPct > real.ExpectancyPct
+	return outperforms(best.Result, real)
+}
+
+// outperforms is the real-side comparison: a candidate must beat the record
+// on both expectancy and win rate, the win rate read SMOOTHED by the size of
+// the record — (wins+1)/(trades+2), Laplace's rule of succession.
+//
+// Raw, one winning close since the last apply was a 100% win rate: the AT2-6
+// fix let a saturated record be matched, but matching still took a candidate
+// that won every one of its 10+ backtested trades, which almost none does —
+// a 20-trade, 90%-win candidate at five times the expectancy was refused,
+// and the symbol stayed un-tunable until a loss arrived (AT3-5). Smoothed,
+// one win reads 67%, ten in a row 92%: a thin record is a low hurdle and a
+// long one a high hurdle, and neither is impassable.
+//
+// No minimum trade count is imposed on the real side, deliberately: a thin
+// record makes the hurdle low, never impassable, and the what-if score,
+// min_return_pct and min_trades gates still apply in full. Discarding a thin
+// record instead would remove the one check that a win is not an artifact of
+// the backtest's full-capital assumption for every symbol with few trades.
+func outperforms(res backtest.Result, rec engine.SymbolStats) bool {
+	if res.ExpectancyPct <= rec.ExpectancyPct {
+		return false
+	}
+
+	return res.WinRatePct > smoothedWinRatePct(rec)
+}
+
+// smoothedWinRatePct is rec's win rate by the rule of succession, in percent.
+func smoothedWinRatePct(rec engine.SymbolStats) float64 {
+	if rec.Trades <= 0 {
+		return rec.WinRatePct
+	}
+
+	wins := float64(rec.Wins)
+	if rec.Wins == 0 && rec.WinRatePct > 0 {
+		wins = rec.WinRatePct / 100 * float64(rec.Trades)
+	}
+
+	return (wins + 1) / float64(rec.Trades+2) * 100
 }
 
 // realStatsFor returns symbol's realized track record from since to now (a
@@ -524,10 +583,13 @@ func runBaseline(cfg config.Config, data map[string][]market.Candle, cash, frac 
 		KeepInterval:    cfg.Engine.KeepInterval,
 		MaxRiskSizeUSD:  cfg.Engine.MaxRiskSizeUSD,
 		MinOrderSizeUSD: cfg.Engine.MinOrderSizeUSD,
-		Portfolio:       cfg.Portfolio,
-		Sectors:         cfg.Sectors,
-		AssetClasses:    cfg.AssetClasses,
-		Protections:     cfg.Protections,
+		// MinPositions stays 0 on purpose: this is one symbol on a synthetic
+		// budget, and a min_positions slot of THAT budget is not the live
+		// slot. The candidates run the same way, so the comparison is fair.
+		Portfolio:    cfg.Portfolio,
+		Sectors:      cfg.Sectors,
+		AssetClasses: cfg.AssetClasses,
+		Protections:  cfg.Protections,
 	}
 
 	return bt.Run(data)

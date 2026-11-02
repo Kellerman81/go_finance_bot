@@ -5,10 +5,13 @@ package api
 
 import (
 	"context"
-	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,11 +31,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-//go:embed web/index.html
-var webFS embed.FS
-
 // Server holds dependencies for the HTTP API.
 type Server struct {
+	// runCtx is Run's context, for background work a handler starts; see
+	// serveCtx.
+	runCtx    context.Context
 	eng       *engine.Engine
 	rm        *risk.Manager
 	pf        *portfolio.Portfolio
@@ -119,8 +122,13 @@ func (s *Server) Router() *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "auth_required": s.authToken != ""})
 	})
 
-	// Web UI (single embedded page, precompressed + ETag-cached).
-	r.GET("/", indexAsset.serve)
+	// The web UI lives at /v2. The root redirects there rather than serving
+	// anything of its own: the original single-page dashboard was removed
+	// (see CODE_REVIEW_FINDINGS.md's UI-1) and a bookmark on / should still
+	// land somewhere useful.
+	r.GET("/", func(c *gin.Context) {
+		c.Redirect(http.StatusMovedPermanently, "/v2/")
+	})
 
 	s.registerV2(r)
 
@@ -130,6 +138,7 @@ func (s *Server) Router() *gin.Engine {
 	api.Use(gzipJSON())
 	api.Use(limitRequestBody())
 	api.Use(blockSimpleCrossOriginWrites())
+	api.Use(requireSameOriginWrites()) // bodyless writes are actions too (AP3-1)
 
 	if s.authToken != "" {
 		api.Use(requireToken(s.authToken))
@@ -228,7 +237,7 @@ func (s *Server) registerV2(r *gin.Engine) {
 	r.GET("/v2/f/login", s.serveV2Login)
 
 	v2 := r.Group("/v2")
-	v2.Use(limitRequestBody())
+	v2.Use(limitRequestBody(), requireSameOriginWrites())
 
 	if s.authToken != "" {
 		v2.Use(requireToken(s.authToken))
@@ -298,10 +307,13 @@ func (s *Server) forgetOpenPosition(c *gin.Context) {
 func (s *Server) adoptOpenPosition(c *gin.Context) {
 	sym := strings.ToUpper(strings.TrimSpace(c.Param("symbol")))
 
-	if !s.eng.AdoptHeldPosition(sym) {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": sym + " is not held at the broker, or is already tracked",
-		})
+	if err := s.eng.AdoptHeldPosition(sym); err != nil {
+		status := http.StatusNotFound
+		if errors.Is(err, engine.ErrOrderInFlight) {
+			status = http.StatusConflict
+		}
+
+		c.JSON(status, gin.H{"error": sym + ": " + err.Error()})
 
 		return
 	}
@@ -528,17 +540,22 @@ func (s *Server) setAutotuneRunOnly(c *gin.Context) {
 // KindAudit notification per symbol actually changed — not in this
 // response.
 func (s *Server) runAutotuneNow(c *gin.Context) {
-	if autotune.Busy() {
+	// StartOnce claims the slot before answering, so "started" is true only
+	// for a pass that really runs; the server's own context lets a shutdown
+	// stop it before it writes config.yaml (AT2-7, AT2-8).
+	if !autotune.StartOnce(
+		s.serveCtx(),
+		s.eng,
+		s.rm,
+		s.pf,
+		s.eng.AutotuneConfig(),
+		s.configPath,
+		slog.Default(),
+	) {
 		c.JSON(http.StatusConflict, gin.H{"error": "a search is already running"})
 
 		return
 	}
-
-	cfg := s.eng.AutotuneConfig()
-
-	go func() {
-		autotune.RunOnce(context.Background(), s.eng, s.rm, s.pf, cfg, s.configPath, slog.Default())
-	}()
 
 	c.JSON(http.StatusOK, gin.H{"started": true})
 }
@@ -609,7 +626,12 @@ func (s *Server) putLimits(c *gin.Context) {
 	// trading_enabled: false is validated when it is later turned on (see
 	// setTrading); this is the other way limits can change out from under a
 	// running bot.
-	if s.eng.Status().TradingEnabled {
+	//
+	// The CONFIGURED switch counts as well as the live one: with trading
+	// toggled off live but trading_enabled: true in the file, zeroed ceilings
+	// were applied and only the file write refused — the loader checks the
+	// file's switch (AP3-5).
+	if s.eng.Status().TradingEnabled || s.eng.EngineConfig().TradingEnabled {
 		if err := l.ValidateForTrading(); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
@@ -744,23 +766,94 @@ func (s *Server) putStrategy(c *gin.Context) {
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
 
-	var cfg config.StrategyConfig
+	// Onto the live config, not an empty one: see bindMerged. This is also
+	// what keeps an omitted min_strength_sell at its live value instead of 0,
+	// which switched the sell strength gate off.
+	cfg := s.eng.StrategyConfig()
 
-	if err := c.ShouldBindJSON(&cfg); err != nil {
+	if err := bindMerged(c, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 		return
 	}
 
-	if cfg.FastMA >= cfg.SlowMA && cfg.FastMA > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "fast_ma must be < slow_ma"})
+	// The same rule config.Validate applies at load — unconditionally. The
+	// "&& FastMA > 0" exemption let 0/0 through here, which then could not be
+	// loaded at the next restart (AP2-4).
+	// Every rule config.Validate applies to a strategy at load, so a save
+	// cannot write a file that will not load (AP2-4) or a min_strength the
+	// loader would refuse (CF3-4, ST3-5).
+	if err := config.ValidateStrategyRules(cfg, "strategy"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+
+		return
+	}
+
+	// A strategy that needs more history than the live engine keeps can never
+	// leave warmup — it would vote HOLD forever while a backtest kept
+	// trading (ST3-3).
+	if need := strategy.New(cfg).WarmupBars(); need > engine.MaxHistoryBars {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf(
+			"this strategy needs %d bars of warmup but the engine keeps %d — shorten trend_period, "+
+				"htf_multiple or ml.train_bars",
+			need,
+			engine.MaxHistoryBars,
+		)})
+
+		return
+	}
+
+	// Every override inherits from this strategy, and the engine holds them
+	// as resolved snapshots: re-layer each one from the file onto the new
+	// base, so live trades what a restart would (AT3-2, CF3-3). Resolved
+	// before anything is applied — an override the new base would make
+	// invalid refuses the save rather than breaking the next restart.
+	overrides, reLayer, err := s.reLayerOverrides(cfg)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 		return
 	}
 
 	s.eng.SetStrategyConfig(cfg)
+
+	if reLayer {
+		s.eng.SetSymbolStrategies(overrides)
+	}
+
 	s.noteSave(c, "strategy") // header only: the response body is the bare struct, unwrapped
 	c.JSON(http.StatusOK, s.eng.StrategyConfig())
+}
+
+// reLayerOverrides resolves config.yaml's strategy_overrides onto base, and
+// checks each against the live history limit. ok is false with no config
+// file, where there is no override block to re-read and the live overrides
+// stand.
+func (s *Server) reLayerOverrides(
+	base config.StrategyConfig,
+) (map[string]config.StrategyConfig, bool, error) {
+	if s.configPath == "" {
+		return nil, false, nil
+	}
+
+	overrides, err := config.ResolveOverridesFile(s.configPath, base)
+	if err != nil {
+		return nil, false, fmt.Errorf("the overridden symbols inherit this strategy: %w", err)
+	}
+
+	for sym, sc := range overrides {
+		if need := strategy.New(sc).WarmupBars(); need > engine.MaxHistoryBars {
+			return nil, false, fmt.Errorf(
+				"strategy_overrides[%s] would need %d bars of warmup on this base, "+
+					"but the engine keeps %d",
+				sym,
+				need,
+				engine.MaxHistoryBars,
+			)
+		}
+	}
+
+	return overrides, true, nil
 }
 
 // getExits serves GET /api/exits: the protective-exit levels.
@@ -805,6 +898,14 @@ func (s *Server) putSizing(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "max_risk_size_usd and min_order_size_usd must be >= 0",
 		})
+
+		return
+	}
+
+	// The loader's cross-section slot rule, before the live apply (AP3-5).
+	port, _, _ := s.eng.PortfolioConfig()
+	if err := config.ValidatePositionSlots(port, req.MinPositions); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 		return
 	}
@@ -882,9 +983,8 @@ func (s *Server) putExits(c *gin.Context) {
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
 
-	var x config.ExitsConfig
-
-	if err := c.ShouldBindJSON(&x); err != nil {
+	x, err := bindExits(c, s.eng.ExitsConfig())
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 		return
@@ -899,6 +999,51 @@ func (s *Server) putExits(c *gin.Context) {
 	s.eng.SetExitsConfig(x)
 	s.noteSave(c, "exits") // header only: the response body is the bare struct, unwrapped
 	c.JSON(http.StatusOK, s.eng.ExitsConfig())
+}
+
+// bindExits reads an exits body ONTO the live exits config, like the
+// settings section does (bindMerged): a key the body omits keeps its value.
+// It decoded into an empty struct, so `PUT /api/exits {"stop_loss_pct":0.04}`
+// switched exits off and zeroed the trail, take-profit, ladder and max_hold —
+// live and in config.yaml (AP3-7), while the README says this route keeps
+// what you do not send.
+//
+// max_hold may be spelled as a duration ("72h"), as the settings form and
+// config.yaml spell it, or as the integer nanoseconds GET /api/exits serves,
+// so a GET's output can be PUT straight back (AP2-8).
+func bindExits(c *gin.Context, live config.ExitsConfig) (config.ExitsConfig, error) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return config.ExitsConfig{}, err
+	}
+
+	var raw map[string]json.RawMessage
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return config.ExitsConfig{}, err
+	}
+
+	if mh, ok := raw["max_hold"]; ok {
+		var ns int64
+		if json.Unmarshal(mh, &ns) == nil {
+			raw["max_hold"] = json.RawMessage(strconv.Quote(time.Duration(ns).String()))
+			if body, err = json.Marshal(raw); err != nil {
+				return config.ExitsConfig{}, err
+			}
+		}
+	}
+
+	w := wrapExits(live)
+
+	v := reflect.ValueOf(&w).Elem()
+	v.Set(deepCopy(v))
+	clearPresentMaps(v, raw)
+
+	if err := json.Unmarshal(body, &w); err != nil {
+		return config.ExitsConfig{}, err
+	}
+
+	return w.unwrap()
 }
 
 // getDetectors serves GET /api/detectors: every detector's signal per symbol.
@@ -994,7 +1139,12 @@ func (s *Server) rescreenNow(c *gin.Context) {
 		return
 	}
 
-	s.eng.RescreenNow(c.Request.Context())
+	if !s.eng.RescreenNow(c.Request.Context()) {
+		c.JSON(http.StatusConflict, gin.H{"error": "a screening pass is already running"})
+
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{"screen": s.eng.LastScreen(), "watchlist": s.eng.Watchlist()})
 }
 
@@ -1031,17 +1181,45 @@ func (s *Server) resumeProtections(c *gin.Context) {
 	// the trading toggle to actually resume anything.
 	wasHalted, _ := p.Halted()
 
-	p.Resume(s.pf.Snapshot().Equity)
-	s.eng.PersistProtectionState() // so the cleared halt survives a restart, not just the clear itself
+	// No halt, nothing to resume — and Resume would still re-base the
+	// drawdown peak, the day's equity and the realized peak on today's
+	// figures, forgiving a drawdown that is building: a stale tab or a
+	// double click at 9% down moved the 10% halt to 18% below the real peak
+	// (AP3-6). Re-basing without a halt — after a withdrawal, as the README
+	// advises — has to be asked for by name: ?rebase=1.
+	if !wasHalted && c.Query("rebase") != "1" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":       "no protections halt is active; nothing to resume",
+			"protections": p.Status(),
+		})
 
-	if wasHalted {
-		s.eng.SetTradingEnabled(true)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"resumed": true, "protections": p.Status(),
-		"trading_enabled": s.eng.Status().TradingEnabled,
-	})
+	// Re-based on the equity checkDrawdown measures (pending fills overlaid),
+	// not the raw snapshot: with a buy still working at resume time the raw
+	// figure is low by the cash it committed, which set the day's starting
+	// equity too low for the rest of the UTC day (PR2-8).
+	p.Resume(s.eng.ProtectedEquity())
+	s.eng.PersistProtectionState() // so the cleared halt survives a restart, not just the clear itself
+
+	resp := gin.H{"resumed": true, "protections": p.Status()}
+
+	// The same gate the trading toggle applies (setTrading): Resume used to
+	// switch trading back on with no money-ceiling check, so ceilings zeroed
+	// during the halt (allowed while trading was off) went live unbounded
+	// (AP2-5). The halt is still cleared; trading just stays off, and the
+	// response says why.
+	if wasHalted {
+		if err := s.rm.Limits().ValidateForTrading(); err != nil {
+			resp["trading_not_resumed"] = err.Error()
+		} else {
+			s.eng.SetTradingEnabled(true)
+		}
+	}
+
+	resp["trading_enabled"] = s.eng.Status().TradingEnabled
+	c.JSON(http.StatusOK, resp)
 }
 
 // unlockSymbol serves DELETE /api/protections/lock/:symbol: clears one symbol's
@@ -1222,8 +1400,22 @@ func (s *Server) cancelOrders(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"cancelled": ids})
 }
 
+// serveCtx is the context Run was started with — cancelled at shutdown — for
+// work a handler starts that outlives its request. Background when the
+// server is driven without Run (tests).
+func (s *Server) serveCtx() context.Context {
+	if s.runCtx == nil {
+		return context.Background()
+	}
+
+	return s.runCtx
+}
+
 // Run starts the HTTP server and shuts it down when ctx is cancelled.
 func (s *Server) Run(ctx context.Context, addr string) error {
+	// Written before the listener starts, so every handler goroutine sees it.
+	s.runCtx = ctx
+
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: s.Router(),

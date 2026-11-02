@@ -52,7 +52,11 @@ func (e *Engine) noteUntradeable(symbol string, side broker.Side, err error) {
 		"symbol", symbol, "err", err)
 
 	if n := e.notifyOf(); n != nil {
-		n.Sendf(notify.KindHalt, "instrument not tradeable",
+		// An error, not a halt: one instrument refused, trading continues. As a
+		// Halt every refused instrument re-announced on the urgent lane after
+		// a restart, all in one tick — enough of them filled its 8 slots and a
+		// real drawdown halt arriving then was dropped (NT2-4).
+		n.Sendf(notify.KindError, "instrument not tradeable",
 			"%s: the broker will not accept orders for this instrument. "+
 				"Entries are suspended for it until restart.\n\n%v", symbol, err)
 	}

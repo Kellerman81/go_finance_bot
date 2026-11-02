@@ -57,6 +57,7 @@ const (
 	ExitKindTrailingStop = "trailing-stop"
 	ExitKindTakeProfit   = "take-profit"
 	ExitKindROI          = "roi"
+	ExitKindMaxHold      = "max-hold" // the time barrier (BT3-5)
 	ExitKindStrategy     = "strategy"
 )
 
@@ -73,6 +74,8 @@ func ClassifyExitKind(reason string) string {
 		return ExitKindROI
 	case strings.Contains(reason, ExitKindTakeProfit):
 		return ExitKindTakeProfit
+	case strings.Contains(reason, "max hold"): // exits.Compute's "max hold <d> reached"
+		return ExitKindMaxHold
 	}
 
 	return ExitKindStrategy

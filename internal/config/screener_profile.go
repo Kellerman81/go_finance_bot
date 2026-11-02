@@ -3,7 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
-	"strings"
+
+	"github.com/Kellerman81/go_finance_bot/internal/market"
 )
 
 // errEmptyScreenerClass and errProbeWithoutMode are the two screener
@@ -111,11 +112,31 @@ func (c ScreenerConfig) universeFor(class string) []string {
 		return p.Universe
 	}
 
-	if u, ok := c.UniverseByAssetClass[normalizeClassKey(class)]; ok && len(u) > 0 {
+	if u := c.ownUniverse(class); len(u) > 0 {
 		return u
 	}
 
 	return c.Universe
+}
+
+// ownUniverse is class's universe_by_asset_class entry, its key matched in
+// canonical form as profileFor matches profiles. It indexed the map with the
+// canonical key against keys stored as written: {ETF: [...]} was listed as a
+// configured class and then never found — the curated pool was not screened,
+// and with suggest_universe the starter pool replaced it (SC3-5).
+func (c ScreenerConfig) ownUniverse(class string) []string {
+	key := normalizeClassKey(class)
+	if key == "" {
+		return nil
+	}
+
+	for name, u := range c.UniverseByAssetClass {
+		if normalizeClassKey(name) == key {
+			return u
+		}
+	}
+
+	return nil
 }
 
 // HasOwnUniverse reports whether a class has a candidate pool written for it
@@ -130,7 +151,7 @@ func (c ScreenerConfig) HasOwnUniverse(class string) bool {
 		return true
 	}
 
-	return len(c.UniverseByAssetClass[normalizeClassKey(class)]) > 0
+	return len(c.ownUniverse(class)) > 0
 }
 
 // profileFor looks a class's profile up case-insensitively — config files are
@@ -183,7 +204,17 @@ func (c ScreenerConfig) AssetClassesConfigured() []string {
 // not need to: by the time a class reaches config it has already been through
 // the classifier.
 func normalizeClassKey(class string) string {
-	return strings.ToLower(strings.TrimSpace(class))
+	return CanonicalAssetClass(class)
+}
+
+// CanonicalAssetClass is the one form an asset-class key is compared in:
+// market.NormalizeAssetClass, aliases included — the form the classifier's
+// output already takes. Lower-casing alone left a profile keyed "stocks" or
+// "equity" matching nothing (the classifier says "stock"), and
+// asset_classes: {X: ETFs} a class "etfs" no cap, profile or pool knew,
+// each accepted at load and silently doing nothing (SC3-5).
+func CanonicalAssetClass(class string) string {
+	return market.NormalizeAssetClass(class)
 }
 
 // applyPtr overwrites dst when the override is present. Generic over the

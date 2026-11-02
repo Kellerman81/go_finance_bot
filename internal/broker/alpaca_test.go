@@ -443,3 +443,77 @@ func TestAlpacaLimitOrderNotPolled(t *testing.T) {
 		t.Errorf("Status = %q, want the submission status", res.Status)
 	}
 }
+
+// TestAlpacaMarketFillWithoutAnFXRateReportsNoPrice is the Alpaca half of
+// BR2-3. A market order is still sent when the rate fetch fails (rate stays
+// 1), and its fill price came back in the account's USD labelled as the
+// preferred EUR — a $163 fill booked as €163, skewing entry price, daily
+// spend, realized P&L and the stop anchors by the exchange rate. With no rate
+// the price must be reported as unknown; the engine falls back to its own
+// converted reference.
+func TestAlpacaMarketFillWithoutAnFXRateReportsNoPrice(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/account", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cash": "900", "equity": "1000", "buying_power": "900", "currency": "USD",
+		})
+	})
+	mux.HandleFunc("POST /v2/orders", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "ord-1", "status": "accepted", "filled_qty": "0"})
+	})
+	mux.HandleFunc("GET /v2/orders/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "ord-1", "symbol": "NVDA", "side": "buy", "qty": "1",
+			"filled_qty": "1", "filled_avg_price": "163", "status": "filled",
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	a := NewAlpaca(srv.URL, "k", "s", "EUR")
+	a.fx.baseURL = "http://127.0.0.1:1" // the rate fetch fails deterministically
+
+	res, err := a.SubmitOrder(context.Background(), Order{Symbol: "NVDA", Side: Buy, Qty: 1, Type: Market})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if res.FilledPx != 0 {
+		t.Errorf("FilledPx = %v with no USD->EUR rate, want 0 (unknown) rather than a USD price labelled EUR", res.FilledPx)
+	}
+}
+
+// BR2-7, end to end: the earlier decimal fix reached only the notional path,
+// which nothing calls; the LIMIT path still sent a fixed 2 dp. This checks
+// what actually goes over the wire for a sub-$1 buy limit.
+func TestAlpacaSendsASubDollarLimitAtFourDecimals(t *testing.T) {
+	var sentLimit string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v2/orders", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sentLimit, _ = body["limit_price"].(string)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "ord-1", "symbol": body["symbol"], "side": body["side"],
+			"qty": "100", "filled_qty": "0", "filled_avg_price": "",
+			"status": "new", "submitted_at": "2026-01-01T00:00:00Z",
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	a := NewAlpaca(srv.URL, "k", "s", "")
+
+	if _, err := a.SubmitOrder(context.Background(),
+		Order{Symbol: "PENNY", Side: Buy, Type: Limit, Qty: 100, LimitPx: 0.4567},
+	); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if sentLimit != "0.4567" {
+		t.Errorf("sent limit_price = %q, want %q (not rounded UP to 0.46 on a buy)", sentLimit, "0.4567")
+	}
+}

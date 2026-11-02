@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -222,13 +223,13 @@ type PortfolioConfig struct {
 	// add) to what is left of that symbol's slot, so it behaves like
 	// limits.max_order_value, and the smaller of the two wins.
 	//
-	// Keyed like MaxPctPerAssetClass, UnclassifiedAssetClass included. 0 or 1
-	// means "no split" — one position may use the whole class budget, which
-	// is the behaviour when the key is absent. A class named here needs a
-	// MaxPctPerAssetClass entry, since without a budget there is nothing to
-	// divide; once Enabled, Validate rejects that pairing rather than let the
-	// setting sit there doing nothing. While the block is off both are inert
-	// anyway, so staging the two together is allowed.
+	// Keyed like MaxPctPerAssetClass, UnclassifiedAssetClass included. 0
+	// means "no split", the behaviour when the key is absent. On a class WITH
+	// a max_pct_per_asset_class budget, 1 is the whole budget in one position
+	// — the class cap already enforces that, so it is a no-op too. On a class
+	// WITHOUT one, the slots share the leftover the named budgets did not
+	// claim, and 1 is a real ceiling: one position's share of that leftover
+	// (see risk.PortfolioGuard.MaxPositionValue).
 	MinPositionsPerAssetClass map[string]int `json:"min_positions_per_asset_class" yaml:"min_positions_per_asset_class"`
 }
 
@@ -294,7 +295,7 @@ func (c PortfolioConfig) Validate() error {
 	caps := c.NormalizedAssetClassCaps()
 
 	for class, n := range c.MinPositionsPerAssetClass {
-		name := strings.ToLower(strings.TrimSpace(class))
+		name := CanonicalAssetClass(class)
 		if name == "" {
 			return errors.New("portfolio.min_positions_per_asset_class has an empty class name")
 		}
@@ -367,12 +368,13 @@ func (l Limits) TightestPerOrderCap(equity float64) float64 {
 	return max(capUSD, 0)
 }
 
-// NormalizedAssetClassCaps returns MaxPctPerAssetClass keyed by lower-cased,
-// trimmed class names with the no-op entries (zero or negative) dropped, so the
-// guard can look a class up without re-normalising on every order.
+// NormalizedAssetClassCaps returns MaxPctPerAssetClass keyed by canonical
+// class (CanonicalAssetClass) with the no-op entries (zero or negative)
+// dropped, so the guard can look a class up without re-normalising on every
+// order.
 //
-// Config files are written by hand: "ETF", " etf" and "etf" must all cap the
-// same bucket the classifier fills.
+// Config files are written by hand: "ETF", " etf", "ETFs" and "etf" must all
+// cap the same bucket the classifier fills.
 func (c PortfolioConfig) NormalizedAssetClassCaps() map[string]float64 {
 	if len(c.MaxPctPerAssetClass) == 0 {
 		return nil
@@ -381,7 +383,7 @@ func (c PortfolioConfig) NormalizedAssetClassCaps() map[string]float64 {
 	out := make(map[string]float64, len(c.MaxPctPerAssetClass))
 
 	for class, pct := range c.MaxPctPerAssetClass {
-		if name := strings.ToLower(strings.TrimSpace(class)); name != "" && pct > 0 {
+		if name := CanonicalAssetClass(class); name != "" && pct > 0 {
 			out[name] = pct
 		}
 	}
@@ -395,19 +397,32 @@ func (c PortfolioConfig) NormalizedAssetClassCaps() map[string]float64 {
 
 // NormalizedAssetClassSlots returns MinPositionsPerAssetClass keyed the same
 // way NormalizedAssetClassCaps is, with the no-op entries dropped: 0 (absent)
-// and 1 (the whole budget in one position) both mean "do not split", and a
-// class whose slot count cannot bind is better absent than present.
+// and negative counts, and 1 on a class that has its own budget (the whole
+// budget in one position, which the class cap already enforces).
+//
+// 1 on a class WITHOUT a budget is kept: it caps one position at the leftover
+// the named budgets left, which MaxPositionValue enforces. Dropping every 1
+// here made that branch unreachable — {stock: 0.6} caps with {bond: 1} gave
+// bond no ceiling at all, while the doc promised one (RK2-4).
 func (c PortfolioConfig) NormalizedAssetClassSlots() map[string]int {
 	if len(c.MinPositionsPerAssetClass) == 0 {
 		return nil
 	}
 
+	caps := c.NormalizedAssetClassCaps()
 	out := make(map[string]int, len(c.MinPositionsPerAssetClass))
 
 	for class, n := range c.MinPositionsPerAssetClass {
-		if name := strings.ToLower(strings.TrimSpace(class)); name != "" && n > 1 {
-			out[name] = n
+		name := CanonicalAssetClass(class)
+		if name == "" || n < 1 {
+			continue
 		}
+
+		if _, budgeted := caps[name]; n == 1 && budgeted {
+			continue
+		}
+
+		out[name] = n
 	}
 
 	if len(out) == 0 {
@@ -455,18 +470,27 @@ type MLConfig struct {
 	// to 200.
 	MinSamples int `json:"min_samples" yaml:"min_samples"`
 
-	// BuyProb / SellProb are the probabilities at which the model votes. 0
-	// defaults to 0.58 / 0.42 — deliberately not 0.5, since a model hovering at
-	// the coin-flip line should not be trading.
+	// BuyProb / SellProb set the vote thresholds as distances from 0.5,
+	// applied around the training window's positive (rally) rate rather than
+	// around 0.5 itself — see ml.Predictor.decide. 0 defaults to 0.58 / 0.42,
+	// i.e. ±0.08: deliberately not 0, since a model hovering at its base rate
+	// should not be trading.
 	BuyProb  float64 `json:"buy_prob"  yaml:"buy_prob"`
 	SellProb float64 `json:"sell_prob" yaml:"sell_prob"`
 
-	// MinSkill is the minimum training accuracy *above the majority-class base
-	// rate* before the model is allowed to vote (0.02 = two percentage points).
-	// This is the guard against acting on a model that learned nothing. 0
-	// disables the check, which is not recommended.
+	// MinSkill is how far the model's votes must beat chance before it is
+	// allowed to vote (0.02 = two percentage points): a twin fitted on the
+	// older three quarters of the window votes BUY/SELL on the newest quarter
+	// at buy_prob/sell_prob, and its hit rate must exceed what a vote on the
+	// same side gets by chance by this much (see ml.Model.Skill). Fewer than
+	// 20 held-out votes reads as no skill. This is the guard against acting
+	// on a model that learned nothing. 0 disables the check, which is not
+	// recommended.
 	MinSkill float64 `json:"min_skill" yaml:"min_skill"`
-	// MaxStrength caps the strength the detector contributes (0..1).
+	// MaxStrength caps the strength the detector contributes (0..1). 0 is the
+	// default, 1 — not "mute": to silence the detector take it out of
+	// strategy.detectors or give it a weight of 0. Outside 0..1 is refused at
+	// load, as ai.max_strength is (ML3-7).
 	MaxStrength float64 `json:"max_strength" yaml:"max_strength"`
 
 	// Fitting hyperparameters. The defaults converge on this problem; L2 is the
@@ -488,9 +512,96 @@ func (c MLConfig) Validate() error {
 		return errors.New("ml.buy_prob and ml.sell_prob must be probabilities in 0..1")
 	}
 
-	if c.Enabled && c.SellProb >= c.BuyProb {
-		return fmt.Errorf("ml.sell_prob (%.2f) must be below ml.buy_prob (%.2f)",
-			c.SellProb, c.BuyProb)
+	// A negative or above-1 max_strength used to run silently as full
+	// strength, the AI2-4 defect on the ml side (ML3-7).
+	if c.MaxStrength < 0 || c.MaxStrength > 1 {
+		return fmt.Errorf("ml.max_strength must be in 0..1 (0 = the default, 1), got %v", c.MaxStrength)
+	}
+
+	// Compared as they will RUN: internal/ml replaces a 0 with the default.
+	// Comparing the raw values let buy 0.35 / sell 0 through — it runs as
+	// 0.35/0.42, crossed — and refused buy 0 / sell 0.5, which runs as a
+	// valid 0.58/0.5 (ML2-4).
+	buy, sell := c.EffectiveProbs()
+	if c.Enabled && sell >= buy {
+		return fmt.Errorf("ml.sell_prob (%.2f) must be below ml.buy_prob (%.2f), as they apply after defaults",
+			sell, buy)
+	}
+
+	return nil
+}
+
+// DefaultAIRefreshInterval is what a 0 ai.refresh_interval resolves to.
+const DefaultAIRefreshInterval = 15 * time.Minute
+
+// DefaultMLBuyProb and DefaultMLSellProb are what a 0 buy_prob / sell_prob
+// resolves to.
+const (
+	DefaultMLBuyProb  = 0.58
+	DefaultMLSellProb = 0.42
+)
+
+// EffectiveProbs returns the buy/sell thresholds as internal/ml applies them,
+// a non-positive value replaced by its default.
+func (c MLConfig) EffectiveProbs() (buy, sell float64) {
+	buy, sell = c.BuyProb, c.SellProb
+	if buy <= 0 {
+		buy = DefaultMLBuyProb
+	}
+
+	if sell <= 0 {
+		sell = DefaultMLSellProb
+	}
+
+	return buy, sell
+}
+
+// Validate rejects protection settings that cannot do what they say. Checked
+// only while protections are enabled — config.example.yaml stages every block
+// at its off value.
+//
+// The three limits are fractions: max_drawdown_pct: 20 (meant as 20%) loaded
+// cleanly and could never halt (PR2-5). And a guard that trips must lock for
+// a real time: a 0 lock (low_profit_lock's default) locks until "now", which
+// AllowEntry reads as already expired, while the guard's history is cleared
+// anyway — it fired and blocked nothing (PR2-4).
+//
+//nolint:cyclop // a flat list of independent range checks
+func (c ProtectionsConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+
+	for name, v := range map[string]float64{
+		"max_drawdown_pct":          c.MaxDrawdownPct,
+		"max_daily_loss_pct":        c.MaxDailyLossPct,
+		"max_realized_drawdown_pct": c.MaxRealizedDrawdownPct,
+	} {
+		if v < 0 || v >= 1 {
+			return fmt.Errorf("protections.%s must be a fraction in [0,1) (0.20 = 20%%; 0 disables it), got %v", name, v)
+		}
+	}
+
+	for name, d := range map[string]time.Duration{
+		"cooldown_after_loss": c.CooldownAfterLoss,
+		"stop_guard_lookback": c.StopGuardLookback,
+		"stop_guard_lock":     c.StopGuardLock,
+		"low_profit_lookback": c.LowProfitLookback,
+		"low_profit_lock":     c.LowProfitLock,
+	} {
+		if d < 0 {
+			return fmt.Errorf("protections.%s must be >= 0, got %v", name, d)
+		}
+	}
+
+	if c.StopGuardTrades > 0 && (c.StopGuardLock <= 0 || c.StopGuardLookback <= 0) {
+		return errors.New("protections.stop_guard_trades needs stop_guard_lookback and stop_guard_lock > 0 " +
+			"— with either at 0 the guard trips and locks nothing")
+	}
+
+	if c.LowProfitTrades > 0 && (c.LowProfitLock <= 0 || c.LowProfitLookback <= 0) {
+		return errors.New("protections.low_profit_trades needs low_profit_lookback and low_profit_lock > 0 " +
+			"— with either at 0 the guard trips and locks nothing")
 	}
 
 	return nil
@@ -578,7 +689,7 @@ type ScreenerConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 	// Universe is the candidate pool to screen. Empty means "screen the current
 	// watchlist" (filtering only, never adding).
-	Universe []string `json:"universe" yaml:"universe"`
+	Universe []string `json:"universe" yaml:"universe,flow"`
 	// Interval is how often the universe is re-screened. 0 defaults to 6h.
 	Interval time.Duration `json:"-" yaml:"interval"`
 	// MaxSymbols caps how many survivors are tracked (the best by Rank). 0 = all.
@@ -620,8 +731,8 @@ type ScreenerConfig struct {
 	// the strategy is never asked to trade something it cannot warm up on.
 	MinHistoryBars int `json:"min_history_bars" yaml:"min_history_bars"`
 	// MaxSpreadPct drops instruments whose estimated bid-ask spread exceeds this
-	// fraction of price (0.005 = 50 bps). The spread is paid twice per round
-	// trip and is invisible in a candle chart, so a symbol can look perfectly
+	// fraction of price (0.005 = 50 bps). Half the spread is paid on each leg
+	// of a round trip and it is invisible in a candle chart, so a symbol can look perfectly
 	// tradeable and still be unable to clear its own cost of entry. 0 = no bound.
 	MaxSpreadPct float64 `json:"max_spread_pct" yaml:"max_spread_pct"`
 	// KeepHeld controls only whether a symbol with an open position that no
@@ -662,7 +773,7 @@ type ScreenerConfig struct {
 	// be removed outright rather than disabled by finding the value that means
 	// "no bound", and a costly check can be ordered behind a cheap one that
 	// rejects most candidates first.
-	Filters []string `json:"filters" yaml:"filters"`
+	Filters []string `json:"filters" yaml:"filters,flow"`
 
 	// Resolution is the bar size candidates are judged on ("1", "5", "15",
 	// "60", "D"). Empty defaults to "1".
@@ -697,8 +808,10 @@ type ScreenerConfig struct {
 	// bounce; this is what refuses it. 0 = no bound.
 	MaxDrawdownPct float64 `json:"max_drawdown_pct" yaml:"max_drawdown_pct"`
 
-	// MinCostMultiple requires a candidate's typical bar range to be at least
-	// this many times its own round-trip cost (two spreads plus commission) —
+	// MinCostMultiple requires a candidate's typical close-to-close move (the
+	// median, unchanged bars included) to be at least this many times its own
+	// round-trip cost — one full spread (half per leg; the measured spread,
+	// floored at costs.spread_pct) plus slippage and commission on both legs —
 	// the "cost" filter. It is the question that decides whether an
 	// instrument can pay for being traded at all, and the one a small account
 	// gets wrong most expensively: an instrument that moves 0.1% a bar
@@ -856,6 +969,8 @@ func (c ScreenerConfig) Validate() error {
 // validateBounds checks one resolved set of screening bounds. Split out from
 // Validate so each per-class profile can be checked the same way after
 // inheritance — see validateProfiles.
+//
+//nolint:cyclop // a flat list of independent range checks
 func (c ScreenerConfig) validateBounds() error {
 	for name, v := range map[string]float64{
 		"min_price":          c.MinPrice,
@@ -898,6 +1013,17 @@ func (c ScreenerConfig) validateBounds() error {
 	} {
 		if v < 0 {
 			return fmt.Errorf("screener.%s must be >= 0, got %v", name, v)
+		}
+	}
+
+	// Fractions of price: 20 (meant as 20%) passes every candidate, so the
+	// filter never binds (CF2-8).
+	for name, v := range map[string]float64{
+		"max_spread_pct":   c.MaxSpreadPct,
+		"max_drawdown_pct": c.MaxDrawdownPct,
+	} {
+		if v >= 1 {
+			return fmt.Errorf("screener.%s is a fraction (0.30 = 30%%), got %v", name, v)
 		}
 	}
 
@@ -1165,7 +1291,7 @@ type NotifyConfig struct {
 	// Events selects what is sent: "trade" (fills), "blocked" (rejected
 	// orders), "halt" (circuit breakers and protections), "error" (upstream API
 	// failures). Empty means trade + halt + error.
-	Events []string `json:"events" yaml:"events"`
+	Events []string `json:"events" yaml:"events,flow"`
 	// Webhook is a URL that receives the raw event as a JSON POST — the escape
 	// hatch for anything not listed here (Slack, Mattermost, n8n, a script).
 	Webhook string `json:"webhook" yaml:"webhook"`
@@ -1220,6 +1346,20 @@ type NotifyConfig struct {
 // CODE_REVIEW_FINDINGS.md's "numerous sections have no range validation at
 // load".
 func (c NotifyConfig) Validate() error {
+	// A typo in events subscribes to nothing at all: notify matches each
+	// event's kind against this list and silently sends none (NT2-7). The
+	// kinds mirror internal/notify's Kind constants (that package imports
+	// this one, so they cannot be referenced directly).
+	if c.Enabled {
+		for _, ev := range c.Events {
+			switch strings.ToLower(strings.TrimSpace(ev)) {
+			case "trade", "blocked", "halt", "error", "audit":
+			default:
+				return fmt.Errorf("notify.events: unknown kind %q (known: trade, blocked, halt, error, audit)", ev)
+			}
+		}
+	}
+
 	if c.MinNotional < 0 {
 		return fmt.Errorf("notify.min_notional must be >= 0, got %v", c.MinNotional)
 	}
@@ -1275,7 +1415,9 @@ type AIConfig struct {
 	// to HOLD — the model's own uncertainty gate, applied before the strategy's
 	// min_strength.
 	MinConfidence float64 `json:"min_confidence" yaml:"min_confidence"`
-	// MaxStrength caps the strength the detector can contribute (0..1). Lower it
+	// MaxStrength caps the strength the detector can contribute (0..1; 0 means
+	// the default, 1 — to silence the advisor, leave "ai" out of the detector
+	// list). Lower it
 	// to let the LLM tilt a decision without being able to carry one alone.
 	MaxStrength float64 `json:"max_strength" yaml:"max_strength"`
 	// SystemPrompt replaces the built-in instruction prompt when non-empty. The
@@ -1326,6 +1468,37 @@ func (c CostsConfig) SpreadFor(measured float64) float64 {
 	}
 
 	return measured
+}
+
+// Validate rejects cost settings the money math cannot use. A negative cost
+// (a typo, or a rebate written as one) inflates every headroom figure, and
+// commission_pct at or above 1 drives the effective price risk.Manager divides
+// by to zero or below, where the cash_reserve clamp silently stops working
+// (RK2-6).
+func (c CostsConfig) Validate() error {
+	for name, v := range map[string]float64{
+		"commission_pct":  c.CommissionPct,
+		"commission_flat": c.CommissionFlat,
+		"commission_min":  c.CommissionMin,
+		"spread_pct":      c.SpreadPct,
+		"slippage_pct":    c.SlippagePct,
+	} {
+		if v < 0 {
+			return fmt.Errorf("costs.%s must be >= 0, got %v", name, v)
+		}
+	}
+
+	for name, v := range map[string]float64{
+		"commission_pct": c.CommissionPct,
+		"spread_pct":     c.SpreadPct,
+		"slippage_pct":   c.SlippagePct,
+	} {
+		if v >= 1 {
+			return fmt.Errorf("costs.%s is a fraction (0.001 = 0.1%%), got %v", name, v)
+		}
+	}
+
+	return nil
 }
 
 // FillPrice returns the price a market order of the given side actually fills
@@ -1434,7 +1607,7 @@ type ExitsConfig struct {
 	// clears successive profit thresholds, instead of holding all of it for one
 	// all-or-nothing exit. Each rung fires at most once per position, in order.
 	// Empty disables scaling out.
-	PartialTakeProfit []PartialExit `json:"partial_take_profit" yaml:"partial_take_profit"`
+	PartialTakeProfit []PartialExit `json:"partial_take_profit" yaml:"partial_take_profit,flow"`
 
 	// ROI is a time-decaying profit ladder, keyed by how long the position has
 	// been held: {"0s": 0.10, "30m": 0.05, "2h": 0.02, "6h": 0}. The bot takes
@@ -1686,7 +1859,16 @@ func (l Limits) Resolve(equity float64) Limits {
 // tighterCeiling picks the binding value of an absolute ceiling and a
 // fraction-of-equity one, where 0 means "not set" for either. Returns 0 when
 // neither is set, which every caller already reads as "no ceiling".
+//
+// A percentage-only ceiling with no usable equity resolves to the smallest
+// positive amount — a ceiling that admits nothing — not to 0, which every
+// caller reads as "no ceiling": the comment on Resolve always promised this,
+// and the code returned 0 (RK2-7).
 func tighterCeiling(abs, pct, equity float64) float64 {
+	if abs <= 0 && pct > 0 && equity <= 0 {
+		return math.SmallestNonzeroFloat64
+	}
+
 	var scaled float64
 
 	if pct > 0 && equity > 0 {
@@ -1755,10 +1937,10 @@ type StrategyConfig struct {
 	// Detectors lists which detectors to run for BUY decisions. Empty =>
 	// ema_cross, rsi, macd. Available: ema_cross, rsi, macd, bollinger, vwap,
 	// atr, rvol, volume_profile, trend, adx, stochastic, supertrend, donchian.
-	Detectors []string `json:"detectors" yaml:"detectors"`
+	Detectors []string `json:"detectors" yaml:"detectors,flow"`
 	// DetectorsSell is the detector set for SELL decisions; empty => same as
 	// Detectors. Lets you use different indicators to exit than to enter.
-	DetectorsSell []string `json:"detectors_sell" yaml:"detectors_sell"`
+	DetectorsSell []string `json:"detectors_sell" yaml:"detectors_sell,flow"`
 	// Combine merges detectors for BUY decisions: "majority", "unanimous" or
 	// "weighted".
 	Combine string `json:"combine" yaml:"combine"`
@@ -1874,7 +2056,8 @@ type StrategyConfig struct {
 	// false-breakout check. <=0 disables that check specifically.
 	DenyBreakoutPeriod int `json:"deny_breakout_period" yaml:"deny_breakout_period"`
 	// DenyBreakoutRVOLPeriod is the relative-volume lookback for the same
-	// check. <=0 falls back to RVOLPeriod.
+	// check. <=0 falls back to DenyBreakoutPeriod, as the detector and
+	// config.example.yaml do (this comment said RVOLPeriod — ST2-4).
 	DenyBreakoutRVOLPeriod int `json:"deny_breakout_rvol_period" yaml:"deny_breakout_rvol_period"`
 	// DenyBreakoutRVOLThreshold is the minimum relative volume a fresh high
 	// must show to be trusted as a real breakout; below it, the buy is
@@ -1900,7 +2083,7 @@ type StrategyConfig struct {
 	// HTFDetectors is the detector set evaluated on the higher timeframe. Empty
 	// falls back to a plain regression trend, which is usually what you want
 	// from a confirmation timeframe.
-	HTFDetectors []string `json:"htf_detectors" yaml:"htf_detectors"`
+	HTFDetectors []string `json:"htf_detectors" yaml:"htf_detectors,flow"`
 	// HTFMode selects how the higher timeframe is applied: "gate" (default)
 	// vetoes signals that oppose it; "vote" adds it to the detector tally like
 	// any other opinion.
@@ -1932,9 +2115,11 @@ type ExecutionConfig struct {
 	MarketFallback bool `yaml:"market_fallback"`
 
 	// SliceNotional splits an order larger than this into several child orders
-	// of at most this size, submitted MinOrderInterval apart (see safety), so a
-	// large order is worked into the book instead of taken in one clip. 0
-	// disables slicing.
+	// of at most this size, so a large order is worked into the book instead
+	// of taken in one clip. 0 disables slicing. The children are paced by
+	// safety.min_order_interval only on Saxo, whose adapter enforces it; on
+	// Alpaca, Trading 212 and the simulator they go out back-to-back — this
+	// comment said otherwise until CM3-6.
 	SliceNotional float64 `yaml:"slice_notional"`
 	// MaxSlices caps how many children one order may be split into, so a very
 	// large order cannot generate an unbounded stream of them. 0 defaults to 5.
@@ -2142,8 +2327,8 @@ func defaultML() MLConfig {
 		TrainBars:    1500,
 		RetrainEvery: 250,
 		MinSamples:   200,
-		BuyProb:      0.58,
-		SellProb:     0.42,
+		BuyProb:      DefaultMLBuyProb,
+		SellProb:     DefaultMLSellProb,
 		MinSkill:     0.02,
 		MaxStrength:  0.5,
 		Epochs:       300,
@@ -2235,45 +2420,94 @@ var ErrValidation = errors.New("config validation failed")
 // Default(), then applies environment-variable overrides. A missing file is not
 // an error — env vars alone are enough to run.
 func Load(path string) (Config, error) {
-	cfg := Default()
-
-	if path != "" {
-		data, err := os.ReadFile(path)
-		switch {
-		case err == nil:
-			// Two passes, because a profile has to be applied *under* the file
-			// that names it: read the profile first, seed the config with it,
-			// then layer the file on top so every explicit setting still wins.
-			var probe struct {
-				Profile string `yaml:"profile"`
-			}
-
-			if err := yaml.Unmarshal(data, &probe); err != nil {
-				return cfg, fmt.Errorf("parse config %s: %w", path, err)
-			}
-
-			if cfg, err = ApplyProfile(cfg, probe.Profile); err != nil {
-				return cfg, fmt.Errorf("config %s: %w", path, err)
-			}
-
-			if err := yaml.Unmarshal(data, &cfg); err != nil {
-				return cfg, fmt.Errorf("parse config %s: %w", path, err)
-			}
-
-			// Per-symbol overrides are resolved against the base *after* it is
-			// final, so each inherits the fully-merged strategy.
-			if cfg.SymbolStrategy, err = resolveSymbolStrategies(data, cfg.Strategy); err != nil {
-				return cfg, fmt.Errorf("config %s: %w", path, err)
-			}
-
-		case os.IsNotExist(err):
-			// fall through to env-only config
-		default:
-			return cfg, fmt.Errorf("read config %s: %w", path, err)
-		}
+	if path == "" {
+		return loadFrom(nil, false, "")
 	}
 
-	applyEnv(&cfg)
+	data, err := os.ReadFile(path)
+
+	switch {
+	case err == nil:
+		return loadFrom(data, true, path)
+	case os.IsNotExist(err):
+		return loadFrom(nil, false, path) // env-only config
+	default:
+		return Default(), fmt.Errorf("read config %s: %w", path, err)
+	}
+}
+
+// loadFrom is Load over bytes already read: data is the file's content when
+// fileRead, and path only names it in errors. Patch runs it over the bytes it
+// is about to write, so a save can never leave a file that does not load.
+//
+//nolint:cyclop // the documented load order — profile, file, overrides, env, validate — as one flow
+func loadFrom(data []byte, fileRead bool, path string) (Config, error) {
+	cfg := Default()
+
+	// BOT_PROFILE is applied in the profile pass, UNDER the file, exactly like
+	// the file's own profile: key — never after it. Applied in applyEnv it ran
+	// over the file and overwrote explicit settings (stop_loss_pct 0.02 came
+	// out 0.08 under BOT_PROFILE=aggressive), and stacked on top of the file's
+	// own profile (CF2-2). It names the profile when both are set, as env
+	// overrides do everywhere else. A misspelt one is an error, not ignored:
+	// it used to be dropped before Validate could ever see it (CF2-3).
+	envProfile := strings.TrimSpace(os.Getenv("BOT_PROFILE"))
+
+	if fileRead {
+		// Two passes, because a profile has to be applied *under* the file
+		// that names it: read the profile first, seed the config with it,
+		// then layer the file on top so every explicit setting still wins.
+		var probe struct {
+			Profile string `yaml:"profile"`
+		}
+
+		if err := yaml.Unmarshal(data, &probe); err != nil {
+			return cfg, fmt.Errorf("parse config %s: %w", path, err)
+		}
+
+		name := probe.Profile
+		if envProfile != "" {
+			name = envProfile
+		}
+
+		var err error
+
+		if cfg, err = ApplyProfile(cfg, name); err != nil {
+			return cfg, fmt.Errorf("config %s: %w", path, err)
+		}
+
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return cfg, fmt.Errorf("parse config %s: %w", path, err)
+		}
+
+		if envProfile != "" {
+			cfg.Profile = envProfile
+		}
+
+		// Per-symbol overrides are resolved against the base *after* it is
+		// final, so each inherits the fully-merged strategy.
+		if cfg.SymbolStrategy, err = resolveSymbolStrategies(data, cfg.Strategy); err != nil {
+			return cfg, fmt.Errorf("config %s: %w", path, err)
+		}
+	} else if envProfile != "" {
+		var err error
+
+		if cfg, err = ApplyProfile(cfg, envProfile); err != nil {
+			return cfg, fmt.Errorf("BOT_PROFILE: %w", err)
+		}
+
+		cfg.Profile = envProfile
+	}
+
+	if err := applyEnv(&cfg); err != nil {
+		return cfg, err
+	}
+
+	// The file's watchlist in canonical form, as BOT_WATCHLIST already was:
+	// `watchlist: [aapl]` became a second tracked symbol beside the screener's
+	// AAPL — pinned under the wrong key, with its own openPos and pendingSell,
+	// two decision loops over one holding (CM3-2).
+	cfg.Watchlist = normalizeWatchlist(cfg.Watchlist)
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("%w: %w", ErrValidation, err)
@@ -2336,9 +2570,7 @@ func EnvSourced(section, path string) bool {
 // applyEnv layers environment-variable overrides onto the config.
 //
 //nolint:cyclop // one guarded assignment per env var; inherently branchy
-func applyEnv(cfg *Config) {
-	applyProfileEnv(cfg) // first, so every other override wins over the profile
-
+func applyEnv(cfg *Config) error {
 	if v := os.Getenv("FINNHUB_API_KEY"); v != "" {
 		cfg.Finnhub.APIKey = v
 	}
@@ -2355,10 +2587,10 @@ func applyEnv(cfg *Config) {
 		cfg.Alpaca.BaseURL = v
 	}
 
-	if v := os.Getenv("ALPACA_USE_SIM"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.Alpaca.UseSim = b
-		}
+	if b, set, err := envBool("ALPACA_USE_SIM"); err != nil {
+		return err
+	} else if set {
+		cfg.Alpaca.UseSim = b
 	}
 
 	if v := os.Getenv("BOT_BROKER"); v != "" {
@@ -2405,18 +2637,30 @@ func applyEnv(cfg *Config) {
 		cfg.Storage.Path = v
 	}
 
-	if v := os.Getenv("BOT_TRADING_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.Engine.TradingEnabled = b
-		}
+	// Every env override of a section the UI saves is marked env-sourced,
+	// not only the secrets: unmarked, the next save of the engine section
+	// wrote BOT_TRADING_ENABLED's value into the file as if the operator had
+	// — the kill switch moved from env to file, and removing the variable no
+	// longer turned trading off (CF3-1).
+	resetEnvSecretPaths("engine")
+
+	if b, set, err := envBool("BOT_TRADING_ENABLED"); err != nil {
+		return err
+	} else if set {
+		cfg.Engine.TradingEnabled = b
+
+		markEnvSecret("engine", "trading_enabled")
 	}
 
-	applyAIEnv(cfg)
+	if err := applyAIEnv(cfg); err != nil {
+		return err
+	}
+
 	applyNotifyEnv(cfg)
 
 	v := os.Getenv("BOT_WATCHLIST")
 	if v == "" {
-		return
+		return nil
 	}
 
 	var syms []string
@@ -2430,52 +2674,75 @@ func applyEnv(cfg *Config) {
 	if len(syms) > 0 {
 		cfg.Watchlist = syms
 	}
+
+	return nil
+}
+
+// envBool reads a boolean environment variable: set reports whether it is
+// present. on/off and yes/no are accepted alongside strconv's spellings, and
+// anything else is an error. It used to be dropped in silence:
+// BOT_TRADING_ENABLED=off over a file with trading_enabled: true left trading
+// ON — the kill switch failing open (CF2-4).
+func envBool(name string) (val, set bool, err error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return false, false, nil
+	}
+
+	switch strings.ToLower(v) {
+	case "on", "yes", "y":
+		return true, true, nil
+	case "off", "no", "n":
+		return false, true, nil
+	}
+
+	b, perr := strconv.ParseBool(v)
+	if perr != nil {
+		return false, false, fmt.Errorf("%s=%q is not a boolean (use true/false, on/off or yes/no)", name, v)
+	}
+
+	return b, true, nil
 }
 
 // applyAIEnv layers the BOT_AI_* overrides onto the AI advisor settings, so a
 // container can point the bot at an Ollama host without editing config.yaml.
-func applyAIEnv(cfg *Config) {
+func applyAIEnv(cfg *Config) error {
 	resetEnvSecretPaths("ai")
 
-	if v := os.Getenv("BOT_AI_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.AI.Enabled = b
-		}
+	// Marked like the API key: an AI save otherwise wrote a temporary
+	// BOT_AI_BASE_URL into the file's base_url (CF3-1).
+	if b, set, err := envBool("BOT_AI_ENABLED"); err != nil {
+		return err
+	} else if set {
+		cfg.AI.Enabled = b
+
+		markEnvSecret("ai", "enabled")
 	}
 
 	if v := os.Getenv("BOT_AI_PROVIDER"); v != "" {
 		cfg.AI.Provider = v
+
+		markEnvSecret("ai", "provider")
 	}
 
 	if v := os.Getenv("BOT_AI_BASE_URL"); v != "" {
 		cfg.AI.BaseURL = v
+
+		markEnvSecret("ai", "base_url")
 	}
 
 	if v := os.Getenv("BOT_AI_MODEL"); v != "" {
 		cfg.AI.Model = v
+
+		markEnvSecret("ai", "model")
 	}
 
 	if v := os.Getenv("BOT_AI_API_KEY"); v != "" {
 		cfg.AI.APIKey = v
 		markEnvSecret("ai", "api_key")
 	}
-}
 
-// applyProfileEnv lets BOT_PROFILE select a profile when there is no config
-// file at all. It is applied before the other env overrides so those still win.
-func applyProfileEnv(cfg *Config) {
-	v := strings.TrimSpace(os.Getenv("BOT_PROFILE"))
-	if v == "" {
-		return
-	}
-
-	out, err := ApplyProfile(*cfg, v)
-	if err != nil {
-		return // an unknown BOT_PROFILE is ignored; Validate reports it
-	}
-
-	out.Profile = v
-	*cfg = out
+	return nil
 }
 
 // applyNotifyEnv layers the BOT_NOTIFY_* overrides, so webhook URLs and bot
@@ -2540,6 +2807,34 @@ func applyNotifyEnv(cfg *Config) {
 	}
 }
 
+// validateAlpacaSwitches refuses alpaca.paper where it promised a safety it
+// did not deliver (CM3-6): it was read by nothing but the startup log line,
+// so with the live base_url and paper: true the log said paper=true while
+// real orders went out. paper: true now has to agree with the endpoint.
+//
+// alpaca.use_sim ("no Alpaca calls"), ignored once broker: alpaca is set
+// explicitly, is NOT refused here: Default() sets it true, so a refusal
+// fired on every broker: alpaca file that never wrote it. cmd/bot warns
+// instead (AlpacaUseSimIgnored).
+func (c Config) validateAlpacaSwitches() error {
+	if c.BrokerProvider() != "alpaca" {
+		return nil
+	}
+
+	if c.Alpaca.Paper && !strings.Contains(strings.ToLower(c.Alpaca.BaseURL), "paper") {
+		return fmt.Errorf("alpaca.paper is true but base_url %q is not the paper endpoint "+
+			"(https://paper-api.alpaca.markets) — orders would be live", c.Alpaca.BaseURL)
+	}
+
+	return nil
+}
+
+// AlpacaUseSimIgnored reports whether alpaca.use_sim is set but has no
+// effect, because broker: alpaca is named explicitly (CM3-6).
+func (c Config) AlpacaUseSimIgnored() bool {
+	return c.Alpaca.UseSim && strings.EqualFold(strings.TrimSpace(c.Broker), "alpaca")
+}
+
 // BrokerProvider returns the effective execution venue: "sim", "alpaca" or
 // "saxo". An explicit broker setting wins; otherwise it is derived from the
 // legacy Alpaca settings for backward compatibility.
@@ -2595,8 +2890,12 @@ func (l Limits) ValidateForTrading() error {
 
 // Validate checks invariants that must hold for safe operation.
 //
-//nolint:cyclop // a flat list of independent sanity checks
+//nolint:cyclop,funlen // a flat list of independent sanity checks
 func (c Config) Validate() error {
+	if err := c.validateAlpacaSwitches(); err != nil {
+		return err
+	}
+
 	// Fail closed: refuse to run with trading enabled but no money ceilings.
 	if c.Engine.TradingEnabled {
 		if err := c.Limits.ValidateForTrading(); err != nil {
@@ -2639,12 +2938,8 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.Strategy.FastMA >= c.Strategy.SlowMA {
-		return fmt.Errorf(
-			"strategy.fast_ma (%d) must be < slow_ma (%d)",
-			c.Strategy.FastMA,
-			c.Strategy.SlowMA,
-		)
+	if err := ValidateStrategyRules(c.Strategy, "strategy"); err != nil {
+		return err
 	}
 
 	if c.Engine.EvalInterval <= 0 {
@@ -2692,6 +2987,14 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if err := c.Costs.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Protections.Validate(); err != nil {
+		return err
+	}
+
 	if err := c.ML.Validate(); err != nil {
 		return err
 	}
@@ -2714,21 +3017,30 @@ func (c Config) Validate() error {
 // per-class counts stand on their own and nothing is being carved out of
 // anything.
 func (c Config) validatePositionSlots() error {
-	if !c.Portfolio.Enabled || c.Engine.MinPositions <= 0 {
+	return ValidatePositionSlots(c.Portfolio, c.Engine.MinPositions)
+}
+
+// ValidatePositionSlots is the cross-section slot rule on its own, for the
+// API: a portfolio or sizing save that broke it was applied LIVE and only the
+// file write refused ("applied, but not saved") — the engine ran a split the
+// loader calls impossible, unnamed classes lost their slot bound, and a
+// restart quietly undid the change (AP3-5). The handlers check it first.
+func ValidatePositionSlots(port PortfolioConfig, minPositions int) error {
+	if !port.Enabled || minPositions <= 0 {
 		return nil
 	}
 
 	var total int
-	for _, n := range c.Portfolio.NormalizedAssetClassSlots() {
+	for _, n := range port.NormalizedAssetClassSlots() {
 		total += n
 	}
 
-	if total > c.Engine.MinPositions {
+	if total > minPositions {
 		return fmt.Errorf(
 			"portfolio.min_positions_per_asset_class claims %d positions between its classes, "+
 				"more than engine.min_positions (%d): the per-class counts come out of the "+
 				"global one, so they cannot exceed it",
-			total, c.Engine.MinPositions)
+			total, minPositions)
 	}
 
 	return nil
@@ -2744,6 +3056,8 @@ func (c Config) validatePositionSlots() error {
 // stop_loss_pct: 2 (meant as "2%") loads clean today and runs every position
 // with no stop loss at all. See CODE_REVIEW_FINDINGS.md's stop_loss_pct
 // finding.
+//
+//nolint:cyclop // a flat list of independent range checks
 func (e ExitsConfig) Validate() error {
 	for name, pct := range map[string]float64{
 		"stop_loss_pct":      e.StopLossPct,
@@ -2772,6 +3086,25 @@ func (e ExitsConfig) Validate() error {
 	// CODE_REVIEW_FINDINGS.md's "negative ROI-ladder values produce a
 	// take-profit that exits at a loss".
 	for key, roi := range e.ROI {
+		// Keys are Go durations. A freqtrade-style minute key ("30") loaded
+		// cleanly and exits.roiThreshold skipped it in silence, so a 10%
+		// target meant to decay never did (EX2-6).
+		if d, err := time.ParseDuration(strings.TrimSpace(key)); err != nil || d < 0 {
+			return fmt.Errorf(
+				"exits.roi key %q is not a duration — write \"30m\", \"2h\", \"0s\" (a bare number has no unit)",
+				key)
+		}
+
+		// "1.5h" is a valid duration, but the settings patcher addresses a
+		// leaf by a dotted path, so roi.1.5h resolved as roi → 1 → 5h: the
+		// rung could not be changed or removed, and every later exits save
+		// failed "applied, but not saved" — reverting at restart (CF3-5).
+		// The same duration has a dot-free spelling.
+		if strings.Contains(key, ".") {
+			return fmt.Errorf("exits.roi key %q contains a dot, which the settings form cannot save — "+
+				"write it without one (\"90m\" for \"1.5h\")", key)
+		}
+
 		if roi < 0 {
 			return fmt.Errorf(
 				"exits.roi[%q] must be >= 0, got %v — a negative ROI target would exit at a "+
@@ -2842,6 +3175,21 @@ func (a AIConfig) Validate() error {
 		return nil
 	}
 
+	// A verdict expires after max_age and is refreshed every
+	// refresh_interval: with max_age the shorter, every symbol votes HOLD for
+	// the gap in each cycle — 15m refresh, 10m max_age, HOLD for 5 minutes of
+	// every 15 — silently (AI3-4).
+	// Compared as it runs: a refresh_interval of 0 is the default 15m.
+	refresh := a.RefreshInterval
+	if refresh <= 0 {
+		refresh = DefaultAIRefreshInterval
+	}
+
+	if a.MaxAge > 0 && a.MaxAge < refresh {
+		return fmt.Errorf("ai.max_age (%s) is shorter than ai.refresh_interval (%s): every verdict "+
+			"would expire before the next one arrives, leaving a HOLD gap each cycle", a.MaxAge, refresh)
+	}
+
 	switch strings.ToLower(strings.TrimSpace(a.Provider)) {
 	case "ollama", "openai", "":
 	default:
@@ -2856,5 +3204,37 @@ func (a AIConfig) Validate() error {
 		return errors.New("ai.base_url is required when ai.enabled is true")
 	}
 
+	// Both are fractions. min_confidence 15 (meant as percent) silently turned
+	// every verdict into HOLD (AI2-3); a negative or above-1 max_strength was
+	// silently replaced by full strength (AI2-4). 0 keeps meaning "the
+	// default, 1" — see MaxStrength — so it is not an error.
+	if a.MinConfidence < 0 || a.MinConfidence > 1 {
+		return fmt.Errorf("ai.min_confidence must be a fraction in 0..1, got %v", a.MinConfidence)
+	}
+
+	if a.MaxStrength < 0 || a.MaxStrength > 1 {
+		return fmt.Errorf("ai.max_strength must be in 0..1 (0 = the default, 1), got %v", a.MaxStrength)
+	}
+
 	return nil
+}
+
+// normalizeWatchlist upper-cases and trims every entry, dropping blanks and
+// duplicates and keeping first-seen order.
+func normalizeWatchlist(in []string) []string {
+	if in == nil {
+		return nil
+	}
+
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+
+	for _, s := range in {
+		if s = strings.ToUpper(strings.TrimSpace(s)); s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+
+	return out
 }

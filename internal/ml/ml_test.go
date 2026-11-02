@@ -513,3 +513,29 @@ func contains(haystack, needle string) bool {
 
 	return false
 }
+
+// TestDecideReadsTheThresholdsAgainstThePositiveRate is the regression for
+// ML2-2. The label is one-sided (1 = rose by at least threshold, 0 = anything
+// else, flat included), so p(up) for a calibrated model sits near the
+// window's positive rate — about 0.06 with the shipped 0.005 threshold. Read
+// against the absolute 0.42 sell line that was SELL on almost every bar: on a
+// random walk, all 3,301 verdicts. "Unlikely to rally" is not "will fall".
+func TestDecideReadsTheThresholdsAgainstThePositiveRate(t *testing.T) {
+	t.Parallel()
+
+	p := New(mlCfg(), ai.Params{})
+	m := &Model{Samples: 1000, Positives: 64} // positive rate 0.064
+
+	if v := p.decide(0.07, m); v.Action != Hold {
+		t.Errorf("p(up)=0.07 at a 0.064 base rate voted %v, want HOLD — it is the base rate, not a fall", v.Action)
+	}
+
+	if v := p.decide(0.30, m); v.Action != Buy {
+		t.Errorf("p(up)=0.30, nearly 5x the base rate, voted %v, want BUY", v.Action)
+	}
+
+	balanced := &Model{Samples: 1000, Positives: 500}
+	if v := p.decide(0.30, balanced); v.Action != Sell {
+		t.Errorf("p(up)=0.30 on a balanced label voted %v, want SELL (the old reading, unchanged)", v.Action)
+	}
+}

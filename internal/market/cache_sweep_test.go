@@ -112,3 +112,28 @@ func TestCachingHistorySweepsStaleEntries(t *testing.T) {
 		t.Errorf("entries after the sweep = %d, want 1 (only MSFT, just fetched)", after)
 	}
 }
+
+// TestCachingHistoryHitsForARollingNowWindow is the regression for MK2-1. The
+// "to must be covered" check meant a window ending at time.Now() — what every
+// real caller asks for — could never hit: a later call's `to` is always past
+// the cached one. Five rolling calls inside the 15 s TTL made five upstream
+// fetches. An entry younger than the TTL may serve a `to` up to TTL past its
+// own, which is the staleness the TTL already accepts.
+func TestCachingHistoryHitsForARollingNowWindow(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	src := &countingFetcher{candles: minuteCandles(60, start)}
+	c := NewCachingHistory(src, 15*time.Second)
+
+	for range 5 {
+		now := time.Now()
+		if _, err := c.Candles(context.Background(), "AAPL", Res1Min, now.Add(-30*time.Minute), now); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt64(&src.calls); got != 1 {
+		t.Errorf("5 rolling now-windows inside the TTL made %d upstream calls, want 1", got)
+	}
+}

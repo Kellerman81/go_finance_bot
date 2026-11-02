@@ -49,8 +49,9 @@ func TestLegitimateJSONWriteStillWorks(t *testing.T) {
 }
 
 // TestBodylessWriteStillWorks checks an endpoint with no request body (e.g.
-// POST /api/screener/rescreen) is unaffected — there's no Content-Type to
-// check and nothing a form/text CSRF payload could carry anyway.
+// POST /api/screener/rescreen) still works for a script or the bot's own UI.
+// "Nothing a CSRF payload could carry" was wrong for a browser, though — see
+// TestACrossSiteBodylessPostIsRefused.
 func TestBodylessWriteStillWorks(t *testing.T) {
 	s := newTestServer(t)
 
@@ -60,5 +61,58 @@ func TestBodylessWriteStillWorks(t *testing.T) {
 
 	if rec.Code == http.StatusUnsupportedMediaType {
 		t.Errorf("a bodyless request was rejected for its (absent) Content-Type: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// AP3-1: a bodyless POST passed blockSimpleCrossOriginWrites, and /api had no
+// Origin check, so with auth off (the default) any web page could
+// fetch(url, {method: "POST", mode: "no-cors"}) and start test mode — every
+// real stop then filled in the simulator for 48 h — clear a drawdown halt and
+// switch trading on, or start autotune.
+func TestACrossSiteBodylessPostIsRefused(t *testing.T) {
+	s := newTestServer(t)
+
+	for _, path := range []string{"/api/testmode/start", "/api/protections/resume", "/api/autotune/run"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("Origin", "https://evil.example")
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("cross-site POST %s: status %d, want 403", path, rec.Code)
+		}
+	}
+
+	if s.eng.TestModeStatus().Active {
+		t.Error("a cross-site request started test mode")
+	}
+}
+
+// AP3-1's GET half: /v2/f/symbolOptimize runs an optimizer search holding the
+// shared autotune slot, and an <img> on any page could request it. Fragments
+// are loaded only by the UI's own same-origin fetches.
+func TestACrossSiteFragmentLoadIsRefused(t *testing.T) {
+	s := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/f/symbolOptimize?symbol=AAPL", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("cross-site fragment GET: status %d, want 403", rec.Code)
+	}
+
+	same := httptest.NewRequest(http.MethodGet, "/v2/f/activity", nil)
+	same.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	rec = httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, same)
+
+	if rec.Code == http.StatusForbidden {
+		t.Error("the UI's own same-origin fragment load was refused")
 	}
 }

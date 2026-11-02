@@ -227,3 +227,39 @@ func TestCheckScaleInRefreshesTheSnapshotBetweenAdds(t *testing.T) {
 			"snapshot that doesn't know about AAA's add yet", got)
 	}
 }
+
+// TestReconcilingAnUnconfirmedBuyReleasesItsReservation guards the
+// reservation an unconfirmed buy holds. It stays reserved while the outcome is
+// unknown (fail closed), but it was never released at all — and once
+// reservations counted against max_total_invested (LR2 RK2-2), an unconfirmed
+// buy that DID fill was counted twice, in the snapshot and as reserved, until
+// a restart. Reconciling the order by hand must release it.
+func TestReconcilingAnUnconfirmedBuyReleasesItsReservation(t *testing.T) {
+	e := ledgerEngine(t) // asyncBroker: accepts, never confirms
+	e.rm = risk.New(config.Limits{
+		MaxOrderValue: 1e9, MaxPerPosition: 1e9, MaxTotalInvested: 1000,
+		MaxDailySpend: 1e9, MaxOpenPositions: 10,
+	}, config.CostsConfig{})
+	e.pf.SetCash(100000)
+	e.prices.Set("Y", 100)
+
+	if _, err := e.ManualOrder(context.Background(), "Y", broker.Buy, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	u := e.Unconfirmed()
+	if len(u) != 1 {
+		t.Fatalf("unconfirmed = %+v, want the one buy", u)
+	}
+
+	probe := broker.Order{Symbol: "Z", Side: broker.Buy, Qty: 5}
+	if _, d := e.rm.Authorize(probe, 100, e.pf.Snapshot()); d.Approved {
+		t.Fatal("the unconfirmed buy's reservation did not hold headroom; the scenario did not set up")
+	}
+
+	e.ClearUnconfirmed(u[0].OrderID)
+
+	if _, d := e.rm.Authorize(probe, 100, e.pf.Snapshot()); !d.Approved {
+		t.Errorf("after reconciling the order by hand its reservation still blocks buys: %s", d.Reason)
+	}
+}

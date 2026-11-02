@@ -434,3 +434,30 @@ func TestTrendGateBuySideUnaffectedBySellOverride(t *testing.T) {
 			"trendFilter regardless of a configured sell-side override", got)
 	}
 }
+
+// TestTrendDetectorReadsAConvexRallyAsUp is the regression for ST2-2. The
+// singularity fix compared |intercept| with 1% of the price, which lets a
+// fitted intercept far BELOW zero through as the denominator — and dividing by
+// a negative base flips the sign of the move. A long flat stretch followed by
+// a steep ramp (the shape of a penny, biotech or meme-stock breakout) fits a
+// line starting well below zero: 80 bars at 1, then a ramp to 21, read
+// "SELL -471%", and the default trend gate blocked the BUY.
+func TestTrendDetectorReadsAConvexRallyAsUp(t *testing.T) {
+	t.Parallel()
+
+	closes := make([]float64, 0, 100)
+	for range 80 {
+		closes = append(closes, 1)
+	}
+
+	for i := 1; i <= 20; i++ {
+		closes = append(closes, 1+float64(i))
+	}
+
+	d := newTrendDetectorParams(len(closes), 0.01)
+
+	action, _, reason := d.Detect(toSeries(closesToCandles(closes)))
+	if action != Buy {
+		t.Errorf("a rally from 1 to 21 read %v (%s), want BUY", action, reason)
+	}
+}

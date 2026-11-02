@@ -101,12 +101,7 @@ func SupertrendLast(
 			finalLower = basicLower
 		}
 
-		switch {
-		case closes[i] > finalUpper:
-			dir = 1
-		case closes[i] < finalLower:
-			dir = -1
-		}
+		dir = supertrendFlip(dir, closes[i], finalUpper, finalLower)
 	}
 
 	switch {
@@ -119,4 +114,38 @@ func SupertrendLast(
 		// signal, not a default up-trend one.
 		return 0, 0, false
 	}
+}
+
+// supertrendFlip is the textbook Supertrend state transition: an up-trend
+// ends only on a close below the lower band, a down-trend only on a close
+// above the upper one, and an undefined direction takes whichever band is
+// crossed.
+//
+// Testing "above the upper band" first regardless of direction disagreed with
+// that once the bands had crossed (after a very wide bar): a close between
+// them kept an up-trend whose support band sat ABOVE the price, which the
+// detector reported as a full-strength BUY. 81/55/20 of 110,929 bars at
+// multipliers 0.5/1/1.5 — the last in the optimizer's grid (IN2-1).
+func supertrendFlip(dir int, closeNow, finalUpper, finalLower float64) int {
+	switch dir {
+	case 1:
+		if closeNow < finalLower {
+			return -1
+		}
+
+	case -1:
+		if closeNow > finalUpper {
+			return 1
+		}
+
+	default:
+		switch {
+		case closeNow > finalUpper:
+			return 1
+		case closeNow < finalLower:
+			return -1
+		}
+	}
+
+	return dir
 }

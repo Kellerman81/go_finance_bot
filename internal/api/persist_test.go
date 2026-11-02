@@ -336,7 +336,7 @@ func TestSizingWritesIntoTheEngineBlock(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	s := newTestServer(t)
+	s := newTestServerFrom(t, nil, config.Default())
 	s.SetConfigPath(path)
 
 	rec := postForm(t, s, "/v2/form/sizing", url.Values{

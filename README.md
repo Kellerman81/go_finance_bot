@@ -194,7 +194,7 @@ the rest of the bot is unchanged:
 | `broker` | Venue | Setup |
 |----------|-------|-------|
 | `sim` | offline simulator | nothing — uses `alpaca.sim_cash` as starting balance |
-| `alpaca` | Alpaca (US) | set `alpaca.key_id`/`secret_key`, `base_url` (paper endpoint by default) |
+| `alpaca` | Alpaca (US) | set `alpaca.key_id`/`secret_key`, `base_url` (paper endpoint by default). `paper: true` must agree with `base_url` — over the live endpoint it is refused at load, since it was only ever a log label; `use_sim` has no effect with `broker: alpaca` (the bot calls Alpaca), and startup says so in the log and diagnostics — use `broker: sim` for the simulator |
 | `saxo` | **Saxo Bank OpenAPI (EU)** | set `saxo.token` (or `SAXO_TOKEN`); `base_url` defaults to the simulation gateway |
 | `trading212` | **Trading 212 (EU)** | set `trading212.api_key` + `trading212.secret` (or `T212_API_KEY`/`T212_SECRET`); `base_url` defaults to the demo endpoint |
 
@@ -232,6 +232,13 @@ the rest of the bot is unchanged:
    Check what your watchlist can trade with `GET /api/orderable`. Note EU retail
    accounts can't buy US-domiciled ETFs (e.g. `SPY`, `VOO`) on Trading 212 — they
    show as not orderable regardless.
+
+   Listings quoted in a minor unit — London's pence (`GBX`/`GBp`), Johannesburg's
+   cents (`ZAc`), Tel Aviv's agorot (`ILA`) — are converted through their major
+   currency: 72p is 0.72 GBP. They used to be valued as if a penny were a pound,
+   which inflated equity and every percentage limit a hundredfold. A rate that
+   cannot be fetched is retried after two minutes, not on every sync, and is
+   reported once per outage.
 
 > Trading 212's API has **no market-data stream** and is heavily rate-limited, so
 > keep Finnhub for near-real-time tracking and use Trading 212 only for execution.
@@ -364,9 +371,34 @@ Two safeguards worth knowing:
   multi-line value such as `ai.system_prompt` from being quietly reflowed.
 - **A failed save never reverts the live change.** The bot keeps running the new
   value and the UI reports "applied, but not saved" — telling you plainly rather
-  than leaving you to discover it at the next restart.
+  than leaving you to discover it at the next restart. A rule that spans
+  sections — per-class slots against `min_positions`, money ceilings against
+  the file's `trading_enabled` — is checked **before** the change is applied,
+  and a save that breaks it is refused outright, so the running bot never
+  holds a combination the loader would reject.
+- **Only what you changed is written.** A save compares each value with what
+  the file already loads to — your file over the defaults and the active
+  `profile:` — so a value the profile supplies is not copied into the file and
+  keeps following the profile, and a later change to a default still reaches
+  you.
+- **A section written with a YAML alias or merge key (`<<: *base`) cannot be
+  saved from the UI**, and the save says so: editing through it would change
+  every other user of the anchor. Write that section out in full.
+- **The portfolio form's `sectors` and `asset_classes` maps** are written as
+  whole blocks (symbol keys such as `SAP.DE` contain dots, which the leaf
+  editor cannot address), only when they changed; comments inside those two
+  blocks are not kept.
 
 Run with `--config <path>` and that is the file that gets edited.
+
+**Environment overrides** (`BOT_TRADING_ENABLED`, `BOT_BROKER`, the broker and
+notifier credentials, …) win over the file. A boolean one accepts
+`true`/`false`, `on`/`off` and `yes`/`no`; anything else stops the bot at
+startup rather than being ignored — `BOT_TRADING_ENABLED=off` used to leave
+trading on. **A settings save never writes an env-supplied value into the
+file** — not the secrets, and not `BOT_TRADING_ENABLED` or the `BOT_AI_*`
+switches either: before, one save moved the kill switch from the environment
+into the file, and removing the variable no longer turned trading off.
 
 ## Profiles
 
@@ -380,8 +412,11 @@ profile: conservative   # conservative | balanced | aggressive
 ```
 
 It seeds strategy, exits, sizing and protections before the rest of your file is
-applied, so anything you set explicitly still wins. `BOT_PROFILE` does the same
-thing without a config file. A profile is a starting point to tune from — not a
+applied, so anything you set explicitly still wins. `BOT_PROFILE` selects the
+profile the same way — with or without a config file, and in place of the
+file's own `profile:` when both are set — and is applied under the file too, so
+it never overrides a setting the file spells out. An unknown name is an error at
+startup. A profile is a starting point to tune from — not a
 recommendation, and never a substitute for backtesting your own data.
 
 ## Web server and API access
@@ -395,7 +430,14 @@ server:
 `addr` is what the gin HTTP server binds. `:8080` listens on every interface —
 fine behind Docker on a private network, **not** fine on a machine reachable
 from the internet. Bind `127.0.0.1:8080` and put a reverse proxy in front if
-the host is exposed.
+the host is exposed. The proxy must **forward the `Host` header**
+(`proxy_set_header Host $host;` in nginx): the `/v2` settings forms **and every
+`/api` write** refuse a browser request whose `Origin` (or `Sec-Fetch-Site`)
+names another site, as do the `/v2` fragment loads — which is what stops
+another web page from posting to the bot. With auth off (the default) a
+bodyless cross-site POST could otherwise start test mode, clear a halt and
+switch trading back on, or start an autotune pass. A proxy that rewrites
+`Host` makes every save look cross-site.
 
 `auth_token` is a single shared bearer token, compared in constant time. It is
 accepted either as `Authorization: Bearer <token>` or as a `?token=` query
@@ -455,7 +497,20 @@ filled a real order would be worse than shipping none. Execution stays on the
 audited broker adapters.
 
 Crypto trades continuously, so the market-hours gate is a no-op for these
-symbols and warmup history is always available.
+symbols and warmup history is always available. A pair is recognised as crypto
+once the Binance feed has priced it, whatever its quote currency (`BTCBRL`,
+`ETHJPY` …), so it never inherits the US equity session — exits included.
+
+Two limits worth knowing:
+
+- **One symbol Binance does not list** (a typo, a delisted pair, a stock the
+  screener added) no longer stops every other symbol's ticks: Binance rejects a
+  batched request whole, so the feed then prices each symbol on its own, sets
+  the refused one aside and says so once in the diagnostics.
+- **History is paged**, 1000 klines per request, up to 30 pages (about 20 days
+  of one-minute bars, a month of 15-minute ones). A wider window keeps its
+  newest part and says so once, rather than silently returning only the last
+  1000 bars — a 30-day one-minute screen used to judge BTCUSDT on under a day.
 
 ## Bars
 
@@ -579,9 +634,23 @@ screener:
 
 **Symbols you hold are never dropped**, whatever the filters say — removing one
 would strand the position with no exits, no trailing stop and no way to sell it.
-The screener decides what may be *entered*, not what may be forgotten. The last
-pass, including the reason each candidate was rejected, is at `GET /api/screener`,
-and `POST /api/screener/rescreen` runs one immediately.
+"Hold" here includes a buy whose fill is not yet confirmed, a limit order still
+resting and a broker holding the bot has not adopted yet — and a held symbol
+that is missing from the watchlist is added back on the next pass, whatever
+`keep_held` says (`keep_held` only changes how its verdict reads). The screener
+decides what may be *entered*, not what may be forgotten. The last pass,
+including the reason each candidate was rejected, is at `GET /api/screener`, and
+`POST /api/screener/rescreen` runs one immediately (409 while a pass is already
+running). A pass runs off the evaluation loop, so even a long one — probe
+backtests and searches included — never delays a stop.
+
+**A candidate is judged on the bars it asked for.** When the history source can
+only serve coarser bars than the profile's `resolution` (Yahoo falls back to
+hourly or daily for an illiquid listing), the candidate is refused as "too few
+bars at resolution …", naming what was served. Judged as the requested
+resolution, the substitute bars flattered exactly the thin listings the screener
+exists to keep out: four times the volume per bar and a bar count that cleared
+`min_history_bars`.
 
 ### Keeping your own picks (`keep_manual`)
 
@@ -625,7 +694,8 @@ reports a bid-ask spread, so it is estimated from the bars themselves using the
 Corwin–Schultz (2012) high-low estimator: a bar's range mixes volatility, which
 grows with the square root of time, and the spread, which does not, so comparing
 one bar's range with the range over two bars isolates the spread. It matters
-because the spread is paid twice per round trip and is invisible on a chart — an
+because the spread is paid on both legs of a round trip — half on the way in,
+half on the way out, one full spread in all — and is invisible on a chart — an
 instrument can look perfectly tradeable and still be unable to clear its own cost
 of entry. The estimate is reported per candidate as `spread_pct` in
 `GET /api/screener`, and feeds `costs.measure_spread` (see **Trading costs**).
@@ -642,6 +712,13 @@ So every setting above can be overridden per asset class, and each profile
 `strategy_overrides` gives, so setting one value cannot silently zero the rest.
 Candidates are classified by the same pipeline the portfolio allocation caps
 use, so a symbol screened as an ETF is the same ETF to both.
+
+Class keys are matched the way the classifier names classes, aliases
+included: a profile, a `universe_by_asset_class` entry, a
+`max_pct_per_asset_class` / `min_positions_per_asset_class` key and a
+hand-written `asset_classes:` label written `ETF`, `ETFs`, `stocks` or
+`equity` all mean `etf` or `stock`. Matched literally, a key the classifier
+never emits configured nothing and loaded without complaint.
 
 ```yaml
 screener:
@@ -671,6 +748,16 @@ screener:
 shared cap the classes compete on a single metric: ranked on volume, a megacap
 beats every ETF, and "8 ETFs and 15 stocks" quietly becomes "23 stocks".
 
+**`lookback_days` is the window judged, within what the data source serves.**
+Yahoo limits intraday history by bar size: 1-minute bars reach back 5 days,
+5- and 15-minute bars a month, hourly bars two years; daily bars have no limit.
+A longer lookback at a fine resolution is capped there — use a coarser
+`resolution` for a longer window. A shorter lookback really is shorter:
+`lookback_days: 10` at `"D"` judges ten daily bars, so `min_history_bars` has
+to fit inside it. Only the resolution asked for is windowed: when Yahoo has too
+few bars at it and substitutes a coarser interval (recorded in the diagnostics
+tab), that fallback keeps its full history.
+
 ### Sector diversification (`max_symbols_per_sector`)
 
 The screener ranks on trend, volume or momentum — all of which correlate hard
@@ -690,6 +777,9 @@ replacement ready. Three properties:
 
 - **Counted across all asset classes**, because the guard is too — a per-class
   budget would let two tech stocks *and* two tech ETFs through a limit of two.
+- **Held positions spend it**, because the guard counts them: with two tech
+  names held and a cap of 2, no tech discovery is picked. They are still kept,
+  never dropped. A pinned symbol you do not hold spends nothing.
 - **A sector at its cap is skipped, not a stop.** The walk continues down the
   ranking, so the freed slots go to the next industry rather than being lost.
   That substitution is the entire point.
@@ -742,7 +832,8 @@ on a dead-cat bounce.
 
 **`cost`** is the one that decides whether an instrument can be profitable *at
 all*. It requires the typical bar-to-bar move to be some multiple of the
-instrument's own round trip — two spreads plus commission. Something that moves
+instrument's own round trip — one spread (half paid on each fill) plus
+commission and slippage on both legs. Something that moves
 0.1% a bar against a 0.15% round trip loses money at every win rate, and no
 strategy setting fixes that. The move is measured close-to-close rather than as
 bar range: a trade captures the change in price, and the bar range is what the
@@ -783,7 +874,16 @@ Three properties worth knowing:
   ranking; not probed is not the same as probed badly.
 - **A thin result is ignored, not trusted.** Below `min_trades` the candidate
   keeps its cheap-filter ranking, with the probe still recorded so you can see
-  why it was not used.
+  why it was not used. The autotune search is held to the same floor: a
+  winner thinner than `min_trades` leaves the backtest result standing.
+- **It runs on the live bar size.** The probe aggregates the profile's bars
+  to `engine.bar_interval` before replaying the strategy; a profile whose bars
+  are COARSER (a daily ETF profile against a 1-minute strategy) is not
+  probed, and the diagnostics say so once — every period would span days.
+- **With both legs on, searched candidates rank first.** A candidate whose
+  search could not run (the run slot was busy) keeps its backtest score, but
+  ranks below every candidate that was searched; the two scores are not on
+  one scale.
 
 ### Starting from nothing (`suggest_universe`)
 
@@ -1124,7 +1224,9 @@ strategy:
 death-by-a-thousand-losses on noisy data):
 
 - `strategy.min_strength` (0..1) — minimum combined confidence to act; weaker
-  signals become HOLD. Higher → fewer, higher-conviction trades. On the
+  signals become HOLD. Higher → fewer, higher-conviction trades. Outside 0..1
+  it is refused at load and in the form, for the base strategy as for an
+  override: `25` (meant as 25%) used to load and silently stop every buy. On the
   synthetic sample, raising it from 0 → 0.30 took win rate **43% → 100%**,
   Sharpe **0.4 → 2.5**, and losses **4 → 0**.
 - `engine.allow_pyramiding: false` (default) — at most one entry per symbol
@@ -1185,7 +1287,17 @@ whether the base bars are 1-minute live ticks or daily candles from a CSV, and
 the newest aggregate always ends on the newest bar (so the reading never
 flickers as a bucket fills). The cost is warmup: confirmation needs
 `htf_multiple` times as much history before it can say anything, and the
-strategy's warmup grows accordingly.
+strategy's warmup grows accordingly. The live engine keeps 3000 bars, so a
+strategy whose warmup needs more could never leave warmup — every detector of
+every symbol would vote HOLD forever while a backtest kept trading. Such a
+save is refused, and one that reaches the engine anyway (a hand-edited
+file) is reported in the diagnostics. `ai` and `ml` cannot be
+`htf_detectors`: they have no symbol on the coarser bars and would always
+abstain, so that is refused at load too.
+
+Each side is gated on its own: the deny gate and `min_strength` /
+`min_strength_sell` are applied to the BUY and the SELL candidate before one is
+chosen, so a sub-threshold BUY no longer suppresses a SELL that qualifies.
 
 ## AI advisor (the `ai` detector)
 
@@ -1274,11 +1386,11 @@ live trading on the back of results the advisor never participated in.
 | `base_url` / `model` / `api_key` | endpoint, model name, bearer token (`BOT_AI_API_KEY`) |
 | `timeout` | per-request deadline (default 20s) |
 | `refresh_interval` | minimum time between calls for one symbol (default 15m) |
-| `max_age` | verdicts older than this are not used (default 1h) |
+| `max_age` | verdicts older than this are not used (default 1h). Must not be shorter than `refresh_interval`, or every verdict would expire before the next arrived — refused at load |
 | `blocking` | wait for the model instead of using the cache — backtests only |
 | `temperature` | 0 (default) = as reproducible as the model allows |
 | `max_concurrent` | in-flight request cap (default 2) — protects a single local GPU |
-| `min_confidence` | below this the model's own answer is demoted to HOLD |
+| `min_confidence` | below this the model's own answer is demoted to HOLD. A BUY/SELL whose confidence is missing, unreadable (`"0,8"`, `"7/10"`) or not above 0 is never a vote, whatever this is set to |
 | `max_strength` | ceiling on the strength it contributes (0..1) |
 | `system_prompt` | replaces the built-in instruction prompt |
 
@@ -1298,7 +1410,7 @@ ml:
   threshold: 0.005       # "up" means +0.5% or better over that window
   train_bars: 1500       # rolling training window
   retrain_every: 250     # refit every 250 new bars
-  min_skill: 0.02        # must beat the majority-class base rate by 2pp to vote
+  min_skill: 0.02        # its held-out votes must beat chance by 2pp to vote
   max_strength: 0.5      # cap its influence
 
 strategy:
@@ -1315,14 +1427,34 @@ unlabelled, and adding future bars must not change any sample already built.
 **`min_skill` is the important setting.** Bar-to-bar direction on liquid
 instruments is close to unpredictable from indicators alone, and a model that
 learned nothing still emits confident-looking probabilities. `min_skill` is the
-margin by which training accuracy must beat simply guessing the majority class;
-below it the detector says so and votes HOLD:
+margin by which the model's votes must beat a vote cast by chance; below it the
+detector says so and votes HOLD:
 
 ```
-ml: skill 0.004 below min_skill 0.020 (acc 0.548 vs base 0.544)
+ml: skill 0.004 below min_skill 0.020 (votes hit 0.072 vs chance 0.068, 31 votes)
 ```
+
+Skill is measured the way the detector trades, and out of sample. A twin of
+the model is fitted on the older three quarters of the training window (minus
+`horizon` rows, whose labels would read into the rest) and votes BUY/SELL on
+the newest quarter at `buy_prob`/`sell_prob`. Its hit rate is compared with
+what a vote on the same side gets by chance: the held-out rally rate for a BUY,
+its complement for a SELL. Fewer than 20 held-out votes count as no skill.
+It used to be training accuracy at a 0.5 cutoff against the majority class —
+with a 0.5% rally label no model ever outputs p > 0.5, so skill was always
+exactly 0 and the shipped `min_skill` silenced the detector whatever it had
+learned. Scored on its own training rows instead, a model of a pure random
+walk read a skill of 0.20: the rows it votes on are the rows it fits best.
 
 Expect to see that message a lot. It is the honest answer, not a malfunction.
+
+**Its features follow the strategy it votes in.** The indicator periods the
+model reads (RSI, MACD, ADX, the trend window, …) are the asking strategy's,
+not a set fixed at startup: a strategy edit, a per-symbol override and an
+optimizer trial each get features on their own periods, and a change refits
+the symbol's model. Each training row's features read the history before the
+window as well, so the first rows of a window see the same full trend window
+and settled indicator seeds that a live prediction does.
 
 **Why regression and not something bigger.** With ~16 features and a few
 thousand noisy samples the bottleneck is signal in the data, not model capacity;
@@ -1339,10 +1471,10 @@ ml: p(up 10 bars)=0.612 BUY (acc 0.58 vs base 0.54, n=1240) [trend_pct+0.41 adx+
 | `enabled` | off ⇒ the `ml` detector exists but always votes HOLD |
 | `horizon` / `threshold` | the label: is the close `horizon` bars ahead at least `threshold` higher? |
 | `train_bars` / `retrain_every` / `min_samples` | rolling window, refit cadence (in **bars**, so backtest and live agree), and the floor to fit at all |
-| `buy_prob` / `sell_prob` | the probabilities at which it votes (default 0.58 / 0.42 — deliberately not 0.5) |
-| `min_skill` | required accuracy above the base rate before it may vote |
-| `max_strength` | ceiling on the strength it contributes |
-| `epochs` / `learning_rate` / `l2` | fitting hyperparameters; `l2` is the brake on overfitting the window |
+| `buy_prob` / `sell_prob` | the vote thresholds, as distances from 0.5 applied around the window's rally rate (default 0.58 / 0.42 = ±0.08). The label is "rose by `threshold` or not", so p(up) of a calibrated model sits near that rate; read against 0.5 it voted SELL on nearly every bar. When rallies are rare the SELL line falls below zero and the model never sells — it cannot have learned a fall |
+| `min_skill` | how far its held-out votes must beat chance before it may vote (see above) |
+| `max_strength` | ceiling on the strength it contributes (0..1); 0 = the default, 1 — not mute. Outside 0..1 is refused at load |
+| `epochs` / `learning_rate` / `l2` | fitting hyperparameters; `l2` is the brake on overfitting the window. The intercept starts at the window's rally rate, so 300 epochs fit a calibrated p(up) rather than one about twice the rate the vote lines centre on |
 
 Fitting is deterministic (full-batch descent, no shuffling), so a model can be
 reasoned about and a backtest reproduced. `GET /api/ml` reports how many symbols
@@ -1365,6 +1497,13 @@ has no headroom:
 - `max_daily_spend` — rolling per-day buy-notional cap
 - `cash_reserve` — cash that must stay uninvested
 - `max_open_positions` — cap on distinct symbols held
+
+A buy still in flight — a limit order resting at the broker, or an order the
+broker did not confirm — counts against `max_total_invested` and, for a symbol
+not yet held, against `max_open_positions`, so a second buy cannot spend the
+headroom the first already claimed (a refusal then reads "N held or in
+flight"). An unconfirmed order keeps its claim until you reconcile it in the
+diagnostics tab.
 
 The bot refuses to start with trading enabled unless `max_order_value` and
 `max_total_invested` are set.
@@ -1729,7 +1868,10 @@ engine:
 A limit order is placed *passively* — below the market for a buy, above for a
 sell — so the spread is earned rather than paid, at the risk of not filling;
 hence the timeout and fallback. Slicing works a large order into the book
-instead of taking it in one clip, paced by `safety.min_order_interval`.
+instead of taking it in one clip. Only the Saxo adapter paces the children
+(by `safety.min_order_interval`); on Alpaca, Trading 212 and the simulator they
+are submitted back-to-back, so slicing there caps each clip's size but does not
+spread the clips over time.
 
 **Protective exits ignore all of this and always go to market.** A stop resting
 unfilled at a limit price while the market runs away from it is precisely the
@@ -1740,8 +1882,50 @@ exposes only a market-order endpoint, so against it a limit order is sent to
 market and crosses the spread anyway — `limit_offset_pct`, `limit_timeout` and
 `market_fallback` then have nothing to act on. The adapter says so once per
 run in the diagnostics tab's API-errors list rather than letting the setting
-look effective. Alpaca and Saxo place real limit orders; the simulated broker
-fills one only when it is already marketable.
+look effective. Saxo places real limit orders and can list and cancel them.
+
+**A resting limit also needs a broker that can list and cancel it**, because
+the timeout and fallback work by finding the order and cancelling it. Alpaca's
+adapter does neither, and neither does the simulated broker test mode uses —
+there an expired limit sell used to block stop-losses for the symbol for good,
+and buy reservations were never released. So on such a broker `type: "limit"`
+falls back to market orders, and says so once per broker in the diagnostics
+tab.
+
+**The market fallback is a new order, and is treated as one.** It goes out up
+to `limit_timeout` after the decision that sized it, so a fallback **buy** must
+pass the same gates any buy does at that moment: if trading was switched off,
+a drawdown halt tripped or the breaker fired while the limit rested, no
+fallback is sent, and it is re-authorised against the money limits as they
+stand. A fallback **sell** is an exit and is never gated.
+
+It also re-sends only what did **not** fill. A limit order can fill partly at
+any point while it rests, and the cancel does not say how much — so the bot
+reads the broker's position after the cancel, books the part that filled and
+sends only the remainder. When that cannot be pinned on one order (another
+slice of the same symbol is still resting, or a buy of it is unconfirmed) a
+buy fallback is skipped and recorded instead: under-buying is the safe side,
+and any shares that did fill are adopted as an untracked holding. A sell
+fallback is simply capped at what is still held.
+
+**Limit prices go out at the precision the broker accepts.** Alpaca takes four
+decimals below $1 and two above; the price is rounded toward the safe side — a
+buy limit down, a sell limit up — so a rounding step never pays more, or
+accepts less, than the limit meant. **Saxo** prices — limit, bracket legs and
+modifications, after the currency conversion — are put on the instrument's own
+tick grid (`TickSize` / `TickSizeScheme` from its instrument details), to the
+nearest tick; Saxo refuses a price off the grid, and every converted price is
+off it. A modification keeps the order's own duration (a day order stays a day
+order), and the open-orders list reports prices in your reporting currency, the
+one a modification is typed in — or names the currency when it cannot convert.
+
+**Exchange sessions.** Without a broker trading calendar (Trading 212, Alpaca),
+orders — exits included — are held outside the venue's session, which the bot
+reads from the symbol's suffix. The German regional exchanges keep their own
+hours rather than Xetra's 09:00–17:30: `.F` (Frankfurt), `.SG`, `.MU`, `.DU`,
+`.HM`, `.HA`, `.BE` and `.BM` all trade shares and ETPs 08:00–22:00. A stop on a Stuttgart
+listing that triggers at 18:00 therefore goes out at 18:00, not the next
+morning. Holidays and auctions are not modelled.
 
 ## Protective exits
 
@@ -1771,7 +1955,13 @@ exits:
 When both a percentage and an ATR multiple are set, the **wider** stop wins, so
 the percentage acts as a floor — a momentarily tiny ATR can't place the stop on
 top of the current price and guarantee an instant exit. With no ATR available
-yet, the percentage rules apply unchanged.
+yet, the percentage rules apply unchanged. An ATR so large that `entry −
+mult × ATR` would fall below zero cannot place an ATR stop. A **new entry** is
+then refused — it would otherwise go out at full size behind the narrow
+percentage stop, the most volatile entry with the least room. A **held**
+position keeps its percentage stop (the stop reads the current ATR, so a crash
+bar must not widen it to nothing), and with ATR-only exits it gets a stop at 1%
+of the entry rather than none. The ATR trail behaves the same way.
 
 **Time-decaying profit ladder (`roi`).** Demand a lot early, settle for less as
 a trade goes stale — the entry that hasn't worked in six hours probably isn't
@@ -1786,7 +1976,10 @@ exits:
     "6h":  0      # after six hours, exit at any profit
 ```
 
-The ladder and `take_profit_pct` combine into whichever target is nearer.
+The ladder and `take_profit_pct` combine into whichever target is nearer. Keys
+are Go durations without a dot — write `"90m"`, not `"1.5h"`: the settings
+editor addresses a value by a dotted path, so a dotted key could never be saved
+from the UI, and it is refused at load.
 
 **Two-stage trailing stop.** One trailing distance has to be two contradictory
 things at once: loose enough early that ordinary noise doesn't end a trade before
@@ -1803,6 +1996,28 @@ exits:
 With `trailing_only_after_offset`, the stop-loss is the only downside rule until
 the position is far enough ahead — use it when the trail exists to protect a
 gain, not to cap a loss. With no offset set, the trail behaves exactly as before.
+
+`atr_trail_mult` still applies in the tight stage, and the wider trail wins
+there too: past the offset the distance is the larger of `trailing_tight_pct`
+and `atr_trail_mult × ATR`. With `trailing_tight_pct: 0.02`, `atr_trail_mult: 3`,
+an ATR of 1.5 and a peak of 110, the trail is 105.50 (3 ATR), not 107.80 (2%).
+That is deliberate — a tight trail inside the instrument's own noise band is
+the exit the ATR multiple exists to prevent — but it means the tight stage
+only tightens on instruments whose ATR is small relative to it.
+
+**Adding to a position re-bases the trail.** The stage is judged from the peak
+against the *average* entry, and a scale-in or pyramid moves the average under
+a peak reached against the old one. Left alone, averaging down from 100 to 97.5
+under a 104.5 peak would read as a 7% gain, arm the tight stage, and put the
+trail above the price — selling the enlarged position at a loss on the next
+check. So an add resets the peak to the new position's level and keeps the
+trail that was in force just before it as a **floor**: the trail starts again
+from the new basis but never sits below where it already was. The floor is
+saved with the position, survives a restart, and lapses if you switch every
+trailing distance off — or **change** the trailing settings: the floor is the
+trail at the settings of the add, and kept after you widen a 3% trail to 10% it
+would hold exactly the positions you scaled into at the old tight level. The
+backtester applies the same rule.
 
 **Time barrier (`max_hold`).** The third barrier of the triple-barrier method:
 
@@ -1908,6 +2123,26 @@ a cooldown can't trap you in a losing position — and a halt is **sticky**. It
 stays until `POST /api/protections/resume`, which also re-bases the drawdown peak
 to current equity. A protection that cleared itself on a timer would let an
 unattended bot walk straight back into whatever was draining the account.
+
+**One trade, one verdict.** The cooldown, stop guard and low-profit guard judge
+a *round trip*, once, when the position is fully closed — on the net P&L of all
+its tranches. A trade that sells half at +5% on a scale-out rung and stops the
+rest out at −2% is a winner and starts no cooldown; a stop-loss the broker fills
+in two slices is one stop toward `stop_guard_trades`, not two. The
+realized-drawdown halt is a running sum and takes each tranche as it lands. The
+backtester applies the same rules, including `max_realized_drawdown_pct`.
+
+**Deposits and withdrawals look like P&L.** The equity halts compare account
+equity against a peak and the day's starting value, and nothing tells them a
+change came from a cash transfer rather than trading. Withdrawing 8% of the
+account trips `max_daily_loss_pct: 0.08`; a larger withdrawal can trip
+`max_drawdown_pct` — annoying, but it fails safe. A same-day **deposit** is the
+dangerous direction: it lifts equity above the day's start and hides that day's
+real trading losses from `max_daily_loss_pct`. Move money while trading is off,
+and after a withdrawal use `POST /api/protections/resume?rebase=1` to re-base
+the peak. Without `rebase=1` a resume with no halt active is refused (409) and
+re-bases nothing: a stale tab or a double click used to forgive a drawdown
+that was building.
 
 State and locks are at `GET /api/protections`; a single symbol can be released
 with `DELETE /api/protections/lock/:symbol`.
@@ -2035,7 +2270,12 @@ That last one matters most. An isolated backtest hands one symbol the full
 account cash for the whole run — something live trading never does, since
 capital is shared across the watchlist. So a proposal must beat both the
 what-if *and* the symbol's actual history since the last autotune apply, on
-win rate and expectancy specifically.
+win rate and expectancy specifically. The record's win rate is read smoothed
+by its size — (wins + 1) / (trades + 2) — so one winning close counts as 67%,
+ten in a row as 92%: a thin record is a low hurdle, a long one a high hurdle,
+and neither is impassable. Read raw, one winning close was a 100% win rate that
+a candidate measured over ten or more trades almost never matches, and the
+symbol stayed un-tunable until it lost.
 
 `min_trades` defaults to 10, deliberately stricter than the manual button's
 floor of 3: a thin sample is a smaller risk on a human-reviewed click than on
@@ -2050,6 +2290,12 @@ an unsupervised, every-symbol, real-money scheduled write.
 | `sharpe` / `sortino` / `calmar` | risk-adjusted return |
 | `profitfactor` / `expectancy` | trade quality, independent of position size |
 
+`calmar` and `profitfactor` score smoothed ratios — CAGR ÷ (max drawdown + 1
+point), and (gross win + m) ÷ (gross loss + m) with m the mean P&L per trade —
+because the raw ratios are undefined (reported as 0) for a run with no drawdown
+or no losing trade, and scoring that 0 ranked a flawless incumbent below every
+candidate.
+
 An unrecognised value falls back to `blend` rather than failing the load. This
 only picks the search winner — the gate against real history always compares
 win rate and expectancy whatever you set here.
@@ -2061,7 +2307,9 @@ a loss is re-tuned immediately rather than at the next scheduled pass.
 
 It adds **no new way to win**: a streak only decides *when* to look, and the
 proposal still has to clear all four gates above. `cooldown` bounds how often
-one symbol can trigger it.
+one symbol can trigger it — checked again when the request is served, so a
+request that waited behind a scheduled pass which has just tuned the same
+symbol is dropped.
 
 The loss counter resets only on a win, never on a tune — so it is "losses in a
 row", not "losses since we last acted". The same counter feeds
@@ -2082,9 +2330,22 @@ without maintaining an allow-list of everything else.
   when the background goroutine starts.
 - A symbol with fewer cached bars than the search needs is skipped for that
   run, silently.
-- Only one search runs at a time process-wide, shared with the manual button.
-  A reactive `on_loss` request that arrives while the slot is busy is
-  **dropped, not queued**.
+- Only one search runs at a time process-wide, shared with the manual button
+  and the screener probe. A reactive `on_loss` request that arrives while
+  another holder has the slot is **retried five minutes later** — once per
+  symbol however often it collided, and judged again on `enabled` and the
+  cooldown when it runs; a scheduled pass that finds the slot busy also tries
+  again five minutes later rather than waiting a whole `interval`. "Run
+  autotune now" answers "started" only when it really got the slot, and a
+  panic inside that pass is recorded rather than taking the bot down.
+- A search's winner is a difference from the strategy the symbol ran when the
+  search **began**. If you save the strategy while a search runs, its result is
+  discarded — applied to the new base it would be a configuration no trial
+  ever ran — and the next pass searches the new one. A shared-strategy save
+  also re-applies every symbol's override on top of the new base at once, so a
+  symbol trades live exactly what a restart would give it.
+- Shutting the bot down stops a running search; a search that finishes after
+  shutdown began applies nothing.
 - Everything it writes is visible in `strategy_overrides` in your config file
   and in the UI's per-symbol view. If you do not recognise a parameter there,
   autotune put it there.
@@ -2114,11 +2375,20 @@ simulated result is not flattered by frictionless fills.
 Trades taken in a window are marked `Simulated` in the trade log, so they never
 get confused with real fills.
 
-Two things it refuses to do:
+**Nothing simulated outlives the window.** The bot's own record of open
+positions — entry prices, trailing peaks, scale-out progress — is set aside when
+the window opens and restored when it closes, and nothing simulated is written
+to the database: not the positions, not the day's spend. A simulated buy used
+to leave a position record for stock you never owned (which then tripped a false
+drawdown halt), and a simulated sale deleted the record of a real holding.
+
+Three things it refuses to do:
 
 - **It will not start while a protection halt is active.** Resume the halt
   deliberately first, rather than letting a fresh simulated window paper over a
   real one.
+- **It will not start while a real limit order is resting.** Its watcher would
+  wake inside the window and settle the real order against the simulator.
 - **It ends early if the trade-rate circuit breaker trips.** A bot placing
   orders fast enough to trip it is not one worth continuing to exercise.
 
@@ -2133,7 +2403,7 @@ will not observe.
 ```yaml
 notify:
   enabled: true
-  events: ["trade", "halt", "error"]   # also "blocked" (noisy)
+  events: ["trade", "halt", "error", "audit"]   # also "blocked" (noisy)
   min_notional: 0                      # suppress fill alerts below this order value
 
   webhook: ""                          # any URL — gets the event as a JSON POST
@@ -2158,6 +2428,20 @@ notify:
 | `telegram_*` | a Telegram chat, via a bot |
 | `pushover_*` | phones, with a real title and priority — a halt can bypass quiet hours while a routine fill doesn't |
 | `apprise_*` | the ~100 services [Apprise](https://github.com/caronc/apprise) supports — email, Matrix, ntfy, Gotify, Signal, SMS — through one [Apprise API](https://github.com/caronc/apprise-api) server, so this repo doesn't need an adapter per service |
+
+The kinds: `trade` (fills), `halt` (a circuit breaker or protection stopped
+trading, or an order the broker never confirmed), `error` (a failed order —
+with the broker's error text — or an upstream API failure, or an instrument the
+broker refuses), `audit` (the bot changing itself: an autotune apply, a
+screener pass changing the watchlist, a cancelled, modified or bracket-submitted
+order), and `blocked` (an order the limits refused; noisy). A subscription
+missing `audit` does not hear about those. An unknown kind is refused at load.
+Each message is cut to the sink's limit rather than rejected by it, and a
+webhook that answers with a redirect counts as a failed delivery — write the
+final `https://` URL. A **halt** that meets a 429 or a 5xx is retried up to three
+times, honouring the sink's `Retry-After` (capped at 30s); routine events are
+not retried. On shutdown the bot waits, briefly, for the halts and errors still
+queued to go out.
 
 Every configured sink gets every subscribed event; a sink needing two
 credentials stays inactive until both are set. Apprise takes either a stored
@@ -2302,9 +2586,48 @@ the open, not at the stop price — you cannot get out at a level the market
 jumped over — and when a bar touches both the stop and the target, the stop
 wins, because the order of the high and low inside a bar is unknowable.
 
+Two orderings inside a bar follow what the live bot, evaluating on ticks,
+would see first:
+
+- **`max_hold` fills at the open.** The position's age is measured at the
+  bar's start, so a barrier due on this bar was due at its open — where live
+  exits on its first tick. Only a stop or target the open itself is already
+  through names the exit instead; a dive later in the bar happens to a
+  position live has already closed.
+- **A scale-in above the stop comes first.** On a falling bar the add's
+  threshold (`-step_pct`) is crossed before a deeper stop, so the add is made
+  and the stop then judged against the re-based average — as live does. When
+  the open, or the threshold itself, is already through a stop or trail, the
+  exit comes first and no add is made.
+
 Fills also pay the spread and slippage from `costs.spread_pct` /
 `costs.slippage_pct`. Free liquidity at the exact reference price is the single
 most flattering assumption a backtest can make.
+
+Position sizing follows the live rules too, `engine.min_positions` included:
+`cmd/backtest` and the optimizer's limit-respecting runs cap each buy at one
+slot of the investable pot, as the live risk manager does. The optimizer's
+relaxed-limits mode and autotune deliberately do not — they measure one symbol
+on a synthetic budget, where a slot of that budget is not the live slot.
+
+**Asset classes and sectors.** Live layers the classes and sectors it learned
+from the provider under `asset_classes:` / `sectors:`. `cmd/backtest` has only
+the file's maps unless told where the learned ones are:
+
+```bash
+cp /path/to/finance_bot.db /tmp/probe.db
+go run ./cmd/backtest -csv data/set.csv -db /tmp/probe.db
+```
+
+The database is opened read-only — nothing is migrated or written — but point
+it at a copy anyway. With portfolio caps on and no `-db`, a run warns about
+every symbol a cap cannot see: those count as unclassified, which they would
+not be live, and run uncapped.
+
+The protections judge a whole round trip, as live does: a position sold in
+tranches is one trade to the cooldown, stop guard and low-profit lock, on its
+net P&L, and `max_realized_drawdown_pct` halts the run (reported under
+`HaltedAt`) exactly when it would halt the bot.
 
 ### What is reported
 
@@ -2482,8 +2805,18 @@ The grid also searches **capital deployment** (order size as a fraction of cash)
 — the dominant driver of total return. By default the optimizer **relaxes the
 money limits** so deployment isn't capped while searching (pass `-respect-limits`
 to keep your config's caps). The best-config output shows the per-trade ceiling
-and the limits needed to realise it — apply your own safety limits before going
-live, knowing tighter limits reduce return proportionally.
+(as `engine.max_risk_size_usd`, the live key with that meaning) and the limits
+needed to realise it — apply your own safety limits before going live, knowing
+tighter limits reduce return proportionally.
+
+**Modes and flags.** `-sensitivity`, `-walkforward` and a search (`-random` or
+the grid) are separate modes; a flag the chosen mode would ignore is an error,
+not a silent no-op — `-walkforward 5 -random 2000` is refused rather than run as
+a grid per fold. `-generations` and `-seed` need `-random`.
+
+**Interrupting.** The first Ctrl+C stops the search and keeps what it found:
+the un-refined result is checkpointed (`-checkpoint`), the refinement pass is
+skipped, and the report printed. A second Ctrl+C ends the process at once.
 
 ### Sensitivity (one-factor-at-a-time)
 
@@ -2513,15 +2846,15 @@ iteration prefer `-random 300`-ish and a few thousand bars over a giant grid on
 
 ## Web UI
 
-Two interfaces are served, in parallel, from the same binary:
+**`http://localhost:8080/v2/`** — tabbed, translated, lazily loaded, strict CSP.
+The root `/` permanently redirects there.
 
-| | Path | |
-|---|---|---|
-| **v2** (recommended) | `http://localhost:8080/v2/` | tabbed, translated, lazily loaded, strict CSP |
-| original | `http://localhost:8080/` | the single-page version, unchanged |
-
-Both talk to the same API. The original stays so that a regression in the new
-page never leaves the bot unmanageable; nothing has to be migrated in one step.
+> **The original single-page UI was removed.** It served from `/` and had
+> fallen behind: no `autotune` or `test_mode` settings existed in it at all, so
+> anyone managing the bot through it could not see those features. It also had
+> no CSP, a known stored-XSS path to the auth token it held as a JS global, and
+> an auth flow that popped a browser prompt once per failed fetch — a stack of
+> them on any page with a token set. Everything it did, `/v2` does, and more.
 
 ### v2
 
@@ -2593,48 +2926,15 @@ assets.
 timeframes now cost a round-trip where the client-side version cost none. On a
 bot you are running locally that is imperceptible; over a slow link it is not.
 
-### Original interface
-
-The single self-contained page at **`http://localhost:8080/`**. It covers:
-
-- **Watchlist** — add/remove symbols.
-- **Signals — all detectors** — every detector's current call per symbol (even
-  ones not in the active set), so you can see what each would do; the active set
-  is outlined in blue.
-- **Strategy** editor — edit detectors, combine mode, `min_strength` and every
-  indicator period and **apply live** (no restart); each field has an inline
-  explanation.
-- **Protective exits** editor — stop-loss, two-stage trailing, take-profit, the
-  ROI and scale-out ladders and the `max_hold` time barrier, applied live.
-- **Costs**, **Entries**, **Protections**, **Portfolio limits**, **Screener**,
-  **Notifications**, **AI advisor** and **ML detector** editors — the remaining
-  configuration blocks, each applied live from its own panel and each field
-  annotated with what it actually does. Details below.
-- **Open positions** — with a **Sell** button per holding, and a **Remove**
-  button for the other case: you already sold the stock by hand in the broker's
-  own app, so the bot's record now describes shares that are not there. Remove
-  drops that record (and its trailing-stop peak) without placing any order.
-  Nothing is booked as a trade — the bot does not know what your manual sale
-  filled at, and inventing an exit price would corrupt realized P&L and the
-  win/loss stats worse than the missing round-trip does. Use **Sell** if you
-  still hold it.
-- **Price & trades chart** — a symbol's recent candles with this bot's own
-  executions marked (filled triangles for fills, hollow for dry-run/blocked
-  decisions), selectable timeframe. Numbers in a table say the bot sold at
-  231.40; the chart says whether that was the top of a run or the bottom of a
-  dip.
-- **Start/Stop trading** toggle.
-- **API error log** — recent failures from Finnhub / Saxo / Alpaca / Yahoo /
-  Trading 212 / Binance / the AI advisor / notifications, colour-coded by source.
-
 ### Live settings
 
 `GET /api/settings` returns every live-editable block in one response — `costs`,
 `exits`, `entries`, `protections`, `portfolio` (+ `sectors`), `screener`,
 `notify`, `ai`, `ml` — and `PUT /api/settings/<section>` applies one of them.
 Sections are applied individually so a rejected block cannot half-apply its
-neighbours. (`GET/PUT /api/exits` still works and still speaks Go field names,
-for anything built against it.)
+neighbours. (`GET/PUT /api/exits` still works, for anything built against
+it; its PUT accepts `max_hold` both as a duration string and as the nanosecond
+integer its GET serves.)
 
 Four details are worth knowing:
 
@@ -2645,6 +2945,13 @@ Four details are worth knowing:
   erase it. Sending a real value replaces it.
 - **Durations are strings**, exactly as in `config.yaml`: `"30m"`, `"2h"`,
   `"0s"` — not nanosecond integers.
+- **`exits`, `screener` and `PUT /api/strategy` keep what you do not send.**
+  The body is applied onto the settings in force, so a key it leaves out keeps
+  its value instead of resetting to zero — the strategy form has no `htf_*`
+  fields and the screener form cannot show `by_asset_class`, and saving either
+  used to wipe them. A map you *do* send replaces the old one whole, so
+  deleting a key works. The other sections (and `PUT /api/limits`, `sizing`)
+  still take the body as the complete block.
 - **Editing protections preserves state.** An active drawdown halt and any
   symbol lockouts survive a threshold change; clearing a halt stays the
   deliberate act of `POST /api/protections/resume`.
@@ -2678,16 +2985,17 @@ orders and toggle live trading.
 | GET | `/api/positions` | portfolio snapshot (cash, holdings, equity) |
 | GET | `/api/open` | durable open-position records (bought, not yet sold; survives restart) |
 | DELETE | `/api/open/:symbol` | forget a position closed **outside** the bot — places no order and books no P&L |
+| POST | `/api/open/:symbol/adopt` | give a broker holding the bot has no record of a full record now, instead of waiting out the automatic adoption; 409 while an order for the symbol is still in flight (a resting limit, an unconfirmed buy, a reservation) — the order's own fill would be booked twice |
 | GET | `/api/orderable` | per-watchlist symbol: is it tradeable on the broker, and to which ticker (Trading 212) |
 | GET | `/api/detectors` | every detector's signal per symbol (incl. inactive ones) |
 | GET | `/api/ai` | LLM advisor status: provider, model, call/error counts, last error |
 | GET | `/api/ml` | learned-detector status: models trained, failures, mean skill above base rate |
 | GET | `/api/chart/:symbol` | candles + this bot's executions for the price chart (`?bars=`, `?res=`) |
 | GET | `/api/protections` | halt state, drawdown vs the equity peak, locked symbols |
-| POST | `/api/protections/resume` | clear a halt and re-base the drawdown peak |
+| POST | `/api/protections/resume` | clear a halt and re-base the drawdown peak; 409 when nothing is halted, unless `?rebase=1` asks for the re-base alone |
 | DELETE | `/api/protections/lock/:symbol` | release one symbol's cooldown / stop-guard lock |
 | GET | `/api/screener` | last universe-selection pass, incl. why each candidate was rejected |
-| POST | `/api/screener/rescreen` | run a screening pass now instead of waiting out the interval |
+| POST | `/api/screener/rescreen` | run a screening pass now instead of waiting out the interval; 409 while one is already running |
 | GET | `/api/notify` | alert sinks and delivery counters (sent / failed / dropped) |
 | GET | `/api/settings` | every live-editable block in one response — costs, exits, entries, protections, portfolio, sectors, screener, notify, ai, ml (secrets redacted) |
 | PUT | `/api/settings/:section` | live-edit one block: `costs`, `exits`, `entries`, `protections`, `portfolio`, `screener`, `notify`, `ai`, `ml` |

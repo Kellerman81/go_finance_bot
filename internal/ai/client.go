@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 )
 
@@ -205,9 +206,13 @@ func postJSON(
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 
+	// The URL in these messages is redacted: an OpenAI-compatible base_url
+	// behind basic auth (https://ops:pw@llm.lan) put the password into every
+	// error — errlog, /api/errors, the advisor's LastError — because the
+	// wrapper re-added the URL net/http had already stripped (EL3-4).
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("call %s: %w", url, err)
+		return fmt.Errorf("call %s: %w", redactURL(url), err)
 	}
 
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
@@ -218,7 +223,7 @@ func postJSON(
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("%s: http %d: %s", url, resp.StatusCode, snippet(data))
+		return fmt.Errorf("%s: http %d: %s", redactURL(url), resp.StatusCode, snippet(data))
 	}
 
 	if err := json.Unmarshal(data, out); err != nil {
@@ -236,4 +241,15 @@ func snippet(b []byte) string {
 	}
 
 	return s
+}
+
+// redactURL is raw with any userinfo password replaced, for an error message.
+// An unparsable URL is withheld entirely rather than echoed.
+func redactURL(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return "<unparsable url>"
+	}
+
+	return u.Redacted()
 }

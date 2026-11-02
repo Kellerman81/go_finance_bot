@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"github.com/Kellerman81/go_finance_bot/internal/ai"
 	"github.com/Kellerman81/go_finance_bot/internal/config"
 	"github.com/Kellerman81/go_finance_bot/internal/market"
 	"github.com/Kellerman81/go_finance_bot/internal/ml"
@@ -9,10 +10,12 @@ import (
 // predictor is the slice of *ml.Predictor the detector needs, as an interface so
 // tests can supply a deterministic stand-in.
 type predictor interface {
-	// Verdict returns the model's read on symbol from its candle history.
-	Verdict(symbol string, candles []market.Candle) (ml.Verdict, bool)
-	// WarmupBars is the history needed before a model can be fitted.
-	WarmupBars() int
+	// VerdictWith returns the model's read on symbol from its candle
+	// history, on features built with params.
+	VerdictWith(symbol string, candles []market.Candle, params ai.Params) (ml.Verdict, bool)
+	// WarmupBarsFor is the history needed before a model on params' features
+	// can be fitted.
+	WarmupBarsFor(params ai.Params) int
 	// Horizon is the forward window the model predicts over.
 	Horizon() int
 }
@@ -30,22 +33,52 @@ type predictor interface {
 type mlDetector struct {
 	pred   predictor
 	warmup int
+	// params are this strategy's indicator periods, handed to the predictor
+	// with every verdict so the model's features follow the strategy it
+	// votes in — the process-wide predictor's own were fixed at startup
+	// (ML3-5).
+	params ai.Params
 }
 
 // newMLDetector builds the ML detector, wired to the process-wide predictor
 // installed by ml.Configure at startup. With none configured the detector still
 // exists (so the UI can list it) and always votes HOLD.
 func newMLDetector(c config.StrategyConfig) *mlDetector {
-	d := &mlDetector{pred: ml.Default()}
+	d := &mlDetector{pred: ml.Default(), params: ml.ParamsFor(c)}
 
 	// The warmup is the predictor's, floored at the indicator warmup so a
 	// disabled predictor still reports something sane. +1 because DetectFor
 	// always drops the newest candle before predicting (see its doc
 	// comment), so it needs one more bar of input than the predictor itself
 	// requires.
-	d.warmup = max(d.pred.WarmupBars(), c.SlowMA+c.MACDSignal+2) + 1
+	d.warmup = max(d.pred.WarmupBarsFor(d.params), c.SlowMA+c.MACDSignal+2) + 1
 
 	return d
+}
+
+// UsePredictor points every "ml" detector in s — buy, sell and
+// higher-timeframe sets — at p. A nil p, or a strategy that is not a
+// *Combined, is left alone.
+func UsePredictor(s Strategy, p *ml.Predictor) {
+	c, ok := s.(*Combined)
+	if !ok || p == nil {
+		return
+	}
+
+	rebind := func(dets []Detector) {
+		for _, d := range dets {
+			if md, ok := d.(*mlDetector); ok {
+				md.pred = p
+			}
+		}
+	}
+
+	rebind(c.detectors)
+	rebind(c.sellDetectors)
+
+	if c.htf != nil {
+		rebind(c.htf.detectors)
+	}
 }
 
 // Name returns the canonical detector name.
@@ -87,9 +120,12 @@ func (d *mlDetector) DetectFor(symbol string, s series) (Action, float64, string
 		return Hold, 0, "ml: predictor disabled"
 	}
 
-	// The predictor needs candles; rebuild them from the series columns. The
-	// times are not used by the feature or label logic (both work on bar index),
-	// so the reconstruction is faithful for this purpose.
+	// The predictor needs candles, WITH their times: the features and labels
+	// work on bar index, but the retrain schedule counts bars newer than the
+	// last fit by Time. Rebuilt from the columns alone every Time was zero, so
+	// that count was always 0 and a model, once fitted, was never refitted —
+	// retrain_every did nothing, live or in backtest, and a symbol whose first
+	// fit failed never got a model at all (ML2-1, CRIT-8 still open).
 	candles := candlesFrom(symbol, s)
 	if len(candles) < d.warmup {
 		return Hold, 0, "ml: not enough history to train"
@@ -97,7 +133,7 @@ func (d *mlDetector) DetectFor(symbol string, s series) (Action, float64, string
 
 	candles = candles[:len(candles)-1]
 
-	v, ok := d.pred.Verdict(symbol, candles)
+	v, ok := d.pred.VerdictWith(symbol, candles, d.params)
 	if !ok {
 		return Hold, 0, "ml: no model yet"
 	}
@@ -113,7 +149,9 @@ func (d *mlDetector) DetectFor(symbol string, s series) (Action, float64, string
 	return Hold, 0, v.Reason
 }
 
-// candlesFrom rebuilds candles from the extracted OHLCV columns.
+// candlesFrom returns the series' candles as a copy the predictor may keep:
+// the source slice when the series carries one (bar times included), else a
+// reconstruction from the OHLCV columns.
 func candlesFrom(symbol string, s series) []market.Candle {
 	out := make([]market.Candle, len(s.close))
 	for i := range s.close {
@@ -121,6 +159,10 @@ func candlesFrom(symbol string, s series) []market.Candle {
 			Symbol: symbol,
 			Open:   s.open[i], High: s.high[i], Low: s.low[i],
 			Close: s.close[i], Volume: s.volume[i],
+		}
+
+		if i < len(s.src) {
+			out[i].Time = s.src[i].Time
 		}
 	}
 

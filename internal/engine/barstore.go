@@ -276,3 +276,47 @@ func (r *ring) reset(candles []market.Candle) {
 		r.push(c)
 	}
 }
+
+// rescale multiplies every stored price for symbol by factor, in place — the
+// completed bars in the ring AND the in-progress bar being built.
+//
+// It exists for one situation: a symbol's currency conversion rate changing
+// after its series was already built. Bars are converted once, when they are
+// seeded or ingested (see Engine.warmup and Engine.ingest), so a rate that
+// arrives late leaves the whole history on the old scale while everything
+// computed fresh — the venue-price check above all — uses the new one. The
+// mismatch is exactly the ratio between the two rates and never heals on its
+// own, because nothing else ever rewrites a bar.
+//
+// Rescaling is the honest correction: the bars described real prices in one
+// currency, and the same prices in another currency are those multiplied by
+// the rate. Volume and timestamps are untouched — only the four price fields
+// are denominated in anything.
+//
+// A non-positive or 1 factor is a no-op.
+func (s *barStore) rescale(symbol string, factor float64) {
+	if factor <= 0 || factor == 1 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if r, ok := s.rings[symbol]; ok {
+		for i := range r.buf {
+			scaleCandle(&r.buf[i], factor)
+		}
+	}
+
+	if b, ok := s.builders[symbol]; ok && b.cur != nil {
+		scaleCandle(b.cur, factor)
+	}
+}
+
+// scaleCandle multiplies a candle's four price fields by factor.
+func scaleCandle(c *market.Candle, factor float64) {
+	c.Open *= factor
+	c.High *= factor
+	c.Low *= factor
+	c.Close *= factor
+}

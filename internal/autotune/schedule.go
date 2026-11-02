@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,11 +42,46 @@ const (
 // way: RunOnce applies a winning proposal directly, with no separate
 // confirmation step of its own — that responsibility sits at the caller
 // (the button's own confirm dialog).
+//
+// It reports false when the run slot was already taken and nothing ran.
 func RunOnce(
 	ctx context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
 	cfg config.AutotuneConfig, configPath string, log *slog.Logger,
-) {
-	runPass(ctx, eng, rm, pf, cfg, configPath, log)
+) bool {
+	return runPass(ctx, eng, rm, pf, cfg, configPath, log)
+}
+
+// StartOnce is RunOnce in the background for an HTTP handler: it claims the
+// run slot SYNCHRONOUSLY and reports whether it got it, then runs the pass on
+// its own goroutine and releases the slot when done. Checking Busy and then
+// starting a goroutine that tried for the slot itself answered "started" for
+// a pass that, having lost the slot in between, never ran (AT2-7).
+func StartOnce(
+	ctx context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
+	cfg config.AutotuneConfig, configPath string, log *slog.Logger,
+) bool {
+	if !TryAcquire() {
+		return false
+	}
+
+	go func() {
+		defer Release()
+		// The scheduled pass runs under cmd/bot's runSupervised and gin's
+		// Recovery covers only the handler goroutine: a panic anywhere in the
+		// backtester or optimizer during a pass started here killed the live
+		// process, leaving the book unmanaged (AT3-7). Recovered and
+		// reported; the slot is still released by the defer above.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("autotune: the manual pass panicked", "panic", r)
+				errlog.Recordf("autotune", "manual pass panicked: %v", r)
+			}
+		}()
+
+		passHeld(ctx, eng, rm, pf, cfg, configPath, log)
+	}()
+
+	return true
 }
 
 // Busy reports whether a symbol search (the manual per-symbol optimizer
@@ -52,15 +90,20 @@ func RunOnce(
 // HTTP handler) that wants to tell an operator "already running" up front,
 // rather than silently deferring to runPass's own internal TryAcquire and
 // leaving a button click that quietly did nothing.
+//
+// A length check, not a TryAcquire/Release pair: claiming the slot to ask the
+// question made a click on "Run autotune now" able to make a scheduled tick
+// that fired in that instant lose its pass (AT2-7). It is a hint either way —
+// the caller's own TryAcquire stays the real gate.
 func Busy() bool {
-	if TryAcquire() {
-		Release()
-
-		return false
-	}
-
-	return true
+	return len(sem) == cap(sem)
 }
+
+// busyRetry is how soon a scheduled pass that found the run slot busy tries
+// again. Without it the pass waited a whole interval — 24 h by default —
+// because a screener probe or a manual button held the slot for a minute
+// (AT2-7).
+const busyRetry = 5 * time.Minute
 
 // Schedule runs the auto-optimizer on its own clock for as long as ctx is
 // alive. It is a no-op (returns immediately) when cfg.Enabled is false —
@@ -112,22 +155,83 @@ func Schedule(
 	// makes the mutual exclusion obvious rather than incidental.
 	losses := eng.LossTuneRequests()
 
+	// retry fires once after a tick that found the slot busy; nil (never
+	// fires) otherwise.
+	var retry <-chan time.Time
+
+	scheduled := func() {
+		retry = nil
+
+		live := eng.AutotuneConfig()
+		if !live.Enabled {
+			log.Info("autotune: disabled live, skipping this tick")
+
+			return
+		}
+
+		if !runPass(ctx, eng, rm, pf, live, configPath, log) {
+			retry = time.After(busyRetry)
+		}
+	}
+
+	lossRetry := newLossRetries(time.After)
+	lossPass := func(symbol string) bool {
+		return runLossPass(ctx, eng, rm, pf, eng.AutotuneConfig(), configPath, symbol, log)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			live := eng.AutotuneConfig()
-			if !live.Enabled {
-				log.Info("autotune: disabled live, skipping this tick")
-
-				continue
-			}
-
-			runPass(ctx, eng, rm, pf, live, configPath, log)
+			scheduled()
+		case <-retry:
+			scheduled()
 		case symbol := <-losses:
-			runLossPass(ctx, eng, rm, pf, eng.AutotuneConfig(), configPath, symbol, log)
+			lossRetry.serve(symbol, lossPass)
+		case <-lossRetry.due:
+			lossRetry.retry(lossPass)
 		}
+	}
+}
+
+// lossRetries holds the loss re-tunes that found the run slot busy, one entry
+// per symbol, retried together after busyRetry. A streak publishes only every
+// after_losses-th loss in a row, so a dropped request waited for N MORE
+// losses — and a screener probe holds the slot routinely (AT3-6). A set, not
+// a queue: one symbol's streak is one request however often it lost the
+// race, and runLossPass re-checks enablement and the cooldown when served.
+type lossRetries struct {
+	pending map[string]bool
+	due     <-chan time.Time // nil (never fires) while nothing is pending
+	after   func(time.Duration) <-chan time.Time
+}
+
+func newLossRetries(after func(time.Duration) <-chan time.Time) *lossRetries {
+	return &lossRetries{pending: map[string]bool{}, after: after}
+}
+
+// serve runs symbol's re-tune, keeping it pending when run reports the slot
+// busy.
+func (l *lossRetries) serve(symbol string, run func(string) bool) {
+	if run(symbol) {
+		delete(l.pending, symbol)
+
+		return
+	}
+
+	l.pending[symbol] = true
+	if l.due == nil {
+		l.due = l.after(busyRetry)
+	}
+}
+
+// retry serves every pending symbol again; one still busy re-arms the timer.
+func (l *lossRetries) retry(run func(string) bool) {
+	l.due = nil
+
+	for _, symbol := range slices.Sorted(maps.Keys(l.pending)) {
+		l.serve(symbol, run)
 	}
 }
 
@@ -139,10 +243,14 @@ func Schedule(
 // so a reactive run can only ever apply a config a scheduled run would also
 // have accepted. The streak decides WHEN to look, never WHAT is allowed to
 // win.
+//
+// It reports false only when the run slot was busy and the request should be
+// retried; every other outcome — ran, ineligible, disabled, in cooldown — is
+// final.
 func runLossPass(
 	ctx context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
 	cfg config.AutotuneConfig, configPath, symbol string, log *slog.Logger,
-) {
+) bool {
 	// Re-checked against the LIVE config, not only where the streak was
 	// counted: the request may have been queued before the operator turned
 	// either switch off, and a tune that lands after "autotune: off" would
@@ -150,25 +258,40 @@ func runLossPass(
 	if !cfg.Enabled || !cfg.OnLoss.Enabled {
 		log.Info("autotune on_loss: disabled live, dropping request", "symbol", symbol)
 
-		return
+		return true
 	}
 
 	if len(selectSymbols([]string{symbol}, cfg.RunOnlyForSymbols, cfg.ExcludeSymbols)) == 0 {
 		log.Info("autotune on_loss: symbol is not eligible, skipping",
 			"symbol", symbol)
 
-		return
+		return true
+	}
+
+	// The cooldown again, now: it was judged when the streak was counted,
+	// but a request that waited in the channel behind a scheduled pass
+	// (this goroutine runs both) may find that pass has just applied a new
+	// config to this very symbol. Re-tuning it seconds later — on a config
+	// with zero trades since — is the stale backlog on_loss.cooldown exists
+	// to prevent (AT2-5).
+	if !eng.LossTuneCooldownPassed(symbol, cfg.OnLoss.Cooldown) {
+		log.Info("autotune on_loss: symbol was tuned within the cooldown, dropping request",
+			"symbol", symbol, "cooldown", cfg.OnLoss.Cooldown)
+
+		return true
 	}
 
 	if !TryAcquire() {
-		// Dropped rather than queued: by the time a long scheduled pass
-		// finishes, this symbol has very likely been re-evaluated by that
-		// pass anyway, and a stale backlog of reactive requests would fire
-		// searches for streaks that are no longer current.
-		log.Warn("autotune on_loss: skipping, a search is already running",
+		// Retried after busyRetry, not dropped (AT3-6): Schedule keeps one
+		// pending entry per symbol, so this is never a stale backlog, and
+		// the checks above run again when it is served. Requests that
+		// arrive DURING a scheduled pass wait in the channel — this
+		// goroutine is busy running it — and the cooldown check keeps
+		// those honest too.
+		log.Info("autotune on_loss: a search is already running, retrying later",
 			"symbol", symbol)
 
-		return
+		return false
 	}
 	defer Release()
 
@@ -178,6 +301,8 @@ func runLossPass(
 		log.Info("autotune on_loss: no candidate cleared the gates, config unchanged",
 			"symbol", symbol)
 	}
+
+	return true
 }
 
 // runPass evaluates every eligible watchlist symbol once, strictly
@@ -187,17 +312,29 @@ func runLossPass(
 // reconstruct the current map, merge in the change, SetSymbolStrategies the
 // merged map) — concurrent applies within one pass could race and silently
 // drop each other's write. Sequential sidesteps that without a new lock.
+//
+// It reports false only when the run slot was busy and nothing ran.
 func runPass(
 	ctx context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
 	cfg config.AutotuneConfig, configPath string, log *slog.Logger,
-) {
+) bool {
 	if !TryAcquire() {
 		log.Warn("autotune: skipping this pass, a search is already running")
 
-		return
+		return false
 	}
 	defer Release()
 
+	passHeld(ctx, eng, rm, pf, cfg, configPath, log)
+
+	return true
+}
+
+// passHeld is runPass's body, for a caller that already holds the run slot.
+func passHeld(
+	ctx context.Context, eng *engine.Engine, rm *risk.Manager, pf *portfolio.Portfolio,
+	cfg config.AutotuneConfig, configPath string, log *slog.Logger,
+) {
 	symbols := selectSymbols(eng.Watchlist(), cfg.RunOnlyForSymbols, cfg.ExcludeSymbols)
 
 	for _, symbol := range symbols {
@@ -247,8 +384,17 @@ func tuneSymbol(
 		return false
 	}
 
-	result := RunSymbolOptimize(eng, rm, pf, symbol, candles, minTrades, objective, cfg.MinReturnPct)
+	result := RunSymbolOptimize(ctx, eng, rm, pf, symbol, candles, minTrades, objective, cfg.MinReturnPct)
 	if !result.Improved {
+		return false
+	}
+
+	// Shutdown began while the search ran: do not write config.yaml and
+	// re-wire the live engine on the way out (AT2-8). The next pass will
+	// find the same winner if it is real.
+	if ctx.Err() != nil {
+		log.Info("autotune: shutting down, discarding a finished search", "symbol", symbol)
+
 		return false
 	}
 
@@ -309,6 +455,19 @@ func toUpperSet(symbols []string) map[string]bool {
 // order avoids.
 func applyResult(eng *engine.Engine, configPath, symbol string, result Result, log *slog.Logger) {
 	fields := result.Fields
+
+	// The search diffed its winner against the symbol's config as it was
+	// when the search began. A strategy save during the 20-40 s search
+	// moved that base, and the same diff on the new one is a config no
+	// trial ran — refused, the next pass searches from the new base (AT3-2).
+	if live := eng.StrategyConfigFor(symbol); !reflect.DeepEqual(live, result.Base) {
+		log.Warn("autotune: the strategy changed while the search ran; discarding its result",
+			"symbol", symbol)
+		errlog.Recordf("autotune", "%s: strategy changed during the search; result discarded, "+
+			"the next pass searches the new one", symbol)
+
+		return
+	}
 
 	if err := config.PatchSymbolOverride(configPath, symbol, fields); err != nil {
 		log.Error("autotune: failed to write strategy_overrides", "symbol", symbol, "err", err)

@@ -1,8 +1,10 @@
 package market
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -268,5 +270,93 @@ func TestBinanceCloseDuringInFlightPollDoesNotPanic(t *testing.T) {
 
 	if _, ok := <-b.quotes; ok {
 		t.Error("quotes channel still open (or delivered a tick) after Close returned")
+	}
+}
+
+// TestBinanceWarmupCoversTheWholeWindow is the regression for MK2-4 and
+// MK3-2. Binance returns at most 1000 klines per request, the OLDEST from
+// startTime. One request gave the engine's 9-day one-minute warmup its first
+// 16.7 hours and an 8-day hole before live ticks (MK2-4); anchored to the end
+// it gave the last 1000 bars only, so a 30-day screen judged 16 h 39 m
+// (MK3-2). Paged, the window comes back whole: from its start to its end,
+// with no hole.
+func TestBinanceWarmupCoversTheWholeWindow(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(binanceKlineSemantics))
+	t.Cleanup(srv.Close)
+
+	b := NewBinance(srv.URL)
+	t.Cleanup(func() { _ = b.Close() })
+
+	to := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	from := to.Add(-9 * 24 * time.Hour)
+
+	got, err := b.Candles(t.Context(), "BTCUSDT", Res1Min, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) == 0 || !got[0].Time.Equal(from) || to.Sub(got[len(got)-1].Time) > time.Minute {
+		t.Fatalf("got %d bars, want the whole window %s..%s", len(got), from, to)
+	}
+
+	for i := 1; i < len(got); i++ {
+		if gap := got[i].Time.Sub(got[i-1].Time); gap != time.Minute {
+			t.Fatalf("a %s hole at %s: the window was not paged through", gap, got[i-1].Time)
+		}
+	}
+}
+
+// binanceKlineSemantics answers /api/v3/klines the way Binance does: one-
+// minute klines from startTime (inclusive) to endTime (inclusive), at most
+// limit of them, oldest first.
+func binanceKlineSemantics(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	start, _ := strconv.ParseInt(q.Get("startTime"), 10, 64)
+	end, _ := strconv.ParseInt(q.Get("endTime"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+
+	var rows []string
+
+	for ms := start; ms <= end && len(rows) < limit; ms += time.Minute.Milliseconds() {
+		rows = append(rows, fmt.Sprintf(`[%d,"100","101","99","100","5"]`, ms))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte("[" + strings.Join(rows, ",") + "]"))
+}
+
+// MK3-1: Binance answers the batched ticker request with one 400 for the
+// WHOLE batch if any symbol in it is unknown, so one typo, delisted pair or
+// screener-added stock stopped every tick of every symbol — stops and trails
+// included. The refused symbol is set aside; the rest keep their prices.
+func TestOneRefusedSymbolDoesNotStopTheOthers(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if list := q.Get("symbols"); strings.Contains(list, "SPY") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-1121,"msg":"Invalid symbol."}`))
+
+			return
+		}
+
+		_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","price":"60000"}]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	b := newBinance(srv.URL, time.Hour)
+	t.Cleanup(func() { _ = b.Close() })
+
+	if err := b.Subscribe("BTCUSDT", "SPY"); err != nil {
+		t.Fatal(err)
+	}
+
+	b.pollOnce()
+
+	if q, ok := b.LastQuote("BTCUSDT"); !ok || q.Price != 60000 {
+		t.Errorf("BTCUSDT got no price (%v, %v) because SPY was subscribed beside it", q, ok)
 	}
 }

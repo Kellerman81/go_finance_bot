@@ -77,6 +77,10 @@ func detect(d Detector, symbol string, s series) (Action, float64, string) {
 // detectors so each does not re-extract them.
 type series struct {
 	open, high, low, close, volume []float64
+	// src is the candle slice the columns were extracted from, so a detector
+	// that needs more than OHLCV (the learned one needs bar times) can read
+	// it. Valid only for the duration of the call, like the columns.
+	src []market.Candle
 	// buf is the backing array the five columns are carved from. It is kept so a
 	// pooled buffer can be returned whole; nil for an unpooled series.
 	buf []float64
@@ -119,6 +123,7 @@ func acquireSeries(candles []market.Candle) series {
 		close:  buf[3*n : 4*n : 4*n],
 		volume: buf[4*n : 5*n : 5*n],
 		buf:    buf,
+		src:    candles,
 	}
 
 	for i, c := range candles {
@@ -178,6 +183,7 @@ func toSeries(candles []market.Candle) series {
 		low:    buf[2*n : 3*n : 3*n],
 		close:  buf[3*n : 4*n : 4*n],
 		volume: buf[4*n : 5*n : 5*n],
+		src:    candles,
 	}
 
 	for i, c := range candles {
@@ -433,89 +439,109 @@ func (c *Combined) Evaluate(symbol string, candles []market.Candle) Signal {
 	strength := 0.0
 	usedMode := c.mode
 	usedVotes := buyVotes
-	// Prefer SELL on a (rare) tie — de-risking an open position is the safer side.
-	switch {
-	case sellOK && (!buyOK || sellStrength >= buyStrength):
-		action, strength, usedMode, usedVotes = Sell, sellStrength, c.sellMode, sellVotes
-	case buyOK:
-		action, strength, usedMode, usedVotes = Buy, buyStrength, c.mode, buyVotes
+	// The candidate sides in order of preference — SELL first on a (rare) tie,
+	// de-risking an open position being the safer side — each run through the
+	// directional gates BEFORE one is chosen. Choosing first and gating after
+	// let a vetoed SELL take an allowed BUY down with it: with separate buy and
+	// sell detector sets, BUY 0.5 against SELL 0.6 in an up-trend came out
+	// "HOLD: SELL blocked by trend" though the gate would have passed the BUY
+	// (ST2-3).
+	type side struct {
+		action   Action
+		strength float64
+		mode     CombineMode
+		votes    []detectorVote
 	}
 
-	// Higher-timeframe gate: don't trade against the larger move. Like the trend
-	// gate, this only blocks — protective exits run in the engine before the
-	// strategy, so a vetoed SELL can never trap a losing position.
-	if htf.ok && c.htf != nil && c.htf.mode == htfGate && action != Hold {
-		if (htf.action == Buy && action == Sell) || (htf.action == Sell && action == Buy) {
-			sig.Action = Hold
-			sig.Strength = 0
-			sig.Reason = fmt.Sprintf("%s blocked by %s", action, htf.reason)
+	var candidates []side
 
-			return sig
-		}
+	if sellOK && (!buyOK || sellStrength >= buyStrength) {
+		candidates = append(candidates, side{Sell, sellStrength, c.sellMode, sellVotes})
 	}
 
-	// Weekly-trend gate: veto counter-trend actions. An up-trend blocks SELLs, a
-	// down-trend blocks BUYs; a flat trend gates nothing. Protective exits run in
-	// the engine before the strategy, so a vetoed SELL never traps a losing
-	// position. A SELL action uses trendFilterSell when configured (its own
-	// period/threshold); everything else uses the shared trendFilter. Kept
-	// inside the c.trendGate check (rather than computed unconditionally above
-	// it) so a disabled gate costs nothing extra per evaluation.
-	if c.trendGate && action != Hold {
-		gateFilter, reuseVote := c.trendFilter, true
-		if action == Sell && c.trendFilterSell != nil {
-			gateFilter, reuseVote = c.trendFilterSell, false
-		}
+	if buyOK {
+		candidates = append(candidates, side{Buy, buyStrength, c.mode, buyVotes})
+	}
 
-		if gateFilter != nil {
-			if tdir, treason := c.trendVote(
-				s,
-				usedVotes,
-				gateFilter,
-				reuseVote,
-			); (tdir == Buy && action == Sell) ||
-				(tdir == Sell && action == Buy) {
-				sig.Action = Hold
-				sig.Strength = 0
-				sig.Reason = fmt.Sprintf("%s blocked by %s", action, treason)
-				return sig
+	if sellOK && buyOK && sellStrength < buyStrength {
+		candidates = append(candidates, side{Sell, sellStrength, c.sellMode, sellVotes})
+	}
+
+	// Every gate runs per candidate — the directional veto, the BUY-only
+	// deny gate and the side's own conviction bar — and the first candidate
+	// through all of them acts. Choosing by raw strength and only then
+	// applying the deny and conviction gates let a sub-threshold BUY (0.60
+	// against min_strength 0.70) swallow a SELL that cleared its own lower
+	// min_strength_sell — the very setting meant to make exits readier
+	// (ST3-2). The first failure names the HOLD.
+	firstFail := ""
+
+	for _, cand := range candidates {
+		if reason, why := c.candidateFails(
+			s,
+			cand.action,
+			clamp01(cand.strength),
+			cand.mode,
+			cand.votes,
+			htf,
+		); why {
+			if firstFail == "" {
+				firstFail = reason
 			}
+
+			continue
 		}
+
+		action, strength, usedMode, usedVotes = cand.action, cand.strength, cand.mode, cand.votes
+
+		break
 	}
 
-	// Short-term deny gate: BUY-only veto for a false breakout or an
-	// already-overextended move, checked last so it only has to run on a
-	// buy that survived every other gate. See config.StrategyConfig.DenyGate.
-	if c.denyGate && action == Buy {
-		if reason, deny := c.denyVote(s); deny {
-			sig.Action = Hold
-			sig.Strength = 0
-			sig.Reason = fmt.Sprintf("%s denied: %s", action, reason)
+	if action == Hold && firstFail != "" {
+		sig.Action = Hold
+		sig.Strength = 0
+		sig.Reason = firstFail
 
-			return sig
-		}
+		return sig
 	}
 
 	sig.Strength = clamp01(strength)
+	sig.Action = action
+	sig.Reason = formatVotes(usedVotes, action, usedMode)
+
+	return sig
+}
+
+// candidateFails runs one candidate side through every gate — directional
+// veto, the BUY-only deny gate, the side's own conviction bar — and reports
+// the reason it fails, if it does.
+func (c *Combined) candidateFails(
+	s series, action Action, strength float64, mode CombineMode, votes []detectorVote, htf htfRead,
+) (string, bool) {
+	if reason, vetoed := c.directionalVeto(s, action, votes, htf); vetoed {
+		return fmt.Sprintf("%s blocked by %s", action, reason), true
+	}
+
+	// Short-term deny gate: BUY-only veto for a false breakout or an
+	// already-overextended move. See config.StrategyConfig.DenyGate.
+	if c.denyGate && action == Buy {
+		if reason, deny := c.denyVote(s); deny {
+			return fmt.Sprintf("%s denied: %s", action, reason), true
+		}
+	}
+
 	// Conviction gate (separate bars for buy vs sell, so exits can be readier).
 	gate := c.minStrength
 	if action == Sell {
 		gate = c.minStrengthSell
 	}
 
-	if action != Hold && sig.Strength < gate {
-		sig.Action = Hold
-		sig.Reason = fmt.Sprintf("%s => %s %.2f<min %.2f, hold",
-			formatVotes(usedVotes, action, usedMode), action, sig.Strength, gate)
-		sig.Strength = 0
-
-		return sig
+	if strength < gate {
+		return fmt.Sprintf("%s => %s %.2f<min %.2f, hold",
+			formatVotes(votes, action, mode), action, strength, gate), true
 	}
 
-	sig.Action = action
-	sig.Reason = formatVotes(usedVotes, action, usedMode)
-
-	return sig
+	return "", false
 }
 
 // trendVote returns the trend direction (and reason) for the gate, reading
@@ -699,7 +725,11 @@ func New(cfg config.StrategyConfig) Strategy {
 
 	detectors, warmup := buildDetectorList(names, cfg)
 	if len(detectors) == 0 {
-		errlog.Recordf("strategy", "none of the configured detectors %v were recognised; falling back to a plain RSI strategy", names)
+		errlog.RecordOncef(
+			"strategy",
+			"none of the configured detectors %v were recognised; falling back to a plain RSI strategy",
+			names,
+		)
 
 		detectors = []Detector{newRSIDetector(cfg)}
 		warmup = detectors[0].WarmupBars()
@@ -746,9 +776,9 @@ func New(cfg config.StrategyConfig) Strategy {
 	// Multi-timeframe confirmation. It needs its multiple times as many base
 	// bars before it can say anything, so it raises the strategy's warmup —
 	// gating on a higher timeframe that has not formed yet would either block
-	// everything or confirm nothing.
+	// everything or confirm nothing. ReadyBars, not BaseBars: see ReadyBars.
 	htf := newHigherTimeframe(cfg)
-	if n := htf.BaseBars(); n > warmup {
+	if n := htf.ReadyBars(); n > warmup {
 		warmup = n
 	}
 
@@ -799,7 +829,11 @@ func buildDetectorList(names []string, cfg config.StrategyConfig) (dets []Detect
 	for _, n := range names {
 		d := buildDetector(strings.ToLower(strings.TrimSpace(n)), cfg)
 		if d == nil {
-			errlog.Recordf("strategy", "unknown detector %q ignored (check spelling against the registered names)", n)
+			errlog.RecordOncef(
+				"strategy",
+				"unknown detector %q ignored (check spelling against the registered names)",
+				n,
+			)
 
 			continue
 		}
@@ -822,7 +856,7 @@ func normalizeCombine(s string, def CombineMode) CombineMode {
 		return m
 	default:
 		if trimmed != "" {
-			errlog.Recordf("strategy", "unknown combine mode %q ignored; using %q", s, def)
+			errlog.RecordOncef("strategy", "unknown combine mode %q ignored; using %q", s, def)
 		}
 
 		return def
@@ -851,4 +885,51 @@ func clamp01(v float64) float64 {
 	}
 
 	return v
+}
+
+// directionalVeto reports whether the higher-timeframe gate or the trend gate
+// blocks action, and why. Like the gates themselves this only blocks —
+// protective exits run in the engine before the strategy, so a vetoed SELL
+// never traps a losing position. A SELL uses trendFilterSell when configured
+// (its own period/threshold); everything else the shared trendFilter. The
+// trend gate stays inside the c.trendGate check so a disabled gate costs
+// nothing per evaluation.
+func (c *Combined) directionalVeto(
+	s series,
+	action Action,
+	votes []detectorVote,
+	htf htfRead,
+) (string, bool) {
+	if c.htfGates(htf) && opposes(htf.action, action) {
+		return htf.reason, true
+	}
+
+	if !c.trendGate {
+		return "", false
+	}
+
+	gateFilter, reuseVote := c.trendFilter, true
+	if action == Sell && c.trendFilterSell != nil {
+		gateFilter, reuseVote = c.trendFilterSell, false
+	}
+
+	if gateFilter == nil {
+		return "", false
+	}
+
+	if tdir, treason := c.trendVote(s, votes, gateFilter, reuseVote); opposes(tdir, action) {
+		return treason, true
+	}
+
+	return "", false
+}
+
+// htfGates reports whether a usable higher-timeframe read is in gate mode.
+func (c *Combined) htfGates(htf htfRead) bool {
+	return htf.ok && c.htf != nil && c.htf.mode == htfGate
+}
+
+// opposes reports whether a directional read dir points against action.
+func opposes(dir, action Action) bool {
+	return (dir == Buy && action == Sell) || (dir == Sell && action == Buy)
 }
